@@ -950,6 +950,10 @@ function getDeterministicCloseRule(position, managementConfig) {
   ) {
     return { action: "CLOSE", rule: 5, reason: "low yield" };
   }
+  if (!pnlSuspect && (position.age_minutes ?? 0) >= (managementConfig.maxPositionAgeMinutes ?? 2880)) {
+    const ageHours = Math.round((position.age_minutes ?? 0) / 60);
+    return { action: "CLOSE", rule: 6, reason: `max age reached (${ageHours}h)` };
+  }
   return null;
 }
 
