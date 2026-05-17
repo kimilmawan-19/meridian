@@ -435,6 +435,7 @@ After executing, write a brief one-line result per position.
         }
       }
     }
+    drainTelegramQueue().catch(() => { });
   }
   return mgmtReport;
 }
@@ -802,6 +803,7 @@ IMPORTANT:
         else sendMessage(`🔍 Screening Cycle\n\n${stripThink(screenReport)}`).catch(() => { });
       }
     }
+    drainTelegramQueue().catch(() => { });
   }
   return screenReport;
 }
