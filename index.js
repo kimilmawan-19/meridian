@@ -1403,6 +1403,9 @@ function formatHelpText() {
     "/candidates — show latest cached candidates",
     "/deploy <n> — deploy candidate by cached index",
     "/briefing — morning briefing",
+    "/thresholds — show current screening thresholds + performance summary",
+    "/evolve — evolve thresholds from closed position performance data",
+    "/learn [pool] — study top LPers (specific pool or top candidates)",
     "/hive — HiveMind sync status",
     "/hive pull — manual HiveMind pull now",
     "/test-emergency-exit <n> — simulate emergency exit check for position n (dry run, no close)",
@@ -1850,6 +1853,96 @@ async function telegramHandler(msg) {
       ].join("\n")).catch(() => { });
     } catch (e) {
       await sendMessage(`HiveMind error: ${e.message}`).catch(() => { });
+    }
+    return;
+  }
+
+  if (text === "/thresholds") {
+    const s = config.screening;
+    const perf = getPerformanceSummary();
+    const lines = [
+      "Screening thresholds:",
+      `  minFeeActiveTvlRatio: ${s.minFeeActiveTvlRatio}`,
+      `  minOrganic:           ${s.minOrganic}`,
+      `  minHolders:           ${s.minHolders}`,
+      `  minTvl:               $${s.minTvl}`,
+      `  maxTvl:               $${s.maxTvl}`,
+      `  minVolume:            $${s.minVolume}`,
+      `  minTokenFeesSol:      ${s.minTokenFeesSol}`,
+      `  maxBundlePct:         ${s.maxBundlePct}%`,
+      `  maxBotHoldersPct:     ${s.maxBotHoldersPct}%`,
+      `  maxTop10Pct:          ${s.maxTop10Pct}%`,
+      `  timeframe:            ${s.timeframe}`,
+      "",
+      perf
+        ? `Based on ${perf.total_positions_closed} closed positions\nWin rate: ${perf.win_rate_pct}% | Avg PnL: ${perf.avg_pnl_pct}%`
+        : "No closed positions yet — thresholds are preset defaults.",
+    ];
+    await sendMessage(lines.join("\n")).catch(() => { });
+    return;
+  }
+
+  if (text === "/evolve") {
+    const perf = getPerformanceSummary();
+    if (!perf || perf.total_positions_closed < 5) {
+      const needed = 5 - (perf?.total_positions_closed || 0);
+      await sendMessage(`Need ${needed} more closed position(s) to evolve (minimum 5).`).catch(() => { });
+      return;
+    }
+    try {
+      const fs = await import("fs");
+      const lessonsData = JSON.parse(fs.default.readFileSync("./lessons.json", "utf8"));
+      const result = evolveThresholds(lessonsData.performance, config);
+      if (!result || Object.keys(result.changes).length === 0) {
+        await sendMessage("No threshold changes needed — current settings already match performance data.").catch(() => { });
+      } else {
+        reloadScreeningThresholds();
+        const lines = ["Thresholds evolved:", ""];
+        for (const [key] of Object.entries(result.changes)) {
+          lines.push(`  ${key}: ${result.rationale[key]}`);
+        }
+        await sendMessage(lines.join("\n")).catch(() => { });
+      }
+    } catch (e) {
+      await sendMessage(`Evolve error: ${e.message}`).catch(() => { });
+    }
+    return;
+  }
+
+  const learnMatch = text.match(/^\/learn(?:\s+(.+))?$/i);
+  if (learnMatch) {
+    const poolArg = learnMatch[1]?.trim() || null;
+    busy = true;
+    let liveMessage = null;
+    try {
+      liveMessage = await createLiveMessage("📚 Learn", poolArg ? `Studying pool ${poolArg}` : "Fetching top pools to study...");
+      let poolsToStudy = [];
+      if (poolArg) {
+        poolsToStudy = [{ pool: poolArg, name: poolArg }];
+      } else {
+        const { candidates } = await getTopCandidates({ limit: 10 });
+        if (!candidates.length) {
+          await liveMessage.finalize("No eligible pools found to study.");
+          return;
+        }
+        poolsToStudy = candidates.map((c) => ({ pool: c.pool, name: c.name }));
+      }
+      const poolList = poolsToStudy.map((p, i) => `${i + 1}. ${p.name} (${p.pool})`).join("\n");
+      const { content } = await agentLoop(
+        `Study top LPers across these ${poolsToStudy.length} pools by calling study_top_lpers for each:\n\n${poolList}\n\nFor each pool, call study_top_lpers then move to the next. After studying all pools:\n1. Identify patterns that appear across multiple pools.\n2. Note pool-specific patterns where behaviour differs significantly.\n3. Derive 4-8 concrete, actionable lessons using add_lesson. Prioritize cross-pool patterns.\n4. Summarize what you learned.\n\nFocus on: hold duration, entry/exit timing, win rates, whether scalpers or holders dominate.`,
+        config.llm.maxSteps, [], "GENERAL", config.llm.generalModel, null,
+        {
+          onToolStart: async ({ name }) => { await liveMessage?.toolStart(name); },
+          onToolFinish: async ({ name, result, success }) => { await liveMessage?.toolFinish(name, result, success); },
+        }
+      );
+      if (liveMessage) await liveMessage.finalize(stripThink(content));
+    } catch (e) {
+      if (liveMessage) await liveMessage.fail(e.message).catch(() => { });
+      else await sendMessage(`Learn error: ${e.message}`).catch(() => { });
+    } finally {
+      busy = false;
+      drainTelegramQueue().catch(() => { });
     }
     return;
   }
