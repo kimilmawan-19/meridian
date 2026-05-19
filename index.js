@@ -706,8 +706,8 @@ STEPS:
 3. Call deploy_position (active_bin is pre-fetched above — no need to call get_active_bin).
    bins_below = round(${config.strategy.minBinsBelow} + (candidate volatility/5)*(${config.strategy.maxBinsBelow - config.strategy.minBinsBelow})) clamped to [${config.strategy.minBinsBelow},${config.strategy.maxBinsBelow}].
    pass deploy_position.volatility = the candidate volatility value.
-   For single-side SOL deploys, do not invent upside:
-   set amount_y only, keep amount_x = 0, keep bins_above = 0, and let the upper bin stay at the active bin.
+   For single-side SOL deploys: set amount_y only, keep amount_x = 0.
+   Set bins_above to ~25% of bins_below (e.g. bins_below=40 → bins_above=10), capped at 30% of bins_below.
 4. Report in this exact format (no tables, no extra sections):
    🚀 DEPLOYED
 
@@ -2183,7 +2183,7 @@ Commands:
       await runBusy(async () => {
         console.log("\nAgent is picking and deploying...\n");
         const { content: reply } = await agentLoop(
-          `get_top_candidates and deploy only if a candidate is clearly worth it. If there is only one weak candidate, report NO DEPLOY. For a valid deploy, use amount_y=${DEPLOY}, amount_x=0, bins_above=0, and bins_below from positive volatility. Execute now, don't ask.`,
+          `get_top_candidates and deploy only if a candidate is clearly worth it. If there is only one weak candidate, report NO DEPLOY. For a valid deploy, use amount_y=${DEPLOY}, amount_x=0, bins_below from positive volatility, and bins_above=~25% of bins_below (capped at 30%). Execute now, don't ask.`,
           config.llm.maxSteps,
           [],
           "SCREENER"

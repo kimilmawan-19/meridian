@@ -727,11 +727,11 @@ async function runSafetyChecks(name, args) {
       if (
         isSingleSidedSol &&
         args.upside_pct == null &&
-        (!Number.isFinite(requestedBinsAbove) || !Number.isInteger(requestedBinsAbove) || requestedBinsAbove !== 0)
+        (!Number.isFinite(requestedBinsAbove) || !Number.isInteger(requestedBinsAbove) || requestedBinsAbove < 0 || requestedBinsAbove > Math.ceil(requestedBinsBelow * 0.3))
       ) {
         return {
           pass: false,
-          reason: "Single-side SOL deploy must use bins_above=0.",
+          reason: `Single-side SOL deploy bins_above must be between 0 and ${Math.ceil(requestedBinsBelow * 0.3)} (max 30% of bins_below ${requestedBinsBelow}). Got ${args.bins_above ?? 0}.`,
         };
       }
 

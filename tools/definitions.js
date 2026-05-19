@@ -136,8 +136,7 @@ HARD RULES:
 - Bin Step: Only deploy in pools with bin_step between 80 and 125.
 - Volatility must be positive. If volatility is 0, null, or missing, do not deploy.
 - Range must cover at least 35 total bins. Never deploy 1-bin/tiny ranges.
-- For single-side SOL deploys (amount_y only, amount_x=0), do not request upside exposure:
-  use bins_below only, keep bins_above=0, and the upper bin will be pinned to the current active bin.
+- For single-side SOL deploys (amount_y only, amount_x=0): set bins_above to ~25% of bins_below (e.g. bins_below=40 → bins_above=10, max 30% of bins_below). This gives the position upside buffer before going out-of-range.
 
 Guidelines (only when user hasn't specified):
 - Strategy: use the active strategy's lp_strategy field (bid_ask or spot)
