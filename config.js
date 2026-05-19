@@ -88,6 +88,7 @@ export const config = {
     minTokenAgeHours:   u.minTokenAgeHours   ?? null, // null = no minimum
     maxTokenAgeHours:   u.maxTokenAgeHours   ?? null, // null = no maximum
     athFilterPct:       u.athFilterPct       ?? null, // e.g. -20 = only deploy if price is >= 20% below ATH
+    maxPump1hPct:       u.maxPump1hPct       ?? 40,  // max 1h price pump %, reject FOMO entries
   },
 
   // ─── Position Management ────────────────
