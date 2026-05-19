@@ -1628,12 +1628,13 @@ export async function closePosition({ position_address, reason }) {
               const data = await res.json();
               const posEntry = (data.positions || []).find((entry) => entry.positionAddress === position_address);
               if (posEntry) {
-                pnlTrueUsd = safeNum(posEntry.pnlUsd);
+                const closedFeesUsd = parseFloat(posEntry.allTimeFees?.total?.usd || 0);
+                pnlTrueUsd = safeNum(posEntry.pnlUsd) + closedFeesUsd;
                 pnlUsd = config.management.solMode ? getClosedPnlValue(posEntry, true) : pnlTrueUsd;
                 pnlPct = getClosedPnlPct(posEntry, config.management.solMode);
                 finalValueUsd = parseFloat(posEntry.allTimeWithdrawals?.total?.usd || 0);
                 initialUsd = parseFloat(posEntry.allTimeDeposits?.total?.usd || 0);
-                feesUsd = parseFloat(posEntry.allTimeFees?.total?.usd || 0) || feesUsd;
+                feesUsd = closedFeesUsd || feesUsd;
                 break;
               }
             }
@@ -1881,12 +1882,13 @@ export async function closePosition({ position_address, reason }) {
             const data = await res.json();
             const posEntry = (data.positions || []).find(p => p.positionAddress === position_address);
             if (posEntry) {
-              const nextPnlUsd = safeNum(posEntry.pnlUsd);
+              const closedFeesUsd = parseFloat(posEntry.allTimeFees?.total?.usd || 0);
+              const nextPnlUsd = safeNum(posEntry.pnlUsd) + closedFeesUsd;
               const nextPnlValue = config.management.solMode ? getClosedPnlValue(posEntry, true) : nextPnlUsd;
               const nextPnlPct = getClosedPnlPct(posEntry, config.management.solMode);
               const nextFinalValueUsd = parseFloat(posEntry.allTimeWithdrawals?.total?.usd || 0);
               const nextInitialUsd = parseFloat(posEntry.allTimeDeposits?.total?.usd || 0);
-              const nextFeesUsd = parseFloat(posEntry.allTimeFees?.total?.usd || 0) || feesUsd;
+              const nextFeesUsd = closedFeesUsd || feesUsd;
 
               if (shouldRejectClosedPnl(nextPnlPct, reason || tracked?.close_reason)) {
                 log("close_warn", `Rejected unsettled closed PnL for ${position_address.slice(0, 8)} on attempt ${attempt + 1}/6: ${nextPnlPct.toFixed(2)}%`);
