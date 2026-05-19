@@ -1470,12 +1470,13 @@ async function deployLatestCandidate(index) {
   }
   const deployAmount = computeDeployAmount((await getWalletBalances()).sol);
   const binsBelow = computeBinsBelow(candidate.volatility);
+  const binsAbove = Math.ceil(binsBelow * 0.25);
   const result = await executeTool("deploy_position", {
     pool_address: candidate.pool,
     amount_y: deployAmount,
     strategy: config.strategy.strategy,
     bins_below: binsBelow,
-    bins_above: 0,
+    bins_above: binsAbove,
     pool_name: candidate.name,
     base_mint: candidate.base?.mint || candidate.base_mint || null,
     bin_step: candidate.bin_step,
