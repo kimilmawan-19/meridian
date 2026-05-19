@@ -585,15 +585,10 @@ export async function deployPosition({
 
   const isWideRange = totalBins > 69;
   const minBinId = activeBin.binId - activeBinsBelow;
-  const maxBinId = isSingleSidedSol ? activeBin.binId : activeBin.binId + activeBinsAbove;
+  const maxBinId = activeBin.binId + activeBinsAbove;
 
   if (minBinId > maxBinId) {
     throw new Error(`Invalid bin range: ${minBinId} -> ${maxBinId}`);
-  }
-  if (isSingleSidedSol && maxBinId !== activeBin.binId) {
-    throw new Error(
-      `Single-side SOL deploy must end at the SDK active bin. Expected ${activeBin.binId}, got ${maxBinId}.`,
-    );
   }
 
   await assertRangeDoesNotRequireBinArrayInitialization(pool, minBinId, maxBinId);
