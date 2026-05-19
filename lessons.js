@@ -659,6 +659,78 @@ function fmt(lessons) {
 }
 
 /**
+ * Detailed performance analysis across all closed positions.
+ * Powers the /performance Telegram command.
+ */
+export function getDetailedPerformanceAnalysis() {
+  const data = load();
+  const p = data.performance;
+  if (p.length === 0) return null;
+
+  const wins   = p.filter((x) => (x.pnl_pct ?? 0) > 0);
+  const losses = p.filter((x) => (x.pnl_pct ?? 0) <= 0);
+
+  const safePct = (arr, field) => {
+    const vals = arr.map((x) => x[field]).filter(isFiniteNum);
+    return vals.length ? Math.round((avg(vals)) * 100) / 100 : null;
+  };
+
+  const totalPnlUsd   = p.reduce((s, x) => s + (x.pnl_usd ?? 0), 0);
+  const totalFeesUsd  = p.reduce((s, x) => s + (x.fees_earned_usd ?? 0), 0);
+  const avgHoldMin    = safePct(p,      "minutes_held");
+  const avgRangeEff   = safePct(p,      "range_efficiency");
+
+  // Best and worst by pnl_pct
+  const sorted = [...p].sort((a, b) => (b.pnl_pct ?? 0) - (a.pnl_pct ?? 0));
+  const best3  = sorted.slice(0, 3).map((x) => ({ pool_name: x.pool_name, pnl_pct: x.pnl_pct, close_reason: x.close_reason, minutes_held: x.minutes_held }));
+  const worst3 = sorted.slice(-3).reverse().map((x) => ({ pool_name: x.pool_name, pnl_pct: x.pnl_pct, close_reason: x.close_reason, minutes_held: x.minutes_held }));
+
+  // Close reason frequency
+  const reasonCounts = {};
+  for (const x of p) {
+    const r = x.close_reason || "unknown";
+    reasonCounts[r] = (reasonCounts[r] || 0) + 1;
+  }
+  const closeReasons = Object.entries(reasonCounts)
+    .sort((a, b) => b[1] - a[1])
+    .map(([reason, count]) => ({ reason, count }));
+
+  // Avg PnL per bin_step bucket
+  const binStepGroups = {};
+  for (const x of p) {
+    if (!isFiniteNum(x.bin_step)) continue;
+    const key = String(x.bin_step);
+    if (!binStepGroups[key]) binStepGroups[key] = [];
+    binStepGroups[key].push(x.pnl_pct ?? 0);
+  }
+  const binStepSummary = Object.entries(binStepGroups)
+    .map(([step, vals]) => ({ bin_step: Number(step), count: vals.length, avg_pnl_pct: Math.round(avg(vals) * 100) / 100 }))
+    .sort((a, b) => a.bin_step - b.bin_step);
+
+  return {
+    total:          p.length,
+    wins:           wins.length,
+    losses:         losses.length,
+    win_rate_pct:   Math.round((wins.length / p.length) * 100),
+    avg_pnl_pct:    safePct(p, "pnl_pct"),
+    avg_win_pct:    safePct(wins, "pnl_pct"),
+    avg_loss_pct:   safePct(losses, "pnl_pct"),
+    total_pnl_usd:  Math.round(totalPnlUsd * 100) / 100,
+    total_fees_usd: Math.round(totalFeesUsd * 100) / 100,
+    avg_hold_min:   avgHoldMin,
+    avg_hold_wins_min:   safePct(wins,   "minutes_held"),
+    avg_hold_losses_min: safePct(losses, "minutes_held"),
+    avg_range_eff_pct:        avgRangeEff,
+    avg_range_wins_pct:  safePct(wins,   "range_efficiency"),
+    avg_range_losses_pct: safePct(losses, "range_efficiency"),
+    best3,
+    worst3,
+    close_reasons: closeReasons,
+    bin_step_summary: binStepSummary,
+  };
+}
+
+/**
  * Get individual performance records filtered by time window.
  * Tool handler: get_performance_history
  *

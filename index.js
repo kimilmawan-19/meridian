@@ -10,7 +10,7 @@ import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates } from "./tools/screening.js";
 import { fetchPoolMarketData, getMarketDataStats } from "./tools/market-data.js";
 import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
-import { evolveThresholds, getPerformanceSummary } from "./lessons.js";
+import { evolveThresholds, getPerformanceSummary, getDetailedPerformanceAnalysis } from "./lessons.js";
 import { executeTool, registerCronRestarter } from "./tools/executor.js";
 import {
   startPolling,
@@ -1405,6 +1405,7 @@ function formatHelpText() {
     "/briefing — morning briefing",
     "/thresholds — show current screening thresholds + performance summary",
     "/evolve — evolve thresholds from closed position performance data",
+    "/performance — detailed analysis of all closed positions",
     "/learn [pool] — study top LPers (specific pool or top candidates)",
     "/hive — HiveMind sync status",
     "/hive pull — manual HiveMind pull now",
@@ -1944,6 +1945,44 @@ async function telegramHandler(msg) {
       busy = false;
       drainTelegramQueue().catch(() => { });
     }
+    return;
+  }
+
+  if (text === "/performance") {
+    const pa = getDetailedPerformanceAnalysis();
+    if (!pa) {
+      await sendMessage("No closed positions yet — nothing to analyse.").catch(() => { });
+      return;
+    }
+    const fmtMin = (m) => m == null ? "?" : m < 60 ? `${Math.round(m)}m` : `${(m / 60).toFixed(1)}h`;
+    const fmtPnl = (v) => v == null ? "?" : `${v > 0 ? "+" : ""}${v.toFixed(2)}%`;
+    const lines = [
+      `Performance — ${pa.total} closed positions`,
+      "",
+      `Win rate:   ${pa.win_rate_pct}%  (${pa.wins}W / ${pa.losses}L)`,
+      `Avg PnL:    ${fmtPnl(pa.avg_pnl_pct)}  (wins ${fmtPnl(pa.avg_win_pct)}, losses ${fmtPnl(pa.avg_loss_pct)})`,
+      `Total PnL:  $${pa.total_pnl_usd}`,
+      `Total fees: $${pa.total_fees_usd}`,
+      "",
+      `Avg hold:   ${fmtMin(pa.avg_hold_min)}  (wins ${fmtMin(pa.avg_hold_wins_min)}, losses ${fmtMin(pa.avg_hold_losses_min)})`,
+      `Range eff:  ${pa.avg_range_eff_pct ?? "?"}%  (wins ${pa.avg_range_wins_pct ?? "?"}%, losses ${pa.avg_range_losses_pct ?? "?"}%)`,
+      "",
+      "Best 3:",
+      ...pa.best3.map((x) => `  ${fmtPnl(x.pnl_pct)}  ${x.pool_name}  (${fmtMin(x.minutes_held)}, ${x.close_reason})`),
+      "",
+      "Worst 3:",
+      ...pa.worst3.map((x) => `  ${fmtPnl(x.pnl_pct)}  ${x.pool_name}  (${fmtMin(x.minutes_held)}, ${x.close_reason})`),
+      "",
+      "Close reasons:",
+      ...pa.close_reasons.slice(0, 8).map((r) => `  ${r.count}x  ${r.reason}`),
+    ];
+    if (pa.bin_step_summary.length > 0) {
+      lines.push("", "Avg PnL by bin step:");
+      for (const b of pa.bin_step_summary) {
+        lines.push(`  step=${b.bin_step}  ${fmtPnl(b.avg_pnl_pct)}  (${b.count} positions)`);
+      }
+    }
+    await sendMessage(lines.join("\n")).catch(() => { });
     return;
   }
 
