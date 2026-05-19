@@ -1628,13 +1628,18 @@ export async function closePosition({ position_address, reason }) {
               const data = await res.json();
               const posEntry = (data.positions || []).find((entry) => entry.positionAddress === position_address);
               if (posEntry) {
-                const closedFeesUsd = parseFloat(posEntry.allTimeFees?.total?.usd || 0);
-                pnlTrueUsd = safeNum(posEntry.pnlUsd) + closedFeesUsd;
-                pnlUsd = config.management.solMode ? getClosedPnlValue(posEntry, true) : pnlTrueUsd;
-                pnlPct = getClosedPnlPct(posEntry, config.management.solMode);
-                finalValueUsd = parseFloat(posEntry.allTimeWithdrawals?.total?.usd || 0);
-                initialUsd = parseFloat(posEntry.allTimeDeposits?.total?.usd || 0);
-                feesUsd = closedFeesUsd || feesUsd;
+                const closedFeesUsd = safeNum(posEntry.allTimeFees?.total?.usd);
+                const closedFeesSol = safeNum(posEntry.allTimeFees?.total?.sol);
+                const depositSol    = safeNum(posEntry.allTimeDeposits?.total?.sol);
+                const correctedPnlSol = safeNum(posEntry.pnlSol) + closedFeesSol;
+                pnlTrueUsd    = safeNum(posEntry.pnlUsd) + closedFeesUsd;
+                pnlUsd        = config.management.solMode ? correctedPnlSol : pnlTrueUsd;
+                finalValueUsd = safeNum(posEntry.allTimeWithdrawals?.total?.usd);
+                initialUsd    = safeNum(posEntry.allTimeDeposits?.total?.usd);
+                feesUsd       = closedFeesUsd || feesUsd;
+                pnlPct        = config.management.solMode
+                  ? (depositSol > 0 ? (correctedPnlSol / depositSol) * 100 : 0)
+                  : (initialUsd > 0 ? (pnlTrueUsd / initialUsd) * 100 : 0);
                 break;
               }
             }
@@ -1882,13 +1887,18 @@ export async function closePosition({ position_address, reason }) {
             const data = await res.json();
             const posEntry = (data.positions || []).find(p => p.positionAddress === position_address);
             if (posEntry) {
-              const closedFeesUsd = parseFloat(posEntry.allTimeFees?.total?.usd || 0);
-              const nextPnlUsd = safeNum(posEntry.pnlUsd) + closedFeesUsd;
-              const nextPnlValue = config.management.solMode ? getClosedPnlValue(posEntry, true) : nextPnlUsd;
-              const nextPnlPct = getClosedPnlPct(posEntry, config.management.solMode);
-              const nextFinalValueUsd = parseFloat(posEntry.allTimeWithdrawals?.total?.usd || 0);
-              const nextInitialUsd = parseFloat(posEntry.allTimeDeposits?.total?.usd || 0);
-              const nextFeesUsd = closedFeesUsd || feesUsd;
+              const closedFeesUsd     = safeNum(posEntry.allTimeFees?.total?.usd);
+              const closedFeesSol     = safeNum(posEntry.allTimeFees?.total?.sol);
+              const depositSol        = safeNum(posEntry.allTimeDeposits?.total?.sol);
+              const correctedPnlSol   = safeNum(posEntry.pnlSol) + closedFeesSol;
+              const nextPnlUsd        = safeNum(posEntry.pnlUsd) + closedFeesUsd;
+              const nextPnlValue      = config.management.solMode ? correctedPnlSol : nextPnlUsd;
+              const nextFinalValueUsd = safeNum(posEntry.allTimeWithdrawals?.total?.usd);
+              const nextInitialUsd    = safeNum(posEntry.allTimeDeposits?.total?.usd);
+              const nextFeesUsd       = closedFeesUsd || feesUsd;
+              const nextPnlPct        = config.management.solMode
+                ? (depositSol > 0 ? (correctedPnlSol / depositSol) * 100 : 0)
+                : (nextInitialUsd > 0 ? (nextPnlUsd / nextInitialUsd) * 100 : 0);
 
               if (shouldRejectClosedPnl(nextPnlPct, reason || tracked?.close_reason)) {
                 log("close_warn", `Rejected unsettled closed PnL for ${position_address.slice(0, 8)} on attempt ${attempt + 1}/6: ${nextPnlPct.toFixed(2)}%`);
