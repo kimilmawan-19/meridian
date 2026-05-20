@@ -1631,11 +1631,14 @@ export async function closePosition({ position_address, reason }) {
                 const closedFeesUsd = safeNum(posEntry.allTimeFees?.total?.usd);
                 const closedFeesSol = safeNum(posEntry.allTimeFees?.total?.sol);
                 const depositSol    = safeNum(posEntry.allTimeDeposits?.total?.sol);
-                const correctedPnlSol = safeNum(posEntry.pnlSol) + closedFeesSol;
-                pnlTrueUsd    = safeNum(posEntry.pnlUsd) + closedFeesUsd;
-                pnlUsd        = config.management.solMode ? correctedPnlSol : pnlTrueUsd;
+                const withdrawSol   = safeNum(posEntry.allTimeWithdrawals?.total?.sol);
                 finalValueUsd = safeNum(posEntry.allTimeWithdrawals?.total?.usd);
                 initialUsd    = safeNum(posEntry.allTimeDeposits?.total?.usd);
+                // Deterministic PnL formula matching Meteora UI: withdraw + fees - deposit.
+                // Avoids ambiguity in API's pnlUsd/pnlSol fields (which may or may not include fees).
+                const correctedPnlSol = withdrawSol + closedFeesSol - depositSol;
+                pnlTrueUsd    = finalValueUsd + closedFeesUsd - initialUsd;
+                pnlUsd        = config.management.solMode ? correctedPnlSol : pnlTrueUsd;
                 feesUsd       = closedFeesUsd || feesUsd;
                 pnlPct        = config.management.solMode
                   ? (depositSol > 0 ? (correctedPnlSol / depositSol) * 100 : 0)
@@ -1890,11 +1893,14 @@ export async function closePosition({ position_address, reason }) {
               const closedFeesUsd     = safeNum(posEntry.allTimeFees?.total?.usd);
               const closedFeesSol     = safeNum(posEntry.allTimeFees?.total?.sol);
               const depositSol        = safeNum(posEntry.allTimeDeposits?.total?.sol);
-              const correctedPnlSol   = safeNum(posEntry.pnlSol) + closedFeesSol;
-              const nextPnlUsd        = safeNum(posEntry.pnlUsd) + closedFeesUsd;
-              const nextPnlValue      = config.management.solMode ? correctedPnlSol : nextPnlUsd;
+              const withdrawSol       = safeNum(posEntry.allTimeWithdrawals?.total?.sol);
               const nextFinalValueUsd = safeNum(posEntry.allTimeWithdrawals?.total?.usd);
               const nextInitialUsd    = safeNum(posEntry.allTimeDeposits?.total?.usd);
+              // Deterministic PnL formula matching Meteora UI: withdraw + fees - deposit.
+              // Avoids ambiguity in API's pnlUsd/pnlSol fields (which may or may not include fees).
+              const correctedPnlSol   = withdrawSol + closedFeesSol - depositSol;
+              const nextPnlUsd        = nextFinalValueUsd + closedFeesUsd - nextInitialUsd;
+              const nextPnlValue      = config.management.solMode ? correctedPnlSol : nextPnlUsd;
               const nextFeesUsd       = closedFeesUsd || feesUsd;
               const nextPnlPct        = config.management.solMode
                 ? (depositSol > 0 ? (correctedPnlSol / depositSol) * 100 : 0)
