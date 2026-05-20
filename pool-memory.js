@@ -168,6 +168,21 @@ export function recordPoolDeploy(poolAddress, deployData) {
     log("pool-memory", `Cooldown set for ${entry.name} until ${cooldownUntil} (low yield close)`);
   }
 
+  // Set cooldown after emergency exits (Rule 7 volume collapse, Rule 8 rapid dump)
+  // Prevents immediate re-entry into a pool that just dumped — the main cause of cycling
+  const isEmergencyClose = ["rapid dump", "volume collapse"].some(
+    (s) => (deploy.close_reason || "").includes(s)
+  );
+  if (isEmergencyClose) {
+    const hours = config.management.emergencyExitCooldownHours ?? 4;
+    const cooldownUntil = setPoolCooldown(entry, hours, deploy.close_reason);
+    const mintCooldownUntil = setBaseMintCooldown(db, entry.base_mint, hours, deploy.close_reason);
+    log("pool-memory", `Emergency cooldown set for ${entry.name} until ${cooldownUntil} (${deploy.close_reason})`);
+    if (entry.base_mint && mintCooldownUntil) {
+      log("pool-memory", `Emergency token cooldown set for ${entry.base_mint.slice(0, 8)} until ${mintCooldownUntil} (${deploy.close_reason})`);
+    }
+  }
+
   const oorTriggerCount = config.management.oorCooldownTriggerCount ?? 3;
   const oorCooldownHours = config.management.oorCooldownHours ?? 12;
   const recentDeploys = entry.deploys.slice(-oorTriggerCount);

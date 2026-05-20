@@ -289,7 +289,7 @@ WARNING: This executes a real on-chain transaction. Cannot be undone.`,
           },
           reason: {
             type: "string",
-            description: "Why this position is being closed. Include the rule that triggered it, e.g. 'low yield', 'stop loss', 'trailing TP', 'OOR'. Used for pool memory."
+            description: "Why this position is being closed. REQUIRED for pool memory cooldowns — always pass the exact rule reason: 'rapid dump' (Rule 8), 'volume collapse' (Rule 7), 'low yield' (Rule 5), 'stop loss' (Rule 1), 'take profit' (Rule 2), 'OOR' (Rule 4), 'trailing TP'. Using the exact string ensures the pool is cooled down and not immediately re-entered."
           }
         },
         required: ["position_address"]
