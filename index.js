@@ -996,7 +996,15 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
     return false;
   })();
 
-  if (!pnlSuspect && position.pnl_pct != null && position.pnl_pct <= managementConfig.stopLossPct) {
+  const posAgeMin = position.age_minutes ?? 0;
+  const minAgeForStopLoss = managementConfig.minAgeBeforeStopLoss ?? 15;
+
+  // Break-even stop: if position ever peaked above breakEvenTriggerPct, close when PnL <= 0%
+  if (!pnlSuspect && tracked?.break_even_active && position.pnl_pct != null && position.pnl_pct <= 0) {
+    return { action: "CLOSE", rule: 1, reason: "break-even stop" };
+  }
+
+  if (!pnlSuspect && position.pnl_pct != null && position.pnl_pct <= managementConfig.stopLossPct && posAgeMin >= minAgeForStopLoss) {
     return { action: "CLOSE", rule: 1, reason: "stop loss" };
   }
   if (!pnlSuspect && position.pnl_pct != null && position.pnl_pct >= managementConfig.takeProfitPct) {

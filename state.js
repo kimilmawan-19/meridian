@@ -104,6 +104,7 @@ export function trackPosition({
     confirmed_trailing_exit_reason: null,
     confirmed_trailing_exit_until: null,
     trailing_active: false,
+    break_even_active: false,
     peak_volume_5m_usd: null,
     last_market_data_at: null,
     volume_history: [],
@@ -432,6 +433,13 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
     log("state", `Position ${position_address} trailing TP activated (confirmed peak: ${pos.peak_pnl_pct}%)`);
   }
 
+  // Activate break-even stop once peak reaches breakEvenTriggerPct
+  if (!pos.break_even_active && (pos.peak_pnl_pct ?? 0) >= (mgmtConfig.breakEvenTriggerPct ?? 1)) {
+    pos.break_even_active = true;
+    changed = true;
+    log("state", `Position ${position_address} break-even stop activated (confirmed peak: ${pos.peak_pnl_pct}%)`);
+  }
+
   // Update OOR state
   if (in_range === false && !pos.out_of_range_since) {
     pos.out_of_range_since = new Date().toISOString();
@@ -445,11 +453,28 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
 
   if (changed) save(state);
 
+  // ── Break-even stop ───────────────────────────────────────────
+  // Once peak was profitable enough, never let PnL fall back to 0% or below
+  if (!pnl_pct_suspicious && pos.break_even_active && currentPnlPct != null && currentPnlPct <= 0) {
+    return {
+      action: "BREAK_EVEN",
+      reason: `Break-even stop: peak was ${(pos.peak_pnl_pct ?? 0).toFixed(2)}%, now ${currentPnlPct.toFixed(2)}%`,
+    };
+  }
+
   // ── Stop loss ──────────────────────────────────────────────────
-  if (!pnl_pct_suspicious && currentPnlPct != null && mgmtConfig.stopLossPct != null && currentPnlPct <= mgmtConfig.stopLossPct) {
+  const { age_minutes: slAgeMin } = positionData;
+  const minAgeForStopLoss = mgmtConfig.minAgeBeforeStopLoss ?? 15;
+  if (
+    !pnl_pct_suspicious &&
+    currentPnlPct != null &&
+    mgmtConfig.stopLossPct != null &&
+    currentPnlPct <= mgmtConfig.stopLossPct &&
+    (slAgeMin == null || slAgeMin >= minAgeForStopLoss)
+  ) {
     return {
       action: "STOP_LOSS",
-      reason: `Stop loss: PnL ${currentPnlPct.toFixed(2)}% <= ${mgmtConfig.stopLossPct}%`,
+      reason: `Stop loss: PnL ${currentPnlPct.toFixed(2)}% <= ${mgmtConfig.stopLossPct}% (age: ${slAgeMin ?? "?"}m)`,
     };
   }
 
@@ -480,17 +505,16 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   }
 
   // ── Low yield (only after position has had time to accumulate fees) ───
-  const { age_minutes } = positionData;
   const minAgeForYieldCheck = mgmtConfig.minAgeBeforeYieldCheck ?? 60;
   if (
     fee_per_tvl_24h != null &&
     mgmtConfig.minFeePerTvl24h != null &&
     fee_per_tvl_24h < mgmtConfig.minFeePerTvl24h &&
-    (age_minutes == null || age_minutes >= minAgeForYieldCheck)
+    (slAgeMin == null || slAgeMin >= minAgeForYieldCheck)
   ) {
     return {
       action: "LOW_YIELD",
-      reason: `Low yield: fee/TVL ${fee_per_tvl_24h.toFixed(2)}% < min ${mgmtConfig.minFeePerTvl24h}% (age: ${age_minutes ?? "?"}m)`,
+      reason: `Low yield: fee/TVL ${fee_per_tvl_24h.toFixed(2)}% < min ${mgmtConfig.minFeePerTvl24h}% (age: ${slAgeMin ?? "?"}m)`,
     };
   }
 

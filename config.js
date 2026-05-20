@@ -111,6 +111,8 @@ export const config = {
     takeProfitPct:         u.takeProfitPct         ?? u.takeProfitFeePct ?? 5,
     minFeePerTvl24h:       u.minFeePerTvl24h       ?? 7,
     minAgeBeforeYieldCheck: u.minAgeBeforeYieldCheck ?? 60, // minutes before low yield can trigger close
+    minAgeBeforeStopLoss:  u.minAgeBeforeStopLoss  ?? 15, // minutes before stop loss can fire
+    breakEvenTriggerPct:   u.breakEvenTriggerPct   ?? 1,  // once peak PnL >= this, protect against going below 0%
     minSolToOpen:          u.minSolToOpen          ?? 0.55,
     deployAmountSol:       u.deployAmountSol       ?? 0.5,
     gasReserve:            u.gasReserve            ?? 0.2,
