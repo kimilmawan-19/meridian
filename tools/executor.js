@@ -20,7 +20,7 @@ import { addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-bla
 import { blockDev, unblockDev, listBlockedDevs } from "../dev-blocklist.js";
 import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsOnPool } from "../smart-wallets.js";
 import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
-import { config, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW } from "../config.js";
+import { config, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW, computeDeployAmount } from "../config.js";
 import { getRecentDecisions } from "../decision-log.js";
 import fs from "fs";
 import path from "path";
@@ -789,7 +789,7 @@ async function runSafetyChecks(name, args) {
         };
       }
 
-      // Check SOL balance
+      // Check SOL balance and enforce minimum computed deploy amount
       if (process.env.DRY_RUN !== "true") {
         const balance = await getWalletBalances();
         const gasReserve = config.management.gasReserve;
@@ -798,6 +798,16 @@ async function runSafetyChecks(name, args) {
           return {
             pass: false,
             reason: `Insufficient SOL: have ${balance.sol} SOL, need ${minRequired} SOL (${amountY} deploy + ${gasReserve} gas reserve).`,
+          };
+        }
+        // Prevent LLM from deploying significantly less than computeDeployAmount recommends.
+        // Allows 10% rounding tolerance (e.g. 0.13 computed → 0.12 minimum accepted).
+        const expectedDeploy = computeDeployAmount(balance.sol);
+        const minAcceptable = parseFloat((expectedDeploy * 0.9).toFixed(2));
+        if (amountY < minAcceptable) {
+          return {
+            pass: false,
+            reason: `Deploy amount ${amountY} SOL is too low. Wallet balance suggests deploying ${expectedDeploy} SOL (minimum acceptable: ${minAcceptable} SOL). Use at least ${minAcceptable} SOL.`,
           };
         }
       }
