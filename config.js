@@ -90,6 +90,10 @@ export const config = {
     athFilterPct:       u.athFilterPct       ?? null, // e.g. -20 = only deploy if price is >= 20% below ATH
     maxPump1hPct:       u.maxPump1hPct       ?? 40,  // max 1h price pump %, reject FOMO entries
     minPoolAgeHours:    u.minPoolAgeHours    ?? 6,   // min pool age in hours before deploying
+    // Volume TA entry signals (soft hints to LLM, not hard filters)
+    volumeTrendDeclineThreshold: u.volumeTrendDeclineThreshold ?? 0.6,  // trend_ratio < 0.6 → DECLINING
+    volumeTrendExpandThreshold:  u.volumeTrendExpandThreshold  ?? 1.4,  // trend_ratio > 1.4 → EXPANDING
+    entryBuySellRatio:           u.entryBuySellRatio           ?? 1.5,  // sells/buys > 1.5 → BEARISH signal
   },
 
   // ─── Position Management ────────────────
@@ -139,6 +143,15 @@ export const config = {
       enabled:            u.emergencyExits?.rapidPriceDrop?.enabled            ?? true,
       dropPct5m:          u.emergencyExits?.rapidPriceDrop?.dropPct5m          ?? -8,
       requireNegativePnl: u.emergencyExits?.rapidPriceDrop?.requireNegativePnl ?? true,
+    },
+    // Rule 9: persistent sell-pressure streak — slow bleed exit before stop loss fires
+    sellPressureStreak: {
+      enabled:           u.emergencyExits?.sellPressureStreak?.enabled           ?? true,
+      streakCount:       u.emergencyExits?.sellPressureStreak?.streakCount       ?? 3,    // consecutive 5m windows
+      ratio:             u.emergencyExits?.sellPressureStreak?.ratio             ?? 1.2,  // sells > buys × ratio
+      safetyPnlPct:      u.emergencyExits?.sellPressureStreak?.safetyPnlPct     ?? 5,    // skip if PnL > +5%
+      windowMin:         u.emergencyExits?.sellPressureStreak?.windowMin         ?? 30,   // lookback window (min)
+      snapshotMaxAgeMin: u.emergencyExits?.sellPressureStreak?.snapshotMaxAgeMin ?? 120,  // max snapshot retention (min)
     },
   },
 

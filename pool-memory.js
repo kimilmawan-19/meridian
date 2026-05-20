@@ -338,6 +338,66 @@ export function recordPositionSnapshot(poolAddress, snapshot) {
 }
 
 /**
+ * Record a 5-minute volume/orderflow snapshot for sell-pressure streak tracking.
+ * Deduplicates: skips if last snapshot is less than 55 seconds old (within DexScreener cache TTL).
+ * Called each management cycle and 30s PnL poll from already-fetched market data — no extra I/O.
+ */
+export function addVolumeSnapshot(poolAddress, { vol_5m, buys_5m, sells_5m }) {
+  if (!poolAddress) return;
+  const db = load();
+
+  if (!db[poolAddress]) {
+    db[poolAddress] = {
+      name: poolAddress.slice(0, 8),
+      base_mint: null,
+      deploys: [],
+      total_deploys: 0,
+      avg_pnl_pct: 0,
+      win_rate: 0,
+      adjusted_win_rate: 0,
+      adjusted_win_rate_sample_count: 0,
+      last_deployed_at: null,
+      last_outcome: null,
+      notes: [],
+    };
+  }
+
+  if (!db[poolAddress].volume_snapshots) db[poolAddress].volume_snapshots = [];
+
+  const snaps = db[poolAddress].volume_snapshots;
+  if (snaps.length > 0) {
+    const lastTs = new Date(snaps[snaps.length - 1].ts).getTime();
+    if (Date.now() - lastTs < 55_000) return;
+  }
+
+  snaps.push({
+    ts: new Date().toISOString(),
+    vol_5m: vol_5m ?? null,
+    buys_5m: buys_5m ?? null,
+    sells_5m: sells_5m ?? null,
+  });
+
+  const maxAgeMin = config.emergencyExits?.sellPressureStreak?.snapshotMaxAgeMin ?? 120;
+  const cutoff = Date.now() - maxAgeMin * 60 * 1000;
+  db[poolAddress].volume_snapshots = snaps.filter(s => new Date(s.ts).getTime() >= cutoff);
+
+  save(db);
+}
+
+/**
+ * Get volume snapshots within the last N minutes for a pool.
+ * Returns ordered array of { ts, vol_5m, buys_5m, sells_5m }.
+ */
+export function getVolumeWindow(poolAddress, windowMin = 30) {
+  if (!poolAddress) return [];
+  const db = load();
+  const entry = db[poolAddress];
+  if (!Array.isArray(entry?.volume_snapshots)) return [];
+  const cutoff = Date.now() - windowMin * 60 * 1000;
+  return entry.volume_snapshots.filter(s => new Date(s.ts).getTime() >= cutoff);
+}
+
+/**
  * Recall focused context for a specific pool — used before screening or management.
  * Returns a short formatted string ready for injection into the agent goal.
  */

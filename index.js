@@ -29,7 +29,7 @@ import {
 import { generateBriefing } from "./briefing.js";
 import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop, batchUpdateMarketData } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
-import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
+import { recordPositionSnapshot, recallForPool, addPoolNote, addVolumeSnapshot, getVolumeWindow } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
 import { getTokenNarrative, getTokenInfo } from "./tools/token.js";
 import { stageSignals } from "./signal-tracker.js";
@@ -249,6 +249,14 @@ export async function runManagementCycle({ silent = false } = {}) {
     }
     if (marketUpdates.size > 0) batchUpdateMarketData(marketUpdates);
 
+    // Record volume snapshots for sell-pressure streak (Rule 9) — reuses already-fetched market data
+    for (const p of positionData) {
+      const md = p._marketData;
+      if (md && md.volume_5m != null) {
+        addVolumeSnapshot(p.pool, { vol_5m: md.volume_5m, buys_5m: md.txn_buys_5m ?? 0, sells_5m: md.txn_sells_5m ?? 0 });
+      }
+    }
+
     // JS trailing TP check
     const exitMap = new Map();
     for (const p of positionData) {
@@ -287,7 +295,9 @@ export async function runManagementCycle({ silent = false } = {}) {
         continue;
       }
 
-      const closeRule = getDeterministicCloseRule(p, config.management, p._marketData);
+      const streakWindowMin = config.emergencyExits.sellPressureStreak?.windowMin ?? 30;
+      const volumeWindow = getVolumeWindow(p.pool, streakWindowMin);
+      const closeRule = getDeterministicCloseRule(p, config.management, p._marketData, volumeWindow);
       if (closeRule) {
         actionMap.set(p.position, closeRule);
         if (closeRule.rule === 7 || closeRule.rule === 8) {
@@ -325,6 +335,27 @@ export async function runManagementCycle({ silent = false } = {}) {
             txnBuys5m: p._marketData?.txn_buys_5m,
             txnSells5m: p._marketData?.txn_sells_5m,
             pnlPct: p.pnl_pct,
+          });
+        } else if (closeRule.rule === 9) {
+          log("market_data", `[mgmt_cycle] Rule 9 (${closeRule.reason}) triggered for ${p.pair} — pnl=${p.pnl_pct ?? "?"}% sells=${p._marketData?.txn_sells_5m ?? "?"} buys=${p._marketData?.txn_buys_5m ?? "?"}`);
+          appendDecision({
+            type: "tactical_exit",
+            actor: "MANAGER",
+            pool: p.pool,
+            pool_name: p.pair,
+            position: p.position,
+            summary: `Tactical exit Rule 9: ${closeRule.reason}`,
+            reason: closeRule.reason,
+            metrics: {
+              rule: 9,
+              txn_buys_5m: p._marketData?.txn_buys_5m,
+              txn_sells_5m: p._marketData?.txn_sells_5m,
+              volume_5m: p._marketData?.volume_5m,
+              price_change_5m: p._marketData?.price_change_5m,
+              pnl_pct: p.pnl_pct,
+              age_minutes: p.age_minutes,
+              streak_window_snapshots: volumeWindow.length,
+            },
           });
         }
         continue;
@@ -514,16 +545,18 @@ export async function runScreeningCycle({ silent = false } = {}) {
     const allCandidates = [];
     for (const pool of candidates) {
       const mint = pool.base?.mint;
-      const [smartWallets, narrative, tokenInfo] = await Promise.allSettled([
+      const [smartWallets, narrative, tokenInfo, screenMd] = await Promise.allSettled([
         checkSmartWalletsOnPool({ pool_address: pool.pool }),
         mint ? getTokenNarrative({ mint }) : Promise.resolve(null),
         mint ? getTokenInfo({ query: mint }) : Promise.resolve(null),
+        fetchPoolMarketData(pool.pool),
       ]);
       allCandidates.push({
         pool,
         sw: smartWallets.status === "fulfilled" ? smartWallets.value : null,
         n: narrative.status === "fulfilled" ? narrative.value : null,
         ti: tokenInfo.status === "fulfilled" ? tokenInfo.value?.results?.[0] : null,
+        md: screenMd.status === "fulfilled" ? screenMd.value : null,
         mem: recallForPool(pool.pool),
       });
       await new Promise(r => setTimeout(r, 150)); // avoid 429s
@@ -625,7 +658,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
     );
 
     // Build compact candidate blocks
-    const candidateBlocks = passing.map(({ pool, sw, n, ti, mem }, i) => {
+    const candidateBlocks = passing.map(({ pool, sw, n, ti, md, mem }, i) => {
       const botPct = ti?.audit?.bot_holders_pct ?? "?";
       const top10Pct = ti?.audit?.top_holders_pct ?? "?";
       const feesSol = ti?.global_fees_sol ?? "?";
@@ -657,11 +690,38 @@ export async function runScreeningCycle({ silent = false } = {}) {
         ? `  pvp: HIGH — rival ${pool.pvp_rival_name || pool.pvp_symbol} (${pool.pvp_rival_mint?.slice(0, 8)}...) has pool ${pool.pvp_rival_pool?.slice(0, 8)}..., tvl=$${pool.pvp_rival_tvl}, holders=${pool.pvp_rival_holders}, fees=${pool.pvp_rival_fees}SOL`
         : null;
 
+      // Volume TA soft signals — hint to LLM, not hard filter
+      const volSignalParts = [];
+      const volChangePct = pool.volume_change_pct;
+      if (volChangePct != null) {
+        const trendRatio = 1 + volChangePct / 100;
+        const dt = config.screening.volumeTrendDeclineThreshold ?? 0.6;
+        const et = config.screening.volumeTrendExpandThreshold ?? 1.4;
+        if (trendRatio < dt) volSignalParts.push(`vol_trend=DECLINING(${volChangePct}%)`);
+        else if (trendRatio > et) volSignalParts.push(`vol_trend=EXPANDING(${volChangePct}%)`);
+        else volSignalParts.push(`vol_trend=STABLE(${volChangePct}%)`);
+      }
+      if (md?.txn_buys_5m != null && md?.txn_sells_5m != null) {
+        const total = md.txn_buys_5m + md.txn_sells_5m;
+        const bsRatio = config.screening.entryBuySellRatio ?? 1.5;
+        if (total >= 10) {
+          if (md.txn_sells_5m > md.txn_buys_5m * bsRatio) {
+            volSignalParts.push(`order_flow=BEARISH(S:${md.txn_sells_5m}/B:${md.txn_buys_5m})`);
+          } else if (md.txn_buys_5m > md.txn_sells_5m * bsRatio) {
+            volSignalParts.push(`order_flow=BULLISH(B:${md.txn_buys_5m}/S:${md.txn_sells_5m})`);
+          } else {
+            volSignalParts.push(`order_flow=BALANCED(B:${md.txn_buys_5m}/S:${md.txn_sells_5m})`);
+          }
+        }
+      }
+      const volSignalLine = volSignalParts.length > 0 ? `  vol_signal: ${volSignalParts.join(", ")}` : null;
+
       const block = [
         `POOL: ${pool.name} (${pool.pool})`,
         `  metrics: bin_step=${pool.bin_step}, fee_pct=${pool.fee_pct}%, fee_tvl=${pool.fee_active_tvl_ratio}, vol=$${pool.volume_window}, tvl=$${pool.tvl ?? pool.active_tvl}, volatility_${pool.volatility_timeframe || "30m"}=${pool.volatility}, mcap=$${pool.mcap}, organic=${pool.organic_score}${pool.token_age_hours != null ? `, age=${pool.token_age_hours}h` : ""}`,
         `  audit: top10=${top10Pct}%, bots=${botPct}%, fees=${feesSol}SOL${launchpad ? `, launchpad=${launchpad}` : ""}`,
         pvpLine,
+        volSignalLine,
         okxParts ? `  okx: ${okxParts}` : okxUnavailable ? `  okx: unavailable` : null,
         okxTags ? `  tags: ${okxTags}` : null,
         pool.price_vs_ath_pct != null ? `  ath: price_vs_ath=${pool.price_vs_ath_pct}%${pool.top_cluster_trend ? `, top_cluster=${pool.top_cluster_trend}` : ""}` : null,
@@ -887,7 +947,11 @@ Summarize the current portfolio health, total fees earned, and performance of al
         }
         // BUG FIX: fetch market data so Rules 7 & 8 can evaluate in the fast 30s poll path
         const pollMd = await fetchPoolMarketData(p.pool).catch(() => null);
-        const closeRule = getDeterministicCloseRule(p, config.management, pollMd);
+        if (pollMd?.volume_5m != null) {
+          addVolumeSnapshot(p.pool, { vol_5m: pollMd.volume_5m, buys_5m: pollMd.txn_buys_5m ?? 0, sells_5m: pollMd.txn_sells_5m ?? 0 });
+        }
+        const pollVolumeWindow = getVolumeWindow(p.pool, config.emergencyExits.sellPressureStreak?.windowMin ?? 30);
+        const closeRule = getDeterministicCloseRule(p, config.management, pollMd, pollVolumeWindow);
         if (closeRule) {
           const isEmergency = closeRule.rule === 7 || closeRule.rule === 8;
           if (isEmergency) {
@@ -984,7 +1048,7 @@ function formatCandidates(candidates) {
   ].join("\n");
 }
 
-function getDeterministicCloseRule(position, managementConfig, marketData = null) {
+function getDeterministicCloseRule(position, managementConfig, marketData = null, volumeWindow = []) {
   const tracked = getTrackedPosition(position.position);
   const pnlSuspect = (() => {
     if (position.pnl_pct == null) return false;
@@ -1066,6 +1130,37 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
       const pnlOk = !rpCfg.requireNegativePnl || (!pnlSuspect && (position.pnl_pct ?? 0) < 0);
       if (priceChange5m != null && priceChange5m < rpCfg.dropPct5m && pnlOk) {
         return { action: "CLOSE", rule: 8, reason: "rapid dump" };
+      }
+    }
+  }
+
+  // Rule 9: sell-pressure streak — fills the gap between acute violence (Rule 7/8) and stop loss (Rule 1)
+  // Catches the slow bleed: 15+ consecutive minutes of sell dominance, no single-candle trigger needed
+  if (marketData && volumeWindow.length > 0) {
+    const spCfg = config.emergencyExits.sellPressureStreak;
+    if (spCfg?.enabled) {
+      const streakNeeded = spCfg.streakCount ?? 3;
+      const ratio = spCfg.ratio ?? 1.2;
+      const safetyPnlPct = spCfg.safetyPnlPct ?? 5;
+      // Safety guards: don't exit if we're profiting OR if price is actually going up
+      const pnlBelowSafety = (position.pnl_pct ?? 0) < safetyPnlPct;
+      const priceFalling = (marketData.price_change_5m ?? 0) <= 0;
+      if (!pnlSuspect && pnlBelowSafety && priceFalling && volumeWindow.length >= streakNeeded) {
+        let streak = 0;
+        for (let i = volumeWindow.length - 1; i >= 0; i--) {
+          const s = volumeWindow[i];
+          const buys = s.buys_5m ?? 0;
+          const sells = s.sells_5m ?? 0;
+          // Require minimum sample size to avoid noise from near-dead pools
+          if (buys + sells >= 5 && sells > buys * ratio) {
+            streak++;
+          } else {
+            break;
+          }
+        }
+        if (streak >= streakNeeded) {
+          return { action: "CLOSE", rule: 9, reason: `sell pressure streak (${streak} windows)` };
+        }
       }
     }
   }
