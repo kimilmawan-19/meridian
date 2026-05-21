@@ -568,12 +568,14 @@ export async function runScreeningCycle({ silent = false } = {}) {
     // Hard filters after token recon — block launchpads and excessive Jupiter bot holders
     const filteredOut = [];
     const passing = allCandidates.filter(({ pool, ti, sw }) => {
-      // 🆕 RULE: minimum pool age — rug risk paling tinggi di jam-jam awal
+      // RULE: minimum token age — null = disabled (default). Set to 1-2h for safety net
+      // against very new tokens without blocking most trending pools.
+      // Note: token_age_hours measures the base TOKEN creation time, not when the LP pool was created.
       const ageHours = pool.token_age_hours ?? null;
-      const minAge = config.screening.minPoolAgeHours ?? 6;
-      if (ageHours != null && ageHours < minAge) {
-        log("screening", `Age filter: dropped ${pool.name} — age ${ageHours}h < ${minAge}h`);
-        filteredOut.push({ name: pool.name, reason: `pool too young (${ageHours}h < ${minAge}h)` });
+      const minAge = config.screening.minPoolAgeHours ?? null;
+      if (minAge != null && ageHours != null && ageHours < minAge) {
+        log("screening", `Age filter: dropped ${pool.name} — token age ${ageHours}h < min ${minAge}h`);
+        filteredOut.push({ name: pool.name, reason: `token too young (${ageHours}h < ${minAge}h)` });
         return false;
       }
 
