@@ -9,7 +9,7 @@ import { getMyPositions, closePosition, getActiveBin } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates } from "./tools/screening.js";
 import { fetchPoolMarketData, getMarketDataStats } from "./tools/market-data.js";
-import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
+import { config, configMeta, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
 import { evolveThresholds, getPerformanceSummary, getDetailedPerformanceAnalysis } from "./lessons.js";
 import { executeTool, registerCronRestarter } from "./tools/executor.js";
 import {
@@ -46,6 +46,9 @@ if (isMain) {
   log("startup", "DLMM LP Agent starting...");
   log("startup", `Mode: ${process.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE"}`);
   log("startup", `Model: ${process.env.LLM_MODEL || "hermes-3-405b"}`);
+  if (configMeta.lastEvolved) {
+    log("startup", `⚠️  Screening thresholds were auto-evolved by lessons system on ${configMeta.lastEvolved} (after ${configMeta.positionsAtEvolution ?? "?"} closed positions). Active: minFeeActiveTvlRatio=${config.screening.minFeeActiveTvlRatio}, minOrganic=${config.screening.minOrganic}. If screening returns 0 candidates, these may be too strict — reset manually in user-config.json.`);
+  }
   ensureAgentId();
   bootstrapHiveMind().catch((error) => log("hivemind_warn", `Bootstrap failed: ${error.message}`));
   startHiveMindBackgroundSync();
@@ -2133,7 +2136,6 @@ function getLoneCandidateSkipReason({ pool, sw, n, ti } = {}) {
   const globalFeesSol = Number(tokenInfo.global_fees_sol ?? pool.gmgn_total_fee_sol);
   const top10Pct = Number(tokenInfo.audit?.top_holders_pct ?? pool.gmgn_token_info_top10_pct ?? pool.gmgn_top10_holder_pct);
   const botPct = Number(tokenInfo.audit?.bot_holders_pct ?? pool.gmgn_bot_degen_pct);
-  if (pool.is_wash) return "wash trading was flagged";
   if (pool.is_rugpull && smartWalletCount === 0) return "rugpull risk was flagged and no smart wallets offset it";
   if (pool.is_pvp && smartWalletCount === 0) return "PVP symbol conflict and no smart-wallet confirmation";
   if (Number.isFinite(globalFeesSol) && globalFeesSol < config.screening.minTokenFeesSol) {
@@ -2141,9 +2143,6 @@ function getLoneCandidateSkipReason({ pool, sw, n, ti } = {}) {
   }
   if (Number.isFinite(top10Pct) && top10Pct > config.screening.maxTop10Pct) {
     return `top10 concentration ${top10Pct}% above maximum ${config.screening.maxTop10Pct}%`;
-  }
-  if (Number.isFinite(botPct) && botPct > config.screening.maxBotHoldersPct) {
-    return `bot holders ${botPct}% above maximum ${config.screening.maxBotHoldersPct}%`;
   }
   if (!hasNarrative && smartWalletCount === 0) return "only candidate has no narrative and no smart-wallet confirmation";
   return null;

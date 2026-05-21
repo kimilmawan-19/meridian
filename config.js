@@ -251,6 +251,11 @@ export const config = {
  *   3.0 SOL wallet → 0.98 SOL deploy
  *   4.0 SOL wallet → 1.33 SOL deploy
  */
+export const configMeta = {
+  lastEvolved:          u._lastEvolved          ?? null,
+  positionsAtEvolution: u._positionsAtEvolution ?? null,
+};
+
 export function computeDeployAmount(walletSol) {
   const reserve  = config.management.gasReserve      ?? 0.2;
   const pct      = config.management.positionSizePct ?? 0.35;
