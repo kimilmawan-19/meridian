@@ -374,6 +374,7 @@ export async function discoverPools({
   });
 
   let rawPools = Array.isArray(data.data) ? data.data : [];
+  log("screening", `Pool Discovery API: ${rawPools.length} raw pools (total=${data.total ?? "?"}) | filters: ${filters}`);
 
   if (config.screening.useDiscordSignals) {
     const signalCandidates = await fetchDiscordSignalCandidates().catch((error) => {

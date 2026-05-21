@@ -611,7 +611,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
         .join("\n");
       screenReport = combinedExamples
         ? `No candidates available.\nFiltered examples:\n${combinedExamples}`
-        : `No candidates available (all filtered by launchpad / holder-quality rules).`;
+        : `No candidates available (Meteora API returned 0 pools matching current filter criteria — check logs for filter query).`;
       appendDecision({
         type: "no_deploy",
         actor: "SCREENER",
