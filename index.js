@@ -600,6 +600,16 @@ export async function runScreeningCycle({ silent = false } = {}) {
         return false;
       }
 
+      // 🆕 RULE: minimum token fees — low fees = bundled/scam. No smart-wallet override.
+      // Only enforced when fees data is available (null fallback = let LLM decide).
+      const feeSol = Number(ti?.global_fees_sol ?? pool.gmgn_total_fee_sol);
+      const minFeeSol = config.screening.minTokenFeesSol;
+      if (Number.isFinite(feeSol) && Number.isFinite(minFeeSol) && feeSol < minFeeSol) {
+        log("screening", `Fee filter: dropped ${pool.name} — token fees ${feeSol} SOL < min ${minFeeSol} SOL`);
+        filteredOut.push({ name: pool.name, reason: `token fees ${feeSol} SOL below minimum ${minFeeSol} SOL` });
+        return false;
+      }
+
       const launchpad = pool.launchpad ?? ti?.launchpad ?? null;
       if (launchpad && config.screening.allowedLaunchpads?.length > 0 && !config.screening.allowedLaunchpads.includes(launchpad)) {
         log("screening", `Skipping ${pool.name} — launchpad ${launchpad} not in allow-list`);
@@ -2147,11 +2157,7 @@ function getLoneCandidateSkipReason({ pool, sw, n, ti } = {}) {
   const smartWalletCount = Math.max(sw?.in_pool?.length ?? 0, Number(pool.gmgn_smart_wallets ?? 0) || 0);
   const tokenInfo = ti || {};
   const hasNarrative = !!n?.narrative;
-  const globalFeesSol = Number(tokenInfo.global_fees_sol ?? pool.gmgn_total_fee_sol);
   const top10Pct = Number(tokenInfo.audit?.top_holders_pct ?? pool.gmgn_token_info_top10_pct ?? pool.gmgn_top10_holder_pct);
-  if (Number.isFinite(globalFeesSol) && globalFeesSol < config.screening.minTokenFeesSol) {
-    return `token fees ${globalFeesSol} SOL below minimum ${config.screening.minTokenFeesSol} SOL`;
-  }
   if (Number.isFinite(top10Pct) && top10Pct > config.screening.maxTop10Pct) {
     return `top10 concentration ${top10Pct}% above maximum ${config.screening.maxTop10Pct}%`;
   }
