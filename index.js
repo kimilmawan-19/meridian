@@ -567,7 +567,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
 
     // Hard filters after token recon — block launchpads and excessive Jupiter bot holders
     const filteredOut = [];
-    const passing = allCandidates.filter(({ pool, ti }) => {
+    const passing = allCandidates.filter(({ pool, ti, sw }) => {
       // 🆕 RULE: minimum pool age — rug risk paling tinggi di jam-jam awal
       const ageHours = pool.token_age_hours ?? null;
       const minAge = config.screening.minPoolAgeHours ?? 6;
@@ -583,6 +583,20 @@ export async function runScreeningCycle({ silent = false } = {}) {
       if (pump1h != null && pump1h > maxPump) {
         log("screening", `FOMO filter: dropped ${pool.name} — 1h +${pump1h}% > ${maxPump}%`);
         filteredOut.push({ name: pool.name, reason: `1h pump ${pump1h}% > ${maxPump}%` });
+        return false;
+      }
+
+      // 🆕 RULE: rugpull + PVP hard filter — applied uniformly to all candidates.
+      // Override only when smart wallets are present in the pool.
+      const smartWalletCount = Math.max(sw?.in_pool?.length ?? 0, Number(pool.gmgn_smart_wallets ?? 0) || 0);
+      if (pool.is_rugpull && smartWalletCount === 0) {
+        log("screening", `Rugpull filter: dropped ${pool.name} — OKX rugpull flag with no smart wallets`);
+        filteredOut.push({ name: pool.name, reason: "rugpull flagged with no smart wallets" });
+        return false;
+      }
+      if (pool.is_pvp && smartWalletCount === 0) {
+        log("screening", `PVP filter: dropped ${pool.name} — PVP symbol conflict with no smart wallets`);
+        filteredOut.push({ name: pool.name, reason: "PVP symbol conflict with no smart wallets" });
         return false;
       }
 
@@ -2135,8 +2149,6 @@ function getLoneCandidateSkipReason({ pool, sw, n, ti } = {}) {
   const hasNarrative = !!n?.narrative;
   const globalFeesSol = Number(tokenInfo.global_fees_sol ?? pool.gmgn_total_fee_sol);
   const top10Pct = Number(tokenInfo.audit?.top_holders_pct ?? pool.gmgn_token_info_top10_pct ?? pool.gmgn_top10_holder_pct);
-  if (pool.is_rugpull && smartWalletCount === 0) return "rugpull risk was flagged and no smart wallets offset it";
-  if (pool.is_pvp && smartWalletCount === 0) return "PVP symbol conflict and no smart-wallet confirmation";
   if (Number.isFinite(globalFeesSol) && globalFeesSol < config.screening.minTokenFeesSol) {
     return `token fees ${globalFeesSol} SOL below minimum ${config.screening.minTokenFeesSol} SOL`;
   }
