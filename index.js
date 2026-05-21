@@ -2135,7 +2135,6 @@ function getLoneCandidateSkipReason({ pool, sw, n, ti } = {}) {
   const hasNarrative = !!n?.narrative;
   const globalFeesSol = Number(tokenInfo.global_fees_sol ?? pool.gmgn_total_fee_sol);
   const top10Pct = Number(tokenInfo.audit?.top_holders_pct ?? pool.gmgn_token_info_top10_pct ?? pool.gmgn_top10_holder_pct);
-  const botPct = Number(tokenInfo.audit?.bot_holders_pct ?? pool.gmgn_bot_degen_pct);
   if (pool.is_rugpull && smartWalletCount === 0) return "rugpull risk was flagged and no smart wallets offset it";
   if (pool.is_pvp && smartWalletCount === 0) return "PVP symbol conflict and no smart-wallet confirmation";
   if (Number.isFinite(globalFeesSol) && globalFeesSol < config.screening.minTokenFeesSol) {
