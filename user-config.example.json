@@ -46,6 +46,7 @@
   "maxTokenAgeHours": null,
   "minPoolAgeHours": null,
   "athFilterPct": null,
+  "maxPump1hPct": null,
 
   "minClaimAmount": 5,
   "autoSwapAfterClaim": false,

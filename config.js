@@ -88,7 +88,7 @@ export const config = {
     minTokenAgeHours:   u.minTokenAgeHours   ?? null, // null = no minimum
     maxTokenAgeHours:   u.maxTokenAgeHours   ?? null, // null = no maximum
     athFilterPct:       u.athFilterPct       ?? null, // e.g. -20 = only deploy if price is >= 20% below ATH
-    maxPump1hPct:       u.maxPump1hPct       ?? 40,  // max 1h price pump %, reject FOMO entries
+    maxPump1hPct:       u.maxPump1hPct       ?? null, // null = disabled. Use athFilterPct for position-based anti-uptrend. Set e.g. 80 to also block extreme short-term pumps.
     minPoolAgeHours:    u.minPoolAgeHours    ?? null, // null = disabled. Measures token age (not LP pool age). Set to 1-2 to block very new tokens without conflicting with category="trending".
     // Volume TA entry signals (soft hints to LLM, not hard filters)
     volumeTrendDeclineThreshold: u.volumeTrendDeclineThreshold ?? 0.6,  // trend_ratio < 0.6 → DECLINING

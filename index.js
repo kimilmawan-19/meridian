@@ -579,10 +579,11 @@ export async function runScreeningCycle({ silent = false } = {}) {
         return false;
       }
 
-      // 🆕 RULE: anti-FOMO — skip pool yang pump tinggi 1 jam terakhir
+      // RULE: anti-FOMO short-term pump — null = disabled (default). Use athFilterPct for
+      // position-based anti-uptrend; set maxPump1hPct only if you also want to cap 1h momentum.
       const pump1h = ti?.stats_1h?.price_change ?? null;
-      const maxPump = config.screening.maxPump1hPct ?? 40;
-      if (pump1h != null && pump1h > maxPump) {
+      const maxPump = config.screening.maxPump1hPct ?? null;
+      if (maxPump != null && pump1h != null && pump1h > maxPump) {
         log("screening", `FOMO filter: dropped ${pool.name} — 1h +${pump1h}% > ${maxPump}%`);
         filteredOut.push({ name: pool.name, reason: `1h pump ${pump1h}% > ${maxPump}%` });
         return false;
