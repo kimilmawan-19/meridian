@@ -613,6 +613,16 @@ export async function runScreeningCycle({ silent = false } = {}) {
         return false;
       }
 
+      // 🆕 RULE: top10 holder concentration — applied uniformly to all candidates.
+      // Only enforced when top10 data is available (null fallback = let LLM decide).
+      const top10Pct = Number(ti?.audit?.top_holders_pct ?? pool.gmgn_token_info_top10_pct ?? pool.gmgn_top10_holder_pct);
+      const maxTop10 = config.screening.maxTop10Pct;
+      if (Number.isFinite(top10Pct) && Number.isFinite(maxTop10) && top10Pct > maxTop10) {
+        log("screening", `Top10 filter: dropped ${pool.name} — top10 ${top10Pct}% > max ${maxTop10}%`);
+        filteredOut.push({ name: pool.name, reason: `top10 concentration ${top10Pct}% above maximum ${maxTop10}%` });
+        return false;
+      }
+
       const launchpad = pool.launchpad ?? ti?.launchpad ?? null;
       if (launchpad && config.screening.allowedLaunchpads?.length > 0 && !config.screening.allowedLaunchpads.includes(launchpad)) {
         log("screening", `Skipping ${pool.name} — launchpad ${launchpad} not in allow-list`);
@@ -2155,15 +2165,10 @@ function fmtPct(value) {
   return Number.isFinite(n) ? `${n.toFixed(2)}%` : "?";
 }
 
-function getLoneCandidateSkipReason({ pool, sw, n, ti } = {}) {
+function getLoneCandidateSkipReason({ pool, sw, n } = {}) {
   if (!pool) return "missing candidate data";
   const smartWalletCount = Math.max(sw?.in_pool?.length ?? 0, Number(pool.gmgn_smart_wallets ?? 0) || 0);
-  const tokenInfo = ti || {};
   const hasNarrative = !!n?.narrative;
-  const top10Pct = Number(tokenInfo.audit?.top_holders_pct ?? pool.gmgn_token_info_top10_pct ?? pool.gmgn_top10_holder_pct);
-  if (Number.isFinite(top10Pct) && top10Pct > config.screening.maxTop10Pct) {
-    return `top10 concentration ${top10Pct}% above maximum ${config.screening.maxTop10Pct}%`;
-  }
   if (!hasNarrative && smartWalletCount === 0) return "only candidate has no narrative and no smart-wallet confirmation";
   return null;
 }
