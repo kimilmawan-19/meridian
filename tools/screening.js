@@ -503,30 +503,9 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   const { positions } = await getMyPositions();
   const occupiedPools = new Set(positions.map((p) => p.pool));
   const occupiedMints = new Set(positions.map((p) => p.base_mint).filter(Boolean));
-  const minTvl = Number(config.screening.minTvl ?? 0);
-  const maxTvl = config.screening.maxTvl == null ? null : Number(config.screening.maxTvl);
-  const minFeeActiveTvlRatio = Number(config.screening.minFeeActiveTvlRatio ?? 0);
-
   const eligible = pools
     .filter((p) => {
-      const tvl = Number(p.tvl ?? p.active_tvl ?? 0);
-      if (Number.isFinite(minTvl) && minTvl > 0 && tvl < minTvl) {
-        pushFilteredReason(filteredOut, p, `TVL $${tvl} below minTvl $${minTvl}`);
-        return false;
-      }
-      if (Number.isFinite(maxTvl) && maxTvl > 0 && tvl > maxTvl) {
-        pushFilteredReason(filteredOut, p, `TVL $${tvl} above maxTvl $${maxTvl}`);
-        return false;
-      }
-      const feeActiveTvlRatio = Number(p.fee_active_tvl_ratio);
-      if (Number.isFinite(minFeeActiveTvlRatio) && minFeeActiveTvlRatio > 0 && (!Number.isFinite(feeActiveTvlRatio) || feeActiveTvlRatio < minFeeActiveTvlRatio)) {
-        pushFilteredReason(filteredOut, p, `fee/active-TVL ${Number.isFinite(feeActiveTvlRatio) ? feeActiveTvlRatio : "unknown"} below minFeeActiveTvlRatio ${minFeeActiveTvlRatio}`);
-        return false;
-      }
-      if (!isUsableVolatility(p.volatility)) {
-        pushFilteredReason(filteredOut, p, `volatility ${p.volatility ?? "unknown"} is unusable`);
-        return false;
-      }
+      // TVL, feeTvl, and volatility are already guaranteed by Stage 1 (API) + Stage 2 (getRawPoolScreeningRejectReason)
       if (occupiedPools.has(p.pool)) {
         pushFilteredReason(filteredOut, p, "already have an open position in this pool");
         return false;

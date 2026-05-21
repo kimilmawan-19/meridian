@@ -583,7 +583,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
         return false;
       }
 
-      const launchpad = ti?.launchpad ?? null;
+      const launchpad = pool.launchpad ?? ti?.launchpad ?? null;
       if (launchpad && config.screening.allowedLaunchpads?.length > 0 && !config.screening.allowedLaunchpads.includes(launchpad)) {
         log("screening", `Skipping ${pool.name} — launchpad ${launchpad} not in allow-list`);
         filteredOut.push({ name: pool.name, reason: `launchpad ${launchpad} not in allow-list` });
