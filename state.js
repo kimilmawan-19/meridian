@@ -447,8 +447,11 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
     log("state", `Position ${position_address} trailing TP activated (confirmed peak: ${pos.peak_pnl_pct}%)`);
   }
 
-  // Activate break-even stop once peak reaches breakEvenTriggerPct
-  if (!pos.break_even_active && (pos.peak_pnl_pct ?? 0) >= (mgmtConfig.breakEvenTriggerPct ?? 1)) {
+  // Activate break-even stop once peak reaches breakEvenTriggerPct.
+  // Skip when OOR ABOVE (position is idle SOL, never entered range) — break-even has no meaning
+  // while the position hasn't activated yet and a natural dip would immediately close it.
+  const oorDirForBreakEven = getOorDirection(positionData);
+  if (!pos.break_even_active && (pos.peak_pnl_pct ?? 0) >= (mgmtConfig.breakEvenTriggerPct ?? 1) && oorDirForBreakEven !== "ABOVE") {
     pos.break_even_active = true;
     changed = true;
     log("state", `Position ${position_address} break-even stop activated (confirmed peak: ${pos.peak_pnl_pct}%)`);
@@ -510,10 +513,16 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   // ── Out of range too long ──────────────────────────────────────
   if (pos.out_of_range_since) {
     const minutesOOR = Math.floor((Date.now() - new Date(pos.out_of_range_since).getTime()) / 60000);
-    if (minutesOOR >= mgmtConfig.outOfRangeWaitMinutes) {
+    // Use direction-aware timeout: OOR ABOVE (idle SOL, never activated) gets its own config,
+    // so user can hold longer before giving up on a pullback.
+    const oorDir = getOorDirection(positionData);
+    const oorTimeout = (oorDir === "ABOVE" && mgmtConfig.outOfRangeWaitMinutesAbove != null)
+      ? mgmtConfig.outOfRangeWaitMinutesAbove
+      : mgmtConfig.outOfRangeWaitMinutes;
+    if (minutesOOR >= oorTimeout) {
       return {
         action: "OUT_OF_RANGE",
-        reason: `Out of range for ${minutesOOR}m (limit: ${mgmtConfig.outOfRangeWaitMinutes}m)`,
+        reason: `OOR ${oorDir ?? ""} for ${minutesOOR}m (limit: ${oorTimeout}m)`.trim(),
       };
     }
   }
