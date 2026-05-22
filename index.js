@@ -27,7 +27,7 @@ import {
   createLiveMessage,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop, batchUpdateMarketData } from "./state.js";
+import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop, batchUpdateMarketData, getOorDirection } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote, addVolumeSnapshot, getVolumeWindow } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
@@ -385,7 +385,8 @@ export async function runManagementCycle({ silent = false } = {}) {
 
     const reportLines = positionData.map((p) => {
       const act = actionMap.get(p.position);
-      const inRange = p.in_range ? "🟢 IN" : `🔴 OOR ${p.minutes_out_of_range ?? 0}m`;
+      const oorDir = !p.in_range ? getOorDirection(p) : null;
+      const inRange = p.in_range ? "🟢 IN" : `🔴 OOR${oorDir ? ` ${oorDir}` : ""} ${p.minutes_out_of_range ?? 0}m`;
       const val = config.management.solMode ? `◎${p.total_value_usd ?? "?"}` : `$${p.total_value_usd ?? "?"}`;
       const unclaimed = config.management.solMode ? `◎${p.unclaimed_fees_usd ?? "?"}` : `$${p.unclaimed_fees_usd ?? "?"}`;
       const statusLabel = act.action === "INSTRUCTION" ? "HOLD (instruction)" : act.action;
@@ -473,7 +474,7 @@ After executing, write a brief one-line result per position.
       }
       for (const p of positions) {
         if (!p.in_range && p.minutes_out_of_range >= config.management.outOfRangeWaitMinutes) {
-          notifyOutOfRange({ pair: p.pair, minutesOOR: p.minutes_out_of_range }).catch(() => { });
+          notifyOutOfRange({ pair: p.pair, minutesOOR: p.minutes_out_of_range, direction: getOorDirection(p) }).catch(() => { });
         }
       }
     }
@@ -1119,7 +1120,9 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
   if (!pnlSuspect && position.pnl_pct != null && position.pnl_pct <= managementConfig.stopLossPct && posAgeMin >= minAgeForStopLoss) {
     return { action: "CLOSE", rule: 1, reason: "stop loss" };
   }
-  if (!pnlSuspect && position.pnl_pct != null && position.pnl_pct >= managementConfig.takeProfitPct) {
+  // Skip hard take profit when trailing TP is enabled — let trailing handle it.
+  // Bid_ask positions can run 8-15% via fee accumulation; hard TP at 5% caps profit prematurely.
+  if (!pnlSuspect && !managementConfig.trailingTakeProfit && position.pnl_pct != null && position.pnl_pct >= managementConfig.takeProfitPct) {
     return { action: "CLOSE", rule: 2, reason: "take profit" };
   }
   if (
@@ -1129,13 +1132,22 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
   ) {
     return { action: "CLOSE", rule: 3, reason: "pumped far above range" };
   }
+  const oorAboveWaitMin = managementConfig.outOfRangeWaitMinutesAbove ?? managementConfig.outOfRangeWaitMinutes;
   if (
     position.active_bin != null &&
     position.upper_bin != null &&
     position.active_bin > position.upper_bin &&
+    (position.minutes_out_of_range ?? 0) >= oorAboveWaitMin
+  ) {
+    return { action: "CLOSE", rule: 4, reason: `OOR above (idle, ${position.minutes_out_of_range}m)` };
+  }
+  if (
+    position.active_bin != null &&
+    position.lower_bin != null &&
+    position.active_bin < position.lower_bin &&
     (position.minutes_out_of_range ?? 0) >= managementConfig.outOfRangeWaitMinutes
   ) {
-    return { action: "CLOSE", rule: 4, reason: "OOR" };
+    return { action: "CLOSE", rule: 4, reason: `OOR below (cycle complete, ${position.minutes_out_of_range}m)` };
   }
   if (
     position.fee_per_tvl_24h != null &&

@@ -463,10 +463,15 @@ export async function notifyEmergencyExit({ pair, reason, volume5m, peakVolume5m
   );
 }
 
-export async function notifyOutOfRange({ pair, minutesOOR }) {
+export async function notifyOutOfRange({ pair, minutesOOR, direction = null }) {
   if (hasActiveLiveMessage()) return;
+  const dirLabel = direction === "ABOVE"
+    ? " (price <b>above</b> range — position idle, still SOL)"
+    : direction === "BELOW"
+    ? " (price <b>below</b> range — cycle complete, now token)"
+    : "";
   await sendHTML(
-    `⚠️ <b>Out of Range</b> ${pair}\n` +
+    `⚠️ <b>Out of Range</b> ${pair}${dirLabel}\n` +
     `Been OOR for ${minutesOOR} minutes`
   );
 }

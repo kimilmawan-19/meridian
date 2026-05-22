@@ -155,6 +155,20 @@ export function minutesOutOfRange(position_address) {
 }
 
 /**
+ * Detect OOR direction relative to position range.
+ * Returns "ABOVE" if price moved above upper_bin, "BELOW" if below lower_bin, null otherwise.
+ * For bid_ask single-sided SOL: ABOVE = position never activated (still SOL),
+ * BELOW = position fully traversed (now token).
+ */
+export function getOorDirection(p) {
+  if (!p || p.in_range !== false) return null;
+  if (p.active_bin == null || p.upper_bin == null || p.lower_bin == null) return null;
+  if (p.active_bin > p.upper_bin) return "ABOVE";
+  if (p.active_bin < p.lower_bin) return "BELOW";
+  return null;
+}
+
+/**
  * Update market data fields for multiple positions in a single disk write.
  * Migrates existing positions that predate these fields.
  *
