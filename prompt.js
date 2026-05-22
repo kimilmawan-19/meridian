@@ -131,10 +131,19 @@ NARRATIVE QUALITY (your main judgment call):
 
 POOL MEMORY: Past losses or problems → strong skip signal.
 
+ACTIVE STRATEGY: ${config.strategy.strategy} (single-sided SOL only — amount_y only, amount_x=0)
+${config.strategy.strategy === "bid_ask" ? `BID_ASK CHARACTERISTICS — read carefully, this shapes your candidate selection:
+- Liquidity is concentrated in bins BELOW current price. As price drops into the range, SOL converts to token and fees accrue from oscillation.
+- IDEAL setup: token with strong narrative + active community where price is currently elevated but expected to consolidate/dip back through your range with oscillation. Fees are earned when price ping-pongs through the active bins.
+- AVOID: tokens in unilateral pump (price will run away from your range upward — no oscillation, no fees) or in unilateral dump (you catch a falling knife and end up holding bag).
+- PREFER: tokens with high volatility (volatility >= 3) AND signs of oscillation (not pure trend). Smart wallet presence is a strong signal of accumulation zone.
+- ATH context matters: deploying near ATH is risky for bid_ask — price has more room to drop through your range, but also more risk of dump-and-stay. Mid-range entries (20-40% below ATH) are often the sweet spot.
+` : `STRATEGY ${config.strategy.strategy}: liquidity distribution differs from bid_ask. Apply general DLMM principles.
+`}
 DEPLOY RULES:
 - COMPOUNDING: Use the deploy amount from the goal EXACTLY. Do NOT default to a smaller number.
 - bins_below = round(config.strategy.minBinsBelow + (candidate volatility/5)*(config.strategy.maxBinsBelow-config.strategy.minBinsBelow)) clamped to [minBinsBelow,maxBinsBelow]. Volatility must be a positive number; 0/unknown means skip.
-- Use amount_y only, keep amount_x=0. Set bins_above to ~25% of bins_below (e.g. bins_below=40 → bins_above=10) for upside buffer so the position does not start out-of-range immediately.
+- Use amount_y only, keep amount_x=0.${config.strategy.strategy === "bid_ask" ? ` Set bins_above to 0-5% of bins_below (e.g. bins_below=40 → bins_above=0-2). For bid_ask, large bins_above wastes capital in bins price will not reach downward.` : ` Set bins_above to ~25% of bins_below (e.g. bins_below=40 → bins_above=10) for upside buffer so the position does not start out-of-range immediately.`}
 - Pick ONE pool only when conviction is real. If only one weak candidate survives, skip and explain why none qualify.
 
 ${weightsSummary ? `${weightsSummary}\nPrioritize candidates whose strongest attributes align with high-weight signals.\n\n` : ""}${lessons ? `LESSONS LEARNED:\n${lessons}\n` : ""}Timestamp: ${new Date().toISOString()}
