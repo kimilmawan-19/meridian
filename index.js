@@ -1127,10 +1127,18 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
   }
   if (
     position.active_bin != null &&
-    position.upper_bin != null &&
-    position.active_bin > position.upper_bin + managementConfig.outOfRangeBinsToClose
+    position.upper_bin != null
   ) {
-    return { action: "CLOSE", rule: 3, reason: "pumped far above range" };
+    // Scale outOfRangeBinsToClose with pool volatility at deploy time.
+    // Vol ≤ 2 → 1× base (no change). Vol 4.6 → 2.3× base. Vol 6+ → 3× base (cap).
+    // Prevents premature close on high-volatility pools where 10 bins = normal oscillation.
+    const volMult = (tracked?.volatility > 0)
+      ? Math.max(1, Math.min(3, tracked.volatility / 2))
+      : 1;
+    const effectiveBinsToClose = Math.round(managementConfig.outOfRangeBinsToClose * volMult);
+    if (position.active_bin > position.upper_bin + effectiveBinsToClose) {
+      return { action: "CLOSE", rule: 3, reason: `pumped far above range (>${effectiveBinsToClose} bins, vol=${tracked?.volatility ?? "?"}×${volMult.toFixed(2)})` };
+    }
   }
   const oorAboveWaitMin = managementConfig.outOfRangeWaitMinutesAbove ?? managementConfig.outOfRangeWaitMinutes;
   if (
