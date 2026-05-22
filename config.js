@@ -144,6 +144,7 @@ export const config = {
       enabled:            u.emergencyExits?.rapidPriceDrop?.enabled            ?? true,
       dropPct5m:          u.emergencyExits?.rapidPriceDrop?.dropPct5m          ?? -8,
       requireNegativePnl: u.emergencyExits?.rapidPriceDrop?.requireNegativePnl ?? true,
+      minPositionAgeMin:  u.emergencyExits?.rapidPriceDrop?.minPositionAgeMin  ?? 0,
     },
     // Rule 9: persistent sell-pressure streak — slow bleed exit before stop loss fires
     sellPressureStreak: {

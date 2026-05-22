@@ -1188,31 +1188,38 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
   }
 
   // Rule 8: rapid price dump — sharp 5m drop with negative PnL position
+  // Skip when OOR ABOVE: for bid_ask, a dump while idle (still SOL) is the desired entry signal, not a loss event
   if (marketData) {
     const rpCfg = config.emergencyExits.rapidPriceDrop;
     if (rpCfg.enabled) {
-      const priceChange5m = marketData.price_change_5m;
-      const pnlOk = !rpCfg.requireNegativePnl || (!pnlSuspect && (position.pnl_pct ?? 0) < 0);
-      if (priceChange5m != null && priceChange5m < rpCfg.dropPct5m && pnlOk) {
-        return { action: "CLOSE", rule: 8, reason: "rapid dump" };
+      const oorDir8 = getOorDirection(position);
+      const ageOk8 = (position.age_minutes ?? 0) >= (rpCfg.minPositionAgeMin ?? 0);
+      if (oorDir8 !== "ABOVE" && ageOk8) {
+        const priceChange5m = marketData.price_change_5m;
+        const pnlOk = !rpCfg.requireNegativePnl || (!pnlSuspect && (position.pnl_pct ?? 0) < 0);
+        if (priceChange5m != null && priceChange5m < rpCfg.dropPct5m && pnlOk) {
+          return { action: "CLOSE", rule: 8, reason: "rapid dump" };
+        }
       }
     }
   }
 
   // Rule 9: sell-pressure streak — fills the gap between acute violence (Rule 7/8) and stop loss (Rule 1)
   // Catches the slow bleed: 15+ consecutive minutes of sell dominance, no single-candle trigger needed
+  // Skip when OOR ABOVE: sustained selling while idle (still SOL) = price moving toward bid_ask range (intended entry)
   if (marketData && volumeWindow.length > 0) {
     const spCfg = config.emergencyExits.sellPressureStreak;
     if (spCfg?.enabled) {
+      const oorDir9 = getOorDirection(position);
       const streakNeeded = spCfg.streakCount ?? 3;
       const ratio = spCfg.ratio ?? 1.2;
       const safetyPnlPct = spCfg.safetyPnlPct ?? 5;
       const minAgeMin = spCfg.minPositionAgeMin ?? 0;
-      // Safety guards: don't exit if we're profiting, price is going up, or position is too young to have meaningful window data
+      // Safety guards: don't exit if we're profiting, price is going up, position is too young, or OOR above (idle SOL)
       const pnlBelowSafety = (position.pnl_pct ?? 0) < safetyPnlPct;
       const priceFalling = (marketData.price_change_5m ?? 0) <= 0;
       const ageOk = (position.age_minutes ?? 0) >= minAgeMin;
-      if (!pnlSuspect && ageOk && pnlBelowSafety && priceFalling && volumeWindow.length >= streakNeeded) {
+      if (!pnlSuspect && ageOk && oorDir9 !== "ABOVE" && pnlBelowSafety && priceFalling && volumeWindow.length >= streakNeeded) {
         let streak = 0;
         for (let i = volumeWindow.length - 1; i >= 0; i--) {
           const s = volumeWindow[i];
