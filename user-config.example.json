@@ -67,6 +67,7 @@
 
   "managementIntervalMin": 10,
   "screeningIntervalMin": 30,
+  "screeningIntervalNoPositionMin": 10,
   "healthCheckIntervalMin": 60,
 
   "temperature": 0.373,

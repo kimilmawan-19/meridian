@@ -220,9 +220,17 @@ export async function runManagementCycle({ silent = false } = {}) {
     positions = livePositions?.positions || [];
 
     if (positions.length === 0) {
-      log("cron", "No open positions — triggering screening cycle");
-      mgmtReport = "No open positions. Triggering screening cycle.";
-      runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
+      const noPosCooldownMs = config.schedule.screeningIntervalNoPositionMin * 60 * 1000;
+      const msSinceLastScreen = Date.now() - _screeningLastTriggered;
+      if (msSinceLastScreen >= noPosCooldownMs) {
+        log("cron", "No open positions — triggering screening cycle");
+        mgmtReport = "No open positions. Triggering screening cycle.";
+        runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
+      } else {
+        const waitMin = Math.ceil((noPosCooldownMs - msSinceLastScreen) / 60_000);
+        log("cron", `No open positions — screening cooldown active (~${waitMin}m remaining)`);
+        mgmtReport = `No open positions. Next screening in ~${waitMin}m.`;
+      }
       return mgmtReport;
     }
 

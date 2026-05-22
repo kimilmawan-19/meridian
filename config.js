@@ -165,9 +165,10 @@ export const config = {
 
   // ─── Scheduling ─────────────────────────
   schedule: {
-    managementIntervalMin:  u.managementIntervalMin  ?? 10,
-    screeningIntervalMin:   u.screeningIntervalMin   ?? 30,
-    healthCheckIntervalMin: u.healthCheckIntervalMin ?? 60,
+    managementIntervalMin:            u.managementIntervalMin            ?? 10,
+    screeningIntervalMin:             u.screeningIntervalMin             ?? 30,
+    screeningIntervalNoPositionMin:   u.screeningIntervalNoPositionMin   ?? 10, // faster screening when wallet is empty
+    healthCheckIntervalMin:           u.healthCheckIntervalMin           ?? 60,
   },
 
   // ─── LLM Settings ──────────────────────
