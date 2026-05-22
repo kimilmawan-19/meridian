@@ -1202,10 +1202,12 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
       const streakNeeded = spCfg.streakCount ?? 3;
       const ratio = spCfg.ratio ?? 1.2;
       const safetyPnlPct = spCfg.safetyPnlPct ?? 5;
-      // Safety guards: don't exit if we're profiting OR if price is actually going up
+      const minAgeMin = spCfg.minPositionAgeMin ?? 0;
+      // Safety guards: don't exit if we're profiting, price is going up, or position is too young to have meaningful window data
       const pnlBelowSafety = (position.pnl_pct ?? 0) < safetyPnlPct;
       const priceFalling = (marketData.price_change_5m ?? 0) <= 0;
-      if (!pnlSuspect && pnlBelowSafety && priceFalling && volumeWindow.length >= streakNeeded) {
+      const ageOk = (position.age_minutes ?? 0) >= minAgeMin;
+      if (!pnlSuspect && ageOk && pnlBelowSafety && priceFalling && volumeWindow.length >= streakNeeded) {
         let streak = 0;
         for (let i = volumeWindow.length - 1; i >= 0; i--) {
           const s = volumeWindow[i];

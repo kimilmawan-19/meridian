@@ -153,6 +153,7 @@ export const config = {
       safetyPnlPct:      u.emergencyExits?.sellPressureStreak?.safetyPnlPct     ?? 5,    // skip if PnL > +5%
       windowMin:         u.emergencyExits?.sellPressureStreak?.windowMin         ?? 30,   // lookback window (min)
       snapshotMaxAgeMin: u.emergencyExits?.sellPressureStreak?.snapshotMaxAgeMin ?? 120,  // max snapshot retention (min)
+      minPositionAgeMin: u.emergencyExits?.sellPressureStreak?.minPositionAgeMin ?? 0,    // skip if position younger than N minutes (avoid early-window noise)
     },
   },
 

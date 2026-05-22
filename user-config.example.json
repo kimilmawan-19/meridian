@@ -114,6 +114,14 @@
       "enabled": true,
       "dropPct5m": -8,
       "requireNegativePnl": true
+    },
+    "sellPressureStreak": {
+      "enabled": true,
+      "streakCount": 3,
+      "ratio": 1.2,
+      "safetyPnlPct": 5,
+      "windowMin": 30,
+      "minPositionAgeMin": 20
     }
   },
 
