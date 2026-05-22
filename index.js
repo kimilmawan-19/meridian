@@ -816,10 +816,7 @@ STEPS:
 1. Decide if any candidate is actually worth deploying. One surviving candidate is not automatically good enough.
 2. Pick the best candidate based on narrative quality, smart wallets, and pool metrics.
 3. Call deploy_position (active_bin is pre-fetched above — no need to call get_active_bin).
-   bins_below = round(${config.strategy.minBinsBelow} + (candidate volatility/5)*(${config.strategy.maxBinsBelow - config.strategy.minBinsBelow})) clamped to [${config.strategy.minBinsBelow},${config.strategy.maxBinsBelow}].
-   pass deploy_position.volatility = the candidate volatility value.
-   For single-side SOL deploys: set amount_y only, keep amount_x = 0.
-   Set bins_above to ~25% of bins_below (e.g. bins_below=40 → bins_above=10), capped at 30% of bins_below.
+   Compute bins_below and bins_above using the strategy-specific guidance in your system prompt (DEPLOY RULES section). Pass deploy_position.volatility = the candidate volatility value.
 4. Report in this exact format (no tables, no extra sections):
    🚀 DEPLOYED
 
@@ -2343,7 +2340,7 @@ Commands:
       await runBusy(async () => {
         console.log("\nAgent is picking and deploying...\n");
         const { content: reply } = await agentLoop(
-          `get_top_candidates and deploy only if a candidate is clearly worth it. If there is only one weak candidate, report NO DEPLOY. For a valid deploy, use amount_y=${DEPLOY}, amount_x=0, bins_below from positive volatility, and bins_above=~25% of bins_below (capped at 30%). Execute now, don't ask.`,
+          `get_top_candidates and deploy only if a candidate is clearly worth it. If there is only one weak candidate, report NO DEPLOY. For a valid deploy, use amount_y=${DEPLOY}, amount_x=0. Compute bins_below and bins_above using the strategy-specific guidance in your system prompt (DEPLOY RULES section). Execute now, don't ask.`,
           config.llm.maxSteps,
           [],
           "SCREENER"
