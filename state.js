@@ -353,6 +353,8 @@ export function resolvePendingTrailingDrop(position_address, currentPnlPct, trai
   const pendingCurrent = pos.pending_trailing_current_pnl_pct;
   const pendingPeak = pos.pending_trailing_peak_pnl_pct;
   const pendingDrop = pos.pending_trailing_drop_pct ?? (pendingPeak - pendingCurrent);
+  // Use effective drop at queue time (same proportional formula as the trigger).
+  const effectiveDrop = Math.max(trailingDropPct, pendingPeak / 3);
 
   pos.pending_trailing_current_pnl_pct = null;
   pos.pending_trailing_peak_pnl_pct = null;
@@ -360,10 +362,10 @@ export function resolvePendingTrailingDrop(position_address, currentPnlPct, trai
   pos.pending_trailing_started_at = null;
 
   const stillNearCrash = currentPnlPct != null && currentPnlPct <= pendingCurrent + tolerancePct;
-  const stillDroppedEnough = currentPnlPct != null && (pendingPeak - currentPnlPct) >= trailingDropPct;
+  const stillDroppedEnough = currentPnlPct != null && (pendingPeak - currentPnlPct) >= effectiveDrop;
 
   if (stillNearCrash && stillDroppedEnough) {
-    const reason = `Trailing TP: peak ${pendingPeak.toFixed(2)}% → current ${currentPnlPct.toFixed(2)}% (dropped ${(pendingPeak - currentPnlPct).toFixed(2)}% >= ${trailingDropPct}%)`;
+    const reason = `Trailing TP: peak ${pendingPeak.toFixed(2)}% → current ${currentPnlPct.toFixed(2)}% (dropped ${(pendingPeak - currentPnlPct).toFixed(2)}% >= ${effectiveDrop.toFixed(2)}%)`;
     pos.confirmed_trailing_exit_reason = reason;
     pos.confirmed_trailing_exit_until = new Date(Date.now() + 30_000).toISOString();
     save(state);
@@ -519,14 +521,18 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   // ── Trailing TP ────────────────────────────────────────────────
   if (!pnl_pct_suspicious && pos.trailing_active) {
     const dropFromPeak = pos.peak_pnl_pct - currentPnlPct;
-    if (dropFromPeak >= mgmtConfig.trailingDropPct) {
+    // Widen drop tolerance proportionally at higher peaks: give back at most 1/3 of gains.
+    // trailingDropPct acts as floor so low-peak positions keep their tight stop.
+    const effectiveDrop = Math.max(mgmtConfig.trailingDropPct, pos.peak_pnl_pct / 3);
+    if (dropFromPeak >= effectiveDrop) {
       return {
         action: "TRAILING_TP",
-        reason: `Trailing TP: peak ${pos.peak_pnl_pct.toFixed(2)}% → current ${currentPnlPct.toFixed(2)}% (dropped ${dropFromPeak.toFixed(2)}% >= ${mgmtConfig.trailingDropPct}%)`,
+        reason: `Trailing TP: peak ${pos.peak_pnl_pct.toFixed(2)}% → current ${currentPnlPct.toFixed(2)}% (dropped ${dropFromPeak.toFixed(2)}% >= ${effectiveDrop.toFixed(2)}%)`,
         needs_confirmation: true,
         peak_pnl_pct: pos.peak_pnl_pct,
         current_pnl_pct: currentPnlPct,
         drop_from_peak_pct: dropFromPeak,
+        effective_drop_pct: effectiveDrop,
       };
     }
   }

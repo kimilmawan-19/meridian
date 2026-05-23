@@ -98,7 +98,7 @@ const _trailingDropConfirmTimers = new Map();
 const TRAILING_PEAK_CONFIRM_DELAY_MS = 15_000;
 const TRAILING_PEAK_CONFIRM_TOLERANCE = 0.85;
 const TRAILING_DROP_CONFIRM_DELAY_MS = 15_000;
-const TRAILING_DROP_CONFIRM_TOLERANCE_PCT = 1.0;
+const TRAILING_DROP_CONFIRM_TOLERANCE_PCT = 0.5;
 
 /** Strip <think>...</think> reasoning blocks that some models leak into output */
 function stripThink(text) {
@@ -144,6 +144,17 @@ function scheduleTrailingDropConfirmation(positionAddress) {
   const timer = setTimeout(async () => {
     _trailingDropConfirmTimers.delete(positionAddress);
     try {
+      // Check price direction first — if price is recovering, cancel trailing exit.
+      // A bounce during the 15s window means the drop may be a wick, not a trend reversal.
+      const poolAddress = getTrackedPosition(positionAddress)?.pool;
+      if (poolAddress) {
+        const md = await fetchPoolMarketData(poolAddress).catch(() => null);
+        if (md?.price_change_5m != null && md.price_change_5m > 0) {
+          log("state", `[Trailing recheck] Price recovering (${md.price_change_5m.toFixed(2)}%) — cancelling trailing exit for ${positionAddress}`);
+          return;
+        }
+      }
+
       const result = await getMyPositions({ force: true, silent: true }).catch(() => null);
       const position = result?.positions?.find((p) => p.position === positionAddress);
       const resolved = resolvePendingTrailingDrop(
