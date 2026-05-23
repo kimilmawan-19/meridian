@@ -489,6 +489,20 @@ export async function discoverPools({
 }
 
 /**
+ * Fetch unfiltered trending DLMM pools from Meteora for market breadth analysis.
+ * Used by market regime detection — no quality filters applied intentionally.
+ */
+export async function fetchTrendingBreadth({ timeframe = "5m" } = {}) {
+  const data = await fetchPoolDiscoveryPage({
+    page_size: 50,
+    filters: "pool_type=dlmm",
+    timeframe,
+    category: "trending",
+  });
+  return Array.isArray(data.data) ? data.data : [];
+}
+
+/**
  * Returns eligible pools for the agent to evaluate and pick from.
  * Hard filters applied in code, agent decides which to deploy into.
  */

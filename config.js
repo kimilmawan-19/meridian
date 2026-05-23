@@ -158,6 +158,13 @@ export const config = {
     },
   },
 
+  // ─── Market Regime Detection ─────────────
+  marketRegime: {
+    enabled:       u.marketRegime?.enabled       ?? true,
+    skipOnBearish: u.marketRegime?.skipOnBearish ?? true,
+    notifyOnSkip:  u.marketRegime?.notifyOnSkip  ?? true,
+  },
+
   // ─── Strategy Mapping ───────────────────
   strategy: {
     strategy:     u.strategy     ?? "bid_ask",

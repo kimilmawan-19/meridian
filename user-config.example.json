@@ -126,6 +126,12 @@
     }
   },
 
+  "marketRegime": {
+    "enabled": true,
+    "skipOnBearish": true,
+    "notifyOnSkip": true
+  },
+
   "telegramChatId": "",
   "hiveMindUrl": "",
   "hiveMindApiKey": "",

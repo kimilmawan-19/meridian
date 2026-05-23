@@ -8,6 +8,7 @@ import { log } from "./logger.js";
 import { getMyPositions, closePosition, getActiveBin } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates } from "./tools/screening.js";
+import { assessMarketRegime } from "./market-regime.js";
 import { fetchPoolMarketData, getMarketDataStats } from "./tools/market-data.js";
 import { config, configMeta, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
 import { evolveThresholds, getPerformanceSummary, getDetailedPerformanceAnalysis } from "./lessons.js";
@@ -553,6 +554,32 @@ export async function runScreeningCycle({ silent = false } = {}) {
     const topCandidates = await getTopCandidates({ limit: 10 }).catch(() => null);
     const candidates = (topCandidates?.candidates || topCandidates?.pools || []).slice(0, 10);
     const earlyFilteredExamples = topCandidates?.filtered_examples || [];
+
+    // Market regime check — uses 50 unfiltered trending pools (5m + 1h) + DexScreener flow
+    // Skip screening if market is broadly bearish to avoid deploying into hostile conditions
+    if (config.marketRegime?.enabled) {
+      const regime = await assessMarketRegime(candidates);
+      if (regime.regime === "bearish" && config.marketRegime.skipOnBearish) {
+        const s = regime.signals;
+        const msg =
+          `⏸️ <b>Screening paused — market bearish</b>\n` +
+          `Score: ${regime.score}/4.5\n` +
+          `Breadth: 5m ${s.breadth5m ?? "?"}% | 1h ${s.breadth1h ?? "?"}% (${s.poolsSampled5m ?? 0} pools)\n` +
+          `Volume trend: ${s.avgVolChangePct ?? "?"}% | Acceleration: ${s.avgAccel ?? "?"}x\n` +
+          `Signals: breadth=${s.breadthScore} vol=${s.volumeScore} flow=${s.flowScore}`;
+        log("market_regime", `Screening skipped — bearish regime (score=${regime.score})`);
+        appendDecision({ type: "skip", actor: "SCREENER", summary: "Market bearish — screening paused", reason: msg });
+        if (config.marketRegime.notifyOnSkip && telegramEnabled()) await sendHTML(msg).catch(() => {});
+        _screeningBusy = false;
+        return "Screening skipped — market regime bearish.";
+      }
+      if (regime.regime === "caution") {
+        // Raise quality bar for this cycle only (in-memory, not persisted)
+        config.screening.minFeeActiveTvlRatio = +(config.screening.minFeeActiveTvlRatio * 1.4).toFixed(4);
+        config.screening.minOrganic = Math.min(85, config.screening.minOrganic + 10);
+        log("market_regime", `Caution regime — quality bar raised for this cycle (minFeeActiveTvlRatio=${config.screening.minFeeActiveTvlRatio} minOrganic=${config.screening.minOrganic})`);
+      }
+    }
 
     const allCandidates = [];
     for (const pool of candidates) {
