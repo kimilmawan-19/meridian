@@ -53,6 +53,7 @@
   "outOfRangeBinsToClose": 10,
   "outOfRangeWaitMinutes": 30,
   "outOfRangeWaitMinutesAbove": 30,
+  "oorAboveGraceMin": 15,
   "oorCooldownTriggerCount": 3,
   "oorCooldownHours": 12,
   "minVolumeToRebalance": 1000,

@@ -28,7 +28,7 @@ import {
   createLiveMessage,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop, batchUpdateMarketData, getOorDirection } from "./state.js";
+import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop, batchUpdateMarketData, getOorDirection, wasRecentlyOorAbove } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote, addVolumeSnapshot, getVolumeWindow } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
@@ -1215,13 +1215,18 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
   }
 
   // Rule 8: rapid price dump — sharp 5m drop with negative PnL position
-  // Skip when OOR ABOVE: for bid_ask, a dump while idle (still SOL) is the desired entry signal, not a loss event
+  // Skip when:
+  //   - OOR ABOVE now: position still idle SOL, the dump IS the entry signal
+  //   - Recently OOR ABOVE (within grace window): bid_ask just entered range from a dump,
+  //     continued dumping = continued token accumulation, not a loss event yet
   if (marketData) {
     const rpCfg = config.emergencyExits.rapidPriceDrop;
     if (rpCfg.enabled) {
       const oorDir8 = getOorDirection(position);
       const ageOk8 = (position.age_minutes ?? 0) >= (rpCfg.minPositionAgeMin ?? 0);
-      if (oorDir8 !== "ABOVE" && ageOk8) {
+      const graceMs8 = (managementConfig.oorAboveGraceMin ?? 15) * 60_000;
+      const recentOorAbove8 = wasRecentlyOorAbove(position.position, graceMs8);
+      if (oorDir8 !== "ABOVE" && !recentOorAbove8 && ageOk8) {
         const priceChange5m = marketData.price_change_5m;
         const pnlOk = !rpCfg.requireNegativePnl || (!pnlSuspect && (position.pnl_pct ?? 0) < 0);
         if (priceChange5m != null && priceChange5m < rpCfg.dropPct5m && pnlOk) {
@@ -1233,20 +1238,24 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
 
   // Rule 9: sell-pressure streak — fills the gap between acute violence (Rule 7/8) and stop loss (Rule 1)
   // Catches the slow bleed: 15+ consecutive minutes of sell dominance, no single-candle trigger needed
-  // Skip when OOR ABOVE: sustained selling while idle (still SOL) = price moving toward bid_ask range (intended entry)
+  // Skip when OOR ABOVE (now) or recently OOR ABOVE (within grace window): sustained selling
+  // while bid_ask is in its entry phase is exactly the price action we want
   if (marketData && volumeWindow.length > 0) {
     const spCfg = config.emergencyExits.sellPressureStreak;
     if (spCfg?.enabled) {
       const oorDir9 = getOorDirection(position);
+      const graceMs9 = (managementConfig.oorAboveGraceMin ?? 15) * 60_000;
+      const recentOorAbove9 = wasRecentlyOorAbove(position.position, graceMs9);
       const streakNeeded = spCfg.streakCount ?? 3;
       const ratio = spCfg.ratio ?? 1.2;
       const safetyPnlPct = spCfg.safetyPnlPct ?? 5;
       const minAgeMin = spCfg.minPositionAgeMin ?? 0;
-      // Safety guards: don't exit if we're profiting, price is going up, position is too young, or OOR above (idle SOL)
+      // Safety guards: don't exit if we're profiting, price is going up, position is too young,
+      // OOR above (idle SOL), or recently transitioned from OOR ABOVE (entry phase)
       const pnlBelowSafety = (position.pnl_pct ?? 0) < safetyPnlPct;
       const priceFalling = (marketData.price_change_5m ?? 0) <= 0;
       const ageOk = (position.age_minutes ?? 0) >= minAgeMin;
-      if (!pnlSuspect && ageOk && oorDir9 !== "ABOVE" && pnlBelowSafety && priceFalling && volumeWindow.length >= streakNeeded) {
+      if (!pnlSuspect && ageOk && oorDir9 !== "ABOVE" && !recentOorAbove9 && pnlBelowSafety && priceFalling && volumeWindow.length >= streakNeeded) {
         let streak = 0;
         for (let i = volumeWindow.length - 1; i >= 0; i--) {
           const s = volumeWindow[i];

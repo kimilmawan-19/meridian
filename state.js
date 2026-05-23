@@ -169,6 +169,18 @@ export function getOorDirection(p) {
 }
 
 /**
+ * Returns true if position was observed OOR ABOVE within the given window.
+ * Used by Rule 8 (rapid dump) and Rule 9 (sell streak) to skip emergency exits
+ * while a bid_ask position is still in its entry phase after a recent OOR ABOVE state.
+ */
+export function wasRecentlyOorAbove(position_address, windowMs) {
+  const state = load();
+  const pos = state.positions[position_address];
+  if (!pos || !pos.last_oor_above_at) return false;
+  return (Date.now() - new Date(pos.last_oor_above_at).getTime()) < windowMs;
+}
+
+/**
  * Update market data fields for multiple positions in a single disk write.
  * Migrates existing positions that predate these fields.
  *
@@ -466,6 +478,15 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
     pos.out_of_range_since = null;
     changed = true;
     log("state", `Position ${position_address} back in range`);
+  }
+
+  // Track most recent OOR ABOVE moment — used by Rule 8/9 to grant a grace period
+  // after a bid_ask position transitions from OOR ABOVE back to in-range. The dump
+  // that brings price into our range IS the intended entry signal; continued dumping
+  // right after entry should not immediately trigger emergency exits.
+  if (in_range === false && getOorDirection(positionData) === "ABOVE") {
+    pos.last_oor_above_at = new Date().toISOString();
+    changed = true;
   }
 
   if (changed) save(state);

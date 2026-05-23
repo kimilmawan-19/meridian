@@ -103,6 +103,7 @@ export const config = {
     outOfRangeBinsToClose: u.outOfRangeBinsToClose ?? 10,
     outOfRangeWaitMinutes: u.outOfRangeWaitMinutes ?? 30,
     outOfRangeWaitMinutesAbove: u.outOfRangeWaitMinutesAbove ?? u.outOfRangeWaitMinutes ?? 30, // override OOR timeout when active_bin > upper_bin (bid_ask: position still SOL, never activated)
+    oorAboveGraceMin:    u.oorAboveGraceMin    ?? 15, // grace window (min) after OOR ABOVE — Rule 8/9 skip during this period (entry phase protection)
     oorCooldownTriggerCount: u.oorCooldownTriggerCount ?? 3,
     oorCooldownHours:       u.oorCooldownHours       ?? 12,
     repeatDeployCooldownEnabled: u.repeatDeployCooldownEnabled ?? true,
