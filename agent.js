@@ -188,7 +188,10 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
       const activeModel = model || DEFAULT_MODEL;
 
       // Retry up to 3 times on transient provider errors (502, 503, 529)
-      const FALLBACK_MODEL = "stepfun/step-3.5-flash:free";
+      // Fallback model for transient failures — derived from config so it never goes stale
+      const FALLBACK_MODEL = agentType === "SCREENER"
+        ? (config.llm.screeningModel || DEFAULT_MODEL)
+        : (config.llm.managementModel || DEFAULT_MODEL);
       let response;
       let usedModel = activeModel;
       // Force a tool call on step 0 for action intents — prevents the model from inventing deploy/close outcomes
