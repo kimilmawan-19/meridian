@@ -1230,7 +1230,18 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
         const priceChange5m = marketData.price_change_5m;
         const pnlOk = !rpCfg.requireNegativePnl || (!pnlSuspect && (position.pnl_pct ?? 0) < 0);
         if (priceChange5m != null && priceChange5m < rpCfg.dropPct5m && pnlOk) {
-          return { action: "CLOSE", rule: 8, reason: "rapid dump" };
+          if (rpCfg.requireSellConfirm) {
+            const sells = marketData.txn_sells_5m;
+            const buys = marketData.txn_buys_5m;
+            const ratio = rpCfg.minSellBuyRatio ?? 1.5;
+            if (sells == null || buys == null || sells <= buys * ratio) {
+              log("market_data", `Rule 8 skipped: price ${priceChange5m}% but sell/buy ratio insufficient (sells=${sells ?? "?"} buys=${buys ?? "?"} minRatio=${ratio})`);
+            } else {
+              return { action: "CLOSE", rule: 8, reason: `rapid dump + sell pressure (sells=${sells} buys=${buys} ratio=${ratio})` };
+            }
+          } else {
+            return { action: "CLOSE", rule: 8, reason: "rapid dump" };
+          }
         }
       }
     }
