@@ -283,6 +283,11 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
               userMessage: goal,
             };
           }
+          // On first no-tool failure, switch to fallback model for the retry
+          if (noToolRetryCount === 1 && (model || DEFAULT_MODEL) !== FALLBACK_MODEL) {
+            model = FALLBACK_MODEL;
+            log("agent", `No tool call from primary model — switching to fallback ${FALLBACK_MODEL} for retry`);
+          }
           messages.push({
             role: providerMode === "system" ? "system" : "user",
             content: providerMode === "system"
