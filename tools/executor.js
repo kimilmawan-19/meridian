@@ -20,6 +20,7 @@ import { addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-bla
 import { blockDev, unblockDev, listBlockedDevs } from "../dev-blocklist.js";
 import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsOnPool } from "../smart-wallets.js";
 import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
+import { fetchPoolMarketData } from "./market-data.js";
 import { config, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW, computeDeployAmount } from "../config.js";
 import { getRecentDecisions } from "../decision-log.js";
 import fs from "fs";
@@ -811,6 +812,23 @@ async function runSafetyChecks(name, args) {
             pass: false,
             reason: `Deploy amount ${amountY} SOL is too low. Wallet balance suggests deploying ${expectedDeploy} SOL (minimum acceptable: ${minAcceptable} SOL). Use at least ${minAcceptable} SOL.`,
           };
+        }
+      }
+
+      // Reject deploy if price is actively pumping — bid_ask single-sided SOL will go OOR ABOVE immediately
+      if (config.strategy.strategy === "bid_ask" && isSingleSidedSol) {
+        const PUMP_GUARD_PCT = 8;
+        try {
+          const md = await fetchPoolMarketData(args.pool_address);
+          const price5m = md?.price_change_5m;
+          if (price5m != null && price5m > PUMP_GUARD_PCT) {
+            return {
+              pass: false,
+              reason: `Price is actively pumping (+${price5m.toFixed(1)}% in 5m) — bid_ask position would go out-of-range above immediately. Wait for price to stabilise.`,
+            };
+          }
+        } catch (_) {
+          // Market data unavailable — proceed, don't block on best-effort check
         }
       }
 
