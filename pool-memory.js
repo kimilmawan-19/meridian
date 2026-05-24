@@ -448,15 +448,42 @@ export function recallForPool(poolAddress) {
  * Tool handler: add_pool_note
  * Agent can annotate a pool with a freeform note.
  */
-export function forgetPool({ pool_address }) {
-  if (!pool_address) return { error: "pool_address required" };
+export function forgetPool({ pool_address, all, days }) {
   const db = load();
+
+  // Mode: forget all
+  if (all) {
+    const count = Object.keys(db).length;
+    const cleared = Object.fromEntries(Object.entries(db).map(([k, v]) => [k, { ...v, deploys: [], total_deploys: 0, avg_pnl_pct: 0, win_rate: 0, adjusted_win_rate: 0, adjusted_win_rate_sample_count: 0, last_deployed_at: null, last_outcome: null, cooldown_until: undefined, mint_cooldown_until: undefined }]));
+    // Fully delete all entries
+    for (const k of Object.keys(db)) delete db[k];
+    save(db);
+    log("pool-memory", `All pool memory cleared (${count} pools)`);
+    return { forgotten: true, mode: "all", pools_cleared: count };
+  }
+
+  // Mode: forget by recency (last N days)
+  if (days != null) {
+    const cutoff = new Date(Date.now() - Number(days) * 24 * 60 * 60 * 1000).toISOString();
+    const toDelete = Object.entries(db).filter(([, entry]) => {
+      const ts = entry.last_deployed_at ?? entry.deploys?.at(-1)?.closed_at ?? null;
+      return ts != null && ts >= cutoff;
+    });
+    for (const [addr] of toDelete) delete db[addr];
+    save(db);
+    const names = toDelete.map(([, e]) => e.name ?? "?").join(", ");
+    log("pool-memory", `Pool memory cleared for last ${days}d: ${toDelete.length} pools (${names})`);
+    return { forgotten: true, mode: `last_${days}_days`, pools_cleared: toDelete.length, pools: toDelete.map(([addr, e]) => ({ pool_address: addr, name: e.name })) };
+  }
+
+  // Mode: single pool
+  if (!pool_address) return { error: "Provide pool_address, all: true, or days: N" };
   if (!db[pool_address]) return { forgotten: false, reason: "pool not found in memory" };
   const name = db[pool_address].name ?? pool_address.slice(0, 8);
   delete db[pool_address];
   save(db);
   log("pool-memory", `History cleared for ${pool_address.slice(0, 8)} (${name})`);
-  return { forgotten: true, pool_address, name };
+  return { forgotten: true, mode: "single", pool_address, name };
 }
 
 export function addPoolNote({ pool_address, note }) {

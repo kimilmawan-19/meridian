@@ -990,18 +990,28 @@ Also useful during screening to skip pools with a bad track record.`,
     type: "function",
     function: {
       name: "forget_pool",
-      description: `Wipe all deploy history, win rate, and cooldowns for a pool from pool memory.
-Use when you want the screener to reconsider a pool it previously rejected due to past losses or cooldown.
+      description: `Wipe deploy history, win rate, and cooldowns from pool memory. Three modes:
+- Single pool: provide pool_address only
+- Recent pools: provide days (e.g. days=7 clears all pools deployed in the last 7 days)
+- All pools: provide all=true to wipe everything
+
 Does NOT affect the token blacklist — only clears pool-level memory.`,
       parameters: {
         type: "object",
         properties: {
           pool_address: {
             type: "string",
-            description: "The pool address to forget"
+            description: "Address of a single pool to forget. Omit when using all or days."
+          },
+          all: {
+            type: "boolean",
+            description: "Set true to wipe the entire pool memory."
+          },
+          days: {
+            type: "number",
+            description: "Clear all pools that were last deployed within this many days (e.g. 7)."
           }
-        },
-        required: ["pool_address"]
+        }
       }
     }
   },
