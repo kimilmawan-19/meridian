@@ -1254,8 +1254,15 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
       const recentOorAbove8 = wasRecentlyOorAbove(position.position, graceMs8);
       if (oorDir8 !== "ABOVE" && !recentOorAbove8 && ageOk8) {
         const priceChange5m = marketData.price_change_5m;
+        const priceChange1h = marketData.price_change_1h;
         const pnlOk = !rpCfg.requireNegativePnl || (!pnlSuspect && (position.pnl_pct ?? 0) < 0);
-        if (priceChange5m != null && priceChange5m < rpCfg.dropPct5m && pnlOk) {
+        // 1h confirmation: if dropPct1h is set, require 1h trend to also be below that threshold.
+        // Prevents closing on a 5m spike-dump while the broader 1h trend is still bullish/flat.
+        const dropPct1h = rpCfg.dropPct1h ?? null;
+        const confirmed1h = dropPct1h == null || priceChange1h == null || priceChange1h <= dropPct1h;
+        if (!confirmed1h) {
+          log("market_data", `Rule 8 skipped: 5m dump ${priceChange5m}% but 1h trend ${priceChange1h}% > threshold ${dropPct1h}% — likely spike, not sustained dump`);
+        } else if (priceChange5m != null && priceChange5m < rpCfg.dropPct5m && pnlOk) {
           if (rpCfg.requireSellConfirm) {
             const sells = marketData.txn_sells_5m;
             const buys = marketData.txn_buys_5m;

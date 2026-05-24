@@ -114,6 +114,7 @@
     "rapidPriceDrop": {
       "enabled": true,
       "dropPct5m": -8,
+      "dropPct1h": 0,
       "requireNegativePnl": true,
       "minPositionAgeMin": 0,
       "requireSellConfirm": false,
