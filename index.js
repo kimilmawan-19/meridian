@@ -1190,12 +1190,20 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
     position.active_bin < position.lower_bin &&
     (position.minutes_out_of_range ?? 0) >= managementConfig.outOfRangeWaitMinutes
   ) {
-    return { action: "CLOSE", rule: 4, reason: `OOR below (cycle complete, ${position.minutes_out_of_range}m)` };
+    // Skip close this cycle if buys are dominating — price may be recovering back into range.
+    // The next management cycle will re-evaluate; this prevents closing into a bounce.
+    const oorBelowBuys = marketData?.txn_buys_5m ?? 0;
+    const oorBelowSells = marketData?.txn_sells_5m ?? 0;
+    if (oorBelowBuys > 0 && oorBelowBuys > oorBelowSells) {
+      log("cron_warn", `Rule 4 OOR below deferred for ${position.pair}: buy pressure detected (buys=${oorBelowBuys} sells=${oorBelowSells})`);
+    } else {
+      return { action: "CLOSE", rule: 4, reason: `OOR below (cycle complete, ${position.minutes_out_of_range}m)` };
+    }
   }
   if (
     position.fee_per_tvl_24h != null &&
     position.fee_per_tvl_24h < managementConfig.minFeePerTvl24h &&
-    (position.age_minutes ?? 0) >= 60
+    (position.age_minutes ?? 0) >= (managementConfig.minAgeBeforeYieldCheck ?? 60)
   ) {
     return { action: "CLOSE", rule: 5, reason: "low yield" };
   }
@@ -1205,16 +1213,23 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
   }
 
   // Rule 7: volume collapse — pool liquidity drying up with dominant sell pressure
+  // Skip when:
+  //   - OOR ABOVE: price above range, SOL is idle — no capital at risk from a dying pool
+  //   - In range AND PnL >= 0: still earning fees, a volume dip may be temporary
   if (marketData) {
     const vcCfg = config.emergencyExits.volumeCollapse;
     if (vcCfg.enabled) {
-      const tracked = getTrackedPosition(position.position);
+      const vc7tracked = getTrackedPosition(position.position);
       const ageMin = position.age_minutes ?? 0;
-      const peakVol = tracked?.peak_volume_5m_usd ?? 0;
+      const peakVol = vc7tracked?.peak_volume_5m_usd ?? 0;
       const curVol = marketData.volume_5m;
       const sells = marketData.txn_sells_5m;
       const buys = marketData.txn_buys_5m;
+      const oorDir7 = getOorDirection(position);
+      const inRangeAndGreen = oorDir7 === "IN" && (position.pnl_pct ?? 0) >= 0;
       if (
+        oorDir7 !== "ABOVE" &&
+        !inRangeAndGreen &&
         ageMin >= vcCfg.minPositionAgeMin &&
         peakVol >= vcCfg.minPeakVolumeUsd &&
         curVol != null && curVol < peakVol * (vcCfg.dropThresholdPct / 100) &&
