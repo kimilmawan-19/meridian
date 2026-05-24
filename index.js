@@ -1062,6 +1062,17 @@ Summarize the current portfolio health, total fees earned, and performance of al
   // Store interval ref so stopCronJobs can clear it
   _cronTasks._pnlPollInterval = pnlPollInterval;
   log("cron", `Cycles started — management every ${config.schedule.managementIntervalMin}m, screening every ${config.schedule.screeningIntervalMin}m`);
+
+  // Validate Rule 9 window vs interval — misconfigured values can silently disable the rule
+  const spCfg = config.emergencyExits?.sellPressureStreak;
+  if (spCfg?.enabled) {
+    const streakWindowMin = spCfg.windowMin ?? 30;
+    const streakNeeded   = spCfg.streakCount ?? 3;
+    const maxSnapshots   = Math.floor(streakWindowMin / config.schedule.managementIntervalMin);
+    if (maxSnapshots < streakNeeded) {
+      log("cron_warn", `Rule 9 misconfiguration: windowMin=${streakWindowMin} / managementIntervalMin=${config.schedule.managementIntervalMin} = ~${maxSnapshots} snapshots, but streakCount=${streakNeeded}. Rule 9 will never fire. Increase windowMin or decrease streakCount.`);
+    }
+  }
 }
 
 // ═══════════════════════════════════════════

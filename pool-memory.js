@@ -385,6 +385,19 @@ export function addVolumeSnapshot(poolAddress, { vol_5m, buys_5m, sells_5m }) {
 }
 
 /**
+ * Clear volume snapshots for a pool — called on fresh deploy so stale
+ * sell-pressure history from a previous position does not bleed into Rule 9.
+ */
+export function clearVolumeSnapshots(poolAddress) {
+  if (!poolAddress) return;
+  const db = load();
+  if (!db[poolAddress]?.volume_snapshots?.length) return;
+  db[poolAddress].volume_snapshots = [];
+  save(db);
+  log("pool-memory", `Volume snapshots cleared for ${poolAddress.slice(0, 8)} (new deploy)`);
+}
+
+/**
  * Get volume snapshots within the last N minutes for a pool.
  * Returns ordered array of { ts, vol_5m, buys_5m, sells_5m }.
  */
