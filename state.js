@@ -442,6 +442,15 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
 
   if (pos.confirmed_trailing_exit_until) {
     if (new Date(pos.confirmed_trailing_exit_until).getTime() > Date.now() && pos.confirmed_trailing_exit_reason) {
+      // If position is back in range since confirmation was queued, cancel the exit —
+      // fee collection is still active and the trailing signal is no longer valid.
+      if (in_range === true) {
+        log("state", `Trailing TP confirmed exit cancelled for ${position_address} — back in range`);
+        pos.confirmed_trailing_exit_reason = null;
+        pos.confirmed_trailing_exit_until = null;
+        save(state);
+        return null;
+      }
       const reason = pos.confirmed_trailing_exit_reason;
       pos.confirmed_trailing_exit_reason = null;
       pos.confirmed_trailing_exit_until = null;
@@ -494,12 +503,18 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   if (changed) save(state);
 
   // ── Break-even stop ───────────────────────────────────────────
-  // Once peak was profitable enough, never let PnL fall back to 0% or below
+  // Once peak was profitable enough, never let PnL fall back to 0% or below.
+  // Skip when in range: price oscillation while actively earning fees is expected —
+  // exiting on a temporary dip kills fee collection while the position is still healthy.
   if (!pnl_pct_suspicious && pos.break_even_active && currentPnlPct != null && currentPnlPct <= 0) {
-    return {
-      action: "BREAK_EVEN",
-      reason: `Break-even stop: peak was ${(pos.peak_pnl_pct ?? 0).toFixed(2)}%, now ${currentPnlPct.toFixed(2)}%`,
-    };
+    if (in_range === true) {
+      log("state", `Break-even deferred for ${position_address}: in-range, pnl=${currentPnlPct.toFixed(2)}% — fee collection active`);
+    } else {
+      return {
+        action: "BREAK_EVEN",
+        reason: `Break-even stop: peak was ${(pos.peak_pnl_pct ?? 0).toFixed(2)}%, now ${currentPnlPct.toFixed(2)}%`,
+      };
+    }
   }
 
   // ── Stop loss ──────────────────────────────────────────────────
@@ -519,7 +534,9 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   }
 
   // ── Trailing TP ────────────────────────────────────────────────
-  if (!pnl_pct_suspicious && pos.trailing_active) {
+  // Skip when in range: a PnL dip from peak while actively earning fees is normal price
+  // oscillation, not a signal to exit. Let the position continue accumulating fees.
+  if (!pnl_pct_suspicious && pos.trailing_active && in_range !== true) {
     const dropFromPeak = pos.peak_pnl_pct - currentPnlPct;
     // Widen drop tolerance proportionally at higher peaks: give back at most 1/3 of gains.
     // trailingDropPct acts as floor so low-peak positions keep their tight stop.
@@ -537,24 +554,9 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
     }
   }
 
-  // ── Out of range too long ──────────────────────────────────────
-  if (pos.out_of_range_since) {
-    const minutesOOR = Math.floor((Date.now() - new Date(pos.out_of_range_since).getTime()) / 60000);
-    // Use direction-aware timeout: OOR ABOVE (idle SOL, never activated) gets its own config,
-    // so user can hold longer before giving up on a pullback.
-    const oorDir = getOorDirection(positionData);
-    const oorTimeout = (oorDir === "ABOVE" && mgmtConfig.outOfRangeWaitMinutesAbove != null)
-      ? mgmtConfig.outOfRangeWaitMinutesAbove
-      : mgmtConfig.outOfRangeWaitMinutes;
-    if (minutesOOR >= oorTimeout) {
-      return {
-        action: "OUT_OF_RANGE",
-        reason: `OOR ${oorDir ?? ""} for ${minutesOOR}m (limit: ${oorTimeout}m)`.trim(),
-      };
-    }
-  }
-
   // ── Low yield (only after position has had time to accumulate fees) ───
+  // Note: OOR timeout decision is handled in getDeterministicCloseRule (index.js Rule 4)
+  // where market data (buy/sell pressure) is available for the recovery-signal guard.
   const minAgeForYieldCheck = mgmtConfig.minAgeBeforeYieldCheck ?? 60;
   if (
     fee_per_tvl_24h != null &&
