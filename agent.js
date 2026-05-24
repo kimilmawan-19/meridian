@@ -14,6 +14,7 @@ const GENERAL_INTENT_ONLY_TOOLS = new Set([
   "block_deployer",
   "unblock_deployer",
   "add_pool_note",
+  "forget_pool",
   "set_position_note",
   "add_smart_wallet",
   "remove_smart_wallet",

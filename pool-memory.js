@@ -448,6 +448,17 @@ export function recallForPool(poolAddress) {
  * Tool handler: add_pool_note
  * Agent can annotate a pool with a freeform note.
  */
+export function forgetPool({ pool_address }) {
+  if (!pool_address) return { error: "pool_address required" };
+  const db = load();
+  if (!db[pool_address]) return { forgotten: false, reason: "pool not found in memory" };
+  const name = db[pool_address].name ?? pool_address.slice(0, 8);
+  delete db[pool_address];
+  save(db);
+  log("pool-memory", `History cleared for ${pool_address.slice(0, 8)} (${name})`);
+  return { forgotten: true, pool_address, name };
+}
+
 export function addPoolNote({ pool_address, note }) {
   if (!pool_address) return { error: "pool_address required" };
   const safeNote = sanitizeStoredNote(note);

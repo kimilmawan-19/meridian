@@ -989,6 +989,26 @@ Also useful during screening to skip pools with a bad track record.`,
   {
     type: "function",
     function: {
+      name: "forget_pool",
+      description: `Wipe all deploy history, win rate, and cooldowns for a pool from pool memory.
+Use when you want the screener to reconsider a pool it previously rejected due to past losses or cooldown.
+Does NOT affect the token blacklist — only clears pool-level memory.`,
+      parameters: {
+        type: "object",
+        properties: {
+          pool_address: {
+            type: "string",
+            description: "The pool address to forget"
+          }
+        },
+        required: ["pool_address"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
       name: "add_pool_note",
       description: `Annotate a pool with a freeform note that persists across sessions.
 Use when you observe something worth remembering about a specific pool:
