@@ -143,7 +143,7 @@ ${config.strategy.strategy === "bid_ask" ? `BID_ASK CHARACTERISTICS — read car
 DEPLOY RULES:
 - COMPOUNDING: Use the deploy amount from the goal EXACTLY. Do NOT default to a smaller number.
 - bins_below = round(${config.strategy.minBinsBelow} + (candidate volatility / 5) × ${config.strategy.maxBinsBelow - config.strategy.minBinsBelow}) clamped to [${config.strategy.minBinsBelow}, ${config.strategy.maxBinsBelow}]. Volatility must be a positive number; 0/unknown means skip.
-- Use amount_y only, keep amount_x=0.${config.strategy.strategy === "bid_ask" ? ` Set bins_above to 3-5 (e.g. bins_above=3). Upper bins cost zero capital for single-sided SOL deploys (amount_x=0 means they are empty) — they are a free OOR tolerance buffer that prevents going out-of-range on a single-tick move upward.` : ` Set bins_above to ~25% of bins_below (e.g. bins_below=40 → bins_above=10) for upside buffer so the position does not start out-of-range immediately.`}
+- Use amount_y only, keep amount_x=0.${config.strategy.strategy === "bid_ask" ? ` Set bins_above to 5-7 (e.g. bins_above=5). Upper bins cost zero capital for single-sided SOL deploys (amount_x=0 means they are empty) — they are a free OOR tolerance buffer that prevents going out-of-range on a single-tick move upward.` : ` Set bins_above to ~25% of bins_below (e.g. bins_below=40 → bins_above=10) for upside buffer so the position does not start out-of-range immediately.`}
 - Pick ONE pool only when conviction is real. If only one weak candidate survives, skip and explain why none qualify.
 
 ${weightsSummary ? `${weightsSummary}\nPrioritize candidates whose strongest attributes align with high-weight signals.\n\n` : ""}${lessons ? `LESSONS LEARNED:\n${lessons}\n` : ""}Timestamp: ${new Date().toISOString()}

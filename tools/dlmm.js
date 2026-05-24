@@ -544,8 +544,8 @@ export async function deployPosition({
   }
   const isSingleSidedSol = finalAmountX <= 0 && finalAmountY > 0;
   if (isSingleSidedSol) {
-    // Enforce minimum 3 bins_above as free OOR tolerance — upper bins hold no capital (amount_x=0)
-    activeBinsAbove = Math.max(3, Math.min(Number(bins_above ?? 3), Math.ceil(activeBinsBelow * 0.3)));
+    // Enforce minimum 5 bins_above as free OOR tolerance — upper bins hold no capital (amount_x=0)
+    activeBinsAbove = Math.max(5, Math.min(Number(bins_above ?? 5), Math.ceil(activeBinsBelow * 0.3)));
   }
   activeBinsBelow = Number(activeBinsBelow);
   activeBinsAbove = Number(activeBinsAbove);
