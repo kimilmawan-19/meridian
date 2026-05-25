@@ -14,6 +14,7 @@
   "positionSizePct": 0.35,
 
   "strategy": "bid_ask",
+  "bidAskMinVolatility": 2,
   "minBinsBelow": 35,
   "maxBinsBelow": 69,
   "defaultBinsBelow": 69,

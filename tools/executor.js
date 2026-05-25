@@ -151,6 +151,18 @@ async function validateDeployPoolThresholds(args) {
     };
   }
 
+  // Strategy must match volatility band: bid_ask only pays off on volatile tokens where
+  // price reaches the deep accumulation skirt. On low-volatility pools bid_ask strands the
+  // bulk of capital in bins that never activate — use spot (concentrated near active) instead.
+  const chosenStrategy = (args.strategy ?? config.strategy.strategy ?? "bid_ask").toLowerCase();
+  const bidAskMinVol = numberOrNull(config.strategy.bidAskMinVolatility) ?? 2;
+  if (chosenStrategy === "bid_ask" && volatility < bidAskMinVol) {
+    return {
+      pass: false,
+      reason: `Pool ${volatilityTimeframe} volatility ${volatility} is below bidAskMinVolatility ${bidAskMinVol}. Deploy with strategy="spot" for low-volatility pools (bid_ask strands capital in deep bins that never activate).`,
+    };
+  }
+
   const actualBinStep = poolDetailBinStep(detail);
   const minStep = numberOrNull(config.screening.minBinStep);
   const maxStep = numberOrNull(config.screening.maxBinStep);
@@ -412,6 +424,7 @@ const toolMap = {
       minBinsBelow: ["strategy", "minBinsBelow"],
       maxBinsBelow: ["strategy", "maxBinsBelow"],
       defaultBinsBelow: ["strategy", "defaultBinsBelow"],
+      bidAskMinVolatility: ["strategy", "bidAskMinVolatility"],
       // hivemind
       hiveMindUrl: ["hiveMind", "url"],
       hiveMindApiKey: ["hiveMind", "apiKey"],

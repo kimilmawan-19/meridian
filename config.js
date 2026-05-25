@@ -174,6 +174,7 @@ export const config = {
     minBinsBelow: strategyMinBinsBelow,
     maxBinsBelow: strategyMaxBinsBelow,
     defaultBinsBelow: strategyDefaultBinsBelow,
+    bidAskMinVolatility: numericConfig(u.bidAskMinVolatility) ?? 2, // below this, deploy spot (concentrated fee) instead of bid_ask
   },
 
   // ─── Scheduling ─────────────────────────
