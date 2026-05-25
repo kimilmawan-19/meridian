@@ -435,7 +435,15 @@ export function getStateSummary() {
  * Returns { action, reason } or null if no exit needed.
  */
 export function updatePnlAndCheckExits(position_address, positionData, mgmtConfig) {
-  const { pnl_pct: currentPnlPct, pnl_pct_suspicious, in_range, fee_per_tvl_24h } = positionData;
+  const {
+    pnl_pct: currentPnlPct,
+    pnl_pct_suspicious,
+    in_range,
+    fee_per_tvl_24h,
+    unclaimed_fees_usd,
+    collected_fees_usd,
+    total_value_usd,
+  } = positionData;
   const state = load();
   const pos = state.positions[position_address];
   if (!pos || pos.closed) return null;
@@ -558,16 +566,30 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   // Note: OOR timeout decision is handled in getDeterministicCloseRule (index.js Rule 4)
   // where market data (buy/sell pressure) is available for the recovery-signal guard.
   const minAgeForYieldCheck = mgmtConfig.minAgeBeforeYieldCheck ?? 60;
-  if (
-    fee_per_tvl_24h != null &&
-    mgmtConfig.minFeePerTvl24h != null &&
-    fee_per_tvl_24h < mgmtConfig.minFeePerTvl24h &&
-    (slAgeMin == null || slAgeMin >= minAgeForYieldCheck)
-  ) {
-    return {
-      action: "LOW_YIELD",
-      reason: `Low yield: fee/TVL ${fee_per_tvl_24h.toFixed(2)}% < min ${mgmtConfig.minFeePerTvl24h}% (age: ${slAgeMin ?? "?"}m)`,
-    };
+  const minAgeForPositionMetric = 30; // minutes before position-level rate is reliable
+  if (mgmtConfig.minFeePerTvl24h != null && (slAgeMin == null || slAgeMin >= minAgeForYieldCheck)) {
+    // Position-level fee rate: actual fees earned (claimed + unclaimed) extrapolated to 24h.
+    // More accurate than the pool's 24h rolling average which is dominated by pre-deploy history.
+    // Only trusted after minAgeForPositionMetric minutes; falls back to pool metric while too young.
+    let effectiveFeeRate = fee_per_tvl_24h; // fallback: pool 24h metric
+    let metricSource = "pool_24h";
+    if (
+      slAgeMin >= minAgeForPositionMetric &&
+      total_value_usd > 0
+    ) {
+      const totalFeesEarned = (collected_fees_usd ?? 0) + (unclaimed_fees_usd ?? 0);
+      const positionFeeRate24h = (totalFeesEarned / total_value_usd) * (1440 / slAgeMin) * 100;
+      if (Number.isFinite(positionFeeRate24h)) {
+        effectiveFeeRate = positionFeeRate24h;
+        metricSource = "position_actual";
+      }
+    }
+    if (effectiveFeeRate != null && effectiveFeeRate < mgmtConfig.minFeePerTvl24h) {
+      return {
+        action: "LOW_YIELD",
+        reason: `Low yield: fee/TVL ${effectiveFeeRate.toFixed(2)}% < min ${mgmtConfig.minFeePerTvl24h}% [${metricSource}] (age: ${slAgeMin ?? "?"}m)`,
+      };
+    }
   }
 
   return null;
