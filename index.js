@@ -1346,10 +1346,13 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
       // distributes heavily toward the bottom (grace ≤ 80% depth).
       // Once the grace zone is breached, the breach must persist for entryGraceConfirmMinutes
       // to filter out wick candles that briefly cross the boundary and immediately recover.
-      const rangeTotal9 = (position.upper_bin ?? 0) - (position.lower_bin ?? 0);
-      const depthPct9 = rangeTotal9 > 0 && position.active_bin != null && position.upper_bin != null
+      // FAIL-SAFE: if bin data is unavailable we cannot assess depth — keep grace active
+      // (skip Rule 9) rather than firing blind, so a transient API miss can't force a close.
+      const binsKnown9 = position.active_bin != null && position.upper_bin != null && position.lower_bin != null;
+      const rangeTotal9 = binsKnown9 ? (position.upper_bin - position.lower_bin) : 0;
+      const depthPct9 = binsKnown9 && rangeTotal9 > 0
         ? ((position.upper_bin - position.active_bin) / rangeTotal9) * 100
-        : 100;
+        : 0;
       const deployStrategy9 = (sp9tracked?.strategy ?? config.strategy.strategy ?? "curve").toLowerCase();
       const graceDepth9 = deployStrategy9 === "bid_ask"
         ? (managementConfig.bidAskEntryGraceDepthPct ?? 80)
@@ -1357,11 +1360,12 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
       const confirmMs9 = (managementConfig.entryGraceConfirmMinutes ?? 15) * 60_000;
       const graceExitedAt9 = sp9tracked?.r9_grace_exited_at;
       const inEntryAccumulation9 =
-        oorDir9 === "IN" && (
+        !binsKnown9 ||
+        (oorDir9 === "IN" && (
           depthPct9 < graceDepth9 ||
           graceExitedAt9 == null ||
           (Date.now() - new Date(graceExitedAt9).getTime()) < confirmMs9
-        );
+        ));
 
       // Safety guards: don't exit if we're profiting, price is going up, position is too young,
       // OOR above (idle SOL), recently transitioned from OOR ABOVE, or still in entry accumulation zone
@@ -1369,7 +1373,10 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
       const priceFalling = (marketData.price_change_5m ?? 0) <= 0;
       const ageOk = (position.age_minutes ?? 0) >= minAgeMin;
       if (inEntryAccumulation9) {
-        log("market_data", `Rule 9 skipped for ${position.pair}: entry grace active (depth=${depthPct9.toFixed(1)}% < ${graceDepth9}% or confirm pending, strategy=${deployStrategy9})`);
+        const why = !binsKnown9
+          ? "bin data unavailable (fail-safe)"
+          : `depth=${depthPct9.toFixed(1)}% < ${graceDepth9}% or confirm pending`;
+        log("market_data", `Rule 9 skipped for ${position.pair}: entry grace active (${why}, strategy=${deployStrategy9})`);
       }
       if (!pnlSuspect && ageOk && !inEntryAccumulation9 && oorDir9 !== "ABOVE" && !recentOorAbove9 && pnlBelowSafety && priceFalling && volumeWindow.length >= streakNeeded) {
         let streak = 0;
