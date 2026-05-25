@@ -287,7 +287,7 @@ export async function runManagementCycle({ silent = false } = {}) {
         const pStrat = (r9tracked?.strategy ?? config.strategy.strategy ?? "curve").toLowerCase();
         const graceDepth = pStrat === "bid_ask"
           ? (config.management.bidAskEntryGraceDepthPct ?? 80)
-          : (config.management.curveEntryGraceDepthPct ?? 35);
+          : (config.management.curveEntryGraceDepthPct ?? 50);
         updateR9GraceZone(p.position, depthPct, graceDepth);
       }
     }
@@ -1356,7 +1356,7 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
       const deployStrategy9 = (sp9tracked?.strategy ?? config.strategy.strategy ?? "curve").toLowerCase();
       const graceDepth9 = deployStrategy9 === "bid_ask"
         ? (managementConfig.bidAskEntryGraceDepthPct ?? 80)
-        : (managementConfig.curveEntryGraceDepthPct ?? 35);
+        : (managementConfig.curveEntryGraceDepthPct ?? 50);
       const confirmMs9 = (managementConfig.entryGraceConfirmMinutes ?? 15) * 60_000;
       const graceExitedAt9 = sp9tracked?.r9_grace_exited_at;
       const inEntryAccumulation9 =
@@ -1392,7 +1392,7 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
           }
         }
         if (streak >= streakNeeded) {
-          return { action: "CLOSE", rule: 9, reason: `sell pressure streak (${streak} windows, ratio>${ratio.toFixed(2)} vol=${sp9tracked?.volatility ?? "?"}×${volMult9.toFixed(2)})` };
+          return { action: "CLOSE", rule: 9, reason: `sell pressure streak (${streak} windows, ratio>${ratio.toFixed(2)} vol=${sp9tracked?.volatility ?? "?"}×${volMult9.toFixed(2)} depth=${depthPct9.toFixed(0)}% strat=${deployStrategy9})` };
         }
       }
     }

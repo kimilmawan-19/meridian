@@ -122,7 +122,7 @@ export const config = {
     // curveEntryGraceDepthPct: grace while depth < 35% (curve SOL mostly near top, still buying)
     // bidAskEntryGraceDepthPct: grace while depth < 80% (bid_ask SOL heavy at bottom, accumulating)
     // entryGraceConfirmMinutes: sustained breach required before Rule 9 activates (wick filter)
-    curveEntryGraceDepthPct:   numericConfig(u.curveEntryGraceDepthPct)   ?? 35,
+    curveEntryGraceDepthPct:   numericConfig(u.curveEntryGraceDepthPct)   ?? 50,
     bidAskEntryGraceDepthPct:  numericConfig(u.bidAskEntryGraceDepthPct)  ?? 80,
     entryGraceConfirmMinutes:  numericConfig(u.entryGraceConfirmMinutes)  ?? 15,
     breakEvenTriggerPct:   u.breakEvenTriggerPct   ?? 1,  // once peak PnL >= this, protect against going below 0%

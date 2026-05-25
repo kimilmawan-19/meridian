@@ -62,7 +62,7 @@
   "takeProfitPct": 5,
   "minFeePerTvl24h": 7,
   "minAgeBeforeYieldCheck": 60,
-  "curveEntryGraceDepthPct": 35,
+  "curveEntryGraceDepthPct": 50,
   "bidAskEntryGraceDepthPct": 80,
   "entryGraceConfirmMinutes": 15,
   "trailingTakeProfit": true,
