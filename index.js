@@ -1238,15 +1238,22 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
       const buys = marketData.txn_buys_5m;
       const oorDir7 = getOorDirection(position);
       const inRangeAndGreen = oorDir7 === "IN" && (position.pnl_pct ?? 0) >= 0;
+      // Scale sell-pressure threshold with deploy-time volatility. The screener prefers
+      // volatile tokens (vol>=3), where elevated sells:buys is normal oscillation, not collapse.
+      // Vol <= 2 → 1× (no change). Vol 4 → 1.5× (cap). Requires 3:1 sells instead of 2:1.
+      const volMult7 = (vc7tracked?.volatility > 0)
+        ? Math.max(1, Math.min(1.5, vc7tracked.volatility / 2))
+        : 1;
+      const effectiveSellRatio7 = vcCfg.sellPressureRatio * volMult7;
       if (
         oorDir7 !== "ABOVE" &&
         !inRangeAndGreen &&
         ageMin >= vcCfg.minPositionAgeMin &&
         peakVol >= vcCfg.minPeakVolumeUsd &&
         curVol != null && curVol < peakVol * (vcCfg.dropThresholdPct / 100) &&
-        sells != null && buys != null && sells > buys * vcCfg.sellPressureRatio
+        sells != null && buys != null && sells > buys * effectiveSellRatio7
       ) {
-        return { action: "CLOSE", rule: 7, reason: "volume collapse" };
+        return { action: "CLOSE", rule: 7, reason: `volume collapse (sells>${effectiveSellRatio7.toFixed(2)}× buys, vol=${vc7tracked?.volatility ?? "?"}×${volMult7.toFixed(2)})` };
       }
     }
   }
@@ -1267,13 +1274,21 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
         const priceChange5m = marketData.price_change_5m;
         const priceChange1h = marketData.price_change_1h;
         const pnlOk = !rpCfg.requireNegativePnl || (!pnlSuspect && (position.pnl_pct ?? 0) < 0);
+        // Scale the 5m drop threshold with deploy-time volatility. For tokens the screener
+        // deliberately selected for high volatility, a -8% 5m candle is normal oscillation.
+        // Vol <= 2 → 1× (-8%). Vol 4 → 2× (-16%, cap). dropPct5m is negative, so ×mult widens it.
+        const rp8tracked = getTrackedPosition(position.position);
+        const volMult8 = (rp8tracked?.volatility > 0)
+          ? Math.max(1, Math.min(2, rp8tracked.volatility / 2))
+          : 1;
+        const effectiveDrop5m = rpCfg.dropPct5m * volMult8;
         // 1h confirmation: if dropPct1h is set, require 1h trend to also be below that threshold.
         // Prevents closing on a 5m spike-dump while the broader 1h trend is still bullish/flat.
         const dropPct1h = rpCfg.dropPct1h ?? null;
         const confirmed1h = dropPct1h == null || priceChange1h == null || priceChange1h <= dropPct1h;
         if (!confirmed1h) {
           log("market_data", `Rule 8 skipped: 5m dump ${priceChange5m}% but 1h trend ${priceChange1h}% > threshold ${dropPct1h}% — likely spike, not sustained dump`);
-        } else if (priceChange5m != null && priceChange5m < rpCfg.dropPct5m && pnlOk) {
+        } else if (priceChange5m != null && priceChange5m < effectiveDrop5m && pnlOk) {
           if (rpCfg.requireSellConfirm) {
             const sells = marketData.txn_sells_5m;
             const buys = marketData.txn_buys_5m;
@@ -1281,10 +1296,10 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
             if (sells == null || buys == null || sells <= buys * ratio) {
               log("market_data", `Rule 8 skipped: price ${priceChange5m}% but sell/buy ratio insufficient (sells=${sells ?? "?"} buys=${buys ?? "?"} minRatio=${ratio})`);
             } else {
-              return { action: "CLOSE", rule: 8, reason: `rapid dump + sell pressure (sells=${sells} buys=${buys} ratio=${ratio})` };
+              return { action: "CLOSE", rule: 8, reason: `rapid dump + sell pressure (sells=${sells} buys=${buys} ratio=${ratio}, drop<${effectiveDrop5m.toFixed(1)}% vol=${rp8tracked?.volatility ?? "?"}×${volMult8.toFixed(2)})` };
             }
           } else {
-            return { action: "CLOSE", rule: 8, reason: "rapid dump" };
+            return { action: "CLOSE", rule: 8, reason: `rapid dump (drop<${effectiveDrop5m.toFixed(1)}% vol=${rp8tracked?.volatility ?? "?"}×${volMult8.toFixed(2)})` };
           }
         }
       }
@@ -1302,7 +1317,14 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
       const graceMs9 = (managementConfig.oorAboveGraceMin ?? 15) * 60_000;
       const recentOorAbove9 = wasRecentlyOorAbove(position.position, graceMs9);
       const streakNeeded = spCfg.streakCount ?? 3;
-      const ratio = spCfg.ratio ?? 1.2;
+      // Scale streak sell:buy ratio with deploy-time volatility. Volatile tokens (screener
+      // prefers vol>=3) naturally produce sell-heavy windows; raise the bar before counting.
+      // Vol <= 3 → 1× (no change). Vol 4.5+ → 1.5× (cap).
+      const sp9tracked = getTrackedPosition(position.position);
+      const volMult9 = (sp9tracked?.volatility > 0)
+        ? Math.max(1, Math.min(1.5, sp9tracked.volatility / 3))
+        : 1;
+      const ratio = (spCfg.ratio ?? 1.2) * volMult9;
       const safetyPnlPct = spCfg.safetyPnlPct ?? 5;
       const minAgeMin = spCfg.minPositionAgeMin ?? 0;
       // Safety guards: don't exit if we're profiting, price is going up, position is too young,
@@ -1324,7 +1346,7 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
           }
         }
         if (streak >= streakNeeded) {
-          return { action: "CLOSE", rule: 9, reason: `sell pressure streak (${streak} windows)` };
+          return { action: "CLOSE", rule: 9, reason: `sell pressure streak (${streak} windows, ratio>${ratio.toFixed(2)} vol=${sp9tracked?.volatility ?? "?"}×${volMult9.toFixed(2)})` };
         }
       }
     }
