@@ -174,7 +174,8 @@ export const config = {
     minBinsBelow: strategyMinBinsBelow,
     maxBinsBelow: strategyMaxBinsBelow,
     defaultBinsBelow: strategyDefaultBinsBelow,
-    bidAskMinVolatility: numericConfig(u.bidAskMinVolatility) ?? 2, // below this, deploy spot (concentrated fee) instead of bid_ask
+    bidAskMinVolatility: numericConfig(u.bidAskMinVolatility) ?? null, // deprecated: kept so old configs don't break
+    curveMaxVolatility: numericConfig(u.curveMaxVolatility) ?? numericConfig(u.bidAskMinVolatility) ?? 3, // vol <= this → curve (concentrated fee); above → bid_ask (dip accumulation)
   },
 
   // ─── Scheduling ─────────────────────────

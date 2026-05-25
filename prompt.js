@@ -143,8 +143,9 @@ ${config.strategy.strategy === "bid_ask" ? `BID_ASK CHARACTERISTICS — read car
 DEPLOY RULES:
 - COMPOUNDING: Use the deploy amount from the goal EXACTLY. Do NOT default to a smaller number.
 - STRATEGY SELECTION (by volatility): set the deploy_position "strategy" param based on the candidate's volatility:
-  - volatility >= ${config.strategy.bidAskMinVolatility} → strategy="bid_ask". High oscillation makes the deep accumulation skirt pay off; SOL converts to token on dips and earns fees on the way back up.
-  - volatility < ${config.strategy.bidAskMinVolatility} → strategy="spot". Low-volatility tokens rarely reach the deep bins, so bid_ask wastes capital there. Spot spreads SOL uniformly and keeps more of it near the active bin where fees are actually earned.
+  - volatility <= ${config.strategy.curveMaxVolatility} → strategy="curve". Concentrates SOL near the active bin where price spends most of its time, so capital meets activity and earns the most fees. Lowest bag-holding risk. This is the default for almost all candidates.
+  - volatility > ${config.strategy.curveMaxVolatility} → strategy="bid_ask". Only for extreme oscillation where price genuinely reaches the deep bins — the accumulation skirt buys dips aggressively and pays off on a recovery bounce. Higher risk if the token dumps and stays down.
+  - Never use strategy="spot" here — curve is strictly better at every volatility level.
 - bins_below = round(${config.strategy.minBinsBelow} + (candidate volatility / 5) × ${config.strategy.maxBinsBelow - config.strategy.minBinsBelow}) clamped to [${config.strategy.minBinsBelow}, ${config.strategy.maxBinsBelow}]. Volatility must be a positive number; 0/unknown means skip.
 - Use amount_y only, keep amount_x=0. Set bins_above to 5-7 (e.g. bins_above=5). Upper bins cost zero capital for single-sided SOL deploys (amount_x=0 means they are empty) — they are a free OOR tolerance buffer that prevents going out-of-range on a single-tick move upward.
 - Pick ONE pool only when conviction is real. If only one weak candidate survives, skip and explain why none qualify.

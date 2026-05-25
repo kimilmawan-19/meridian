@@ -151,15 +151,22 @@ async function validateDeployPoolThresholds(args) {
     };
   }
 
-  // Strategy must match volatility band: bid_ask only pays off on volatile tokens where
-  // price reaches the deep accumulation skirt. On low-volatility pools bid_ask strands the
-  // bulk of capital in bins that never activate — use spot (concentrated near active) instead.
-  const chosenStrategy = (args.strategy ?? config.strategy.strategy ?? "bid_ask").toLowerCase();
-  const bidAskMinVol = numberOrNull(config.strategy.bidAskMinVolatility) ?? 2;
-  if (chosenStrategy === "bid_ask" && volatility < bidAskMinVol) {
+  // Strategy must match volatility band. Curve concentrates SOL near the active bin where
+  // price spends most of its time — best fee capture and lowest bag-holding risk at every
+  // volatility level. bid_ask only pays off on extreme oscillation that genuinely reaches the
+  // deep accumulation skirt; below the floor it strands the bulk of capital in idle bins.
+  const chosenStrategy = (args.strategy ?? config.strategy.strategy ?? "curve").toLowerCase();
+  const curveMaxVol = numberOrNull(config.strategy.curveMaxVolatility) ?? 3;
+  if (chosenStrategy === "spot") {
     return {
       pass: false,
-      reason: `Pool ${volatilityTimeframe} volatility ${volatility} is below bidAskMinVolatility ${bidAskMinVol}. Deploy with strategy="spot" for low-volatility pools (bid_ask strands capital in deep bins that never activate).`,
+      reason: `strategy="spot" is not used for auto-deploys — curve is strictly better (more fee, less idle capital) at every volatility level. Deploy with strategy="curve".`,
+    };
+  }
+  if (chosenStrategy === "bid_ask" && volatility <= curveMaxVol) {
+    return {
+      pass: false,
+      reason: `Pool ${volatilityTimeframe} volatility ${volatility} is at or below curveMaxVolatility ${curveMaxVol}. Deploy with strategy="curve" (bid_ask strands capital in deep bins that rarely activate at this volatility).`,
     };
   }
 
@@ -425,6 +432,7 @@ const toolMap = {
       maxBinsBelow: ["strategy", "maxBinsBelow"],
       defaultBinsBelow: ["strategy", "defaultBinsBelow"],
       bidAskMinVolatility: ["strategy", "bidAskMinVolatility"],
+      curveMaxVolatility: ["strategy", "curveMaxVolatility"],
       // hivemind
       hiveMindUrl: ["hiveMind", "url"],
       hiveMindApiKey: ["hiveMind", "apiKey"],

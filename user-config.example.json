@@ -13,8 +13,8 @@
   "gasReserve": 0.2,
   "positionSizePct": 0.35,
 
-  "strategy": "bid_ask",
-  "bidAskMinVolatility": 2,
+  "strategy": "curve",
+  "curveMaxVolatility": 3,
   "minBinsBelow": 35,
   "maxBinsBelow": 69,
   "defaultBinsBelow": 69,
