@@ -28,7 +28,7 @@ import {
   createLiveMessage,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop, batchUpdateMarketData, getOorDirection, wasRecentlyOorAbove } from "./state.js";
+import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop, batchUpdateMarketData, getOorDirection, wasRecentlyOorAbove, updateR9GraceZone } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote, addVolumeSnapshot, getVolumeWindow } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
@@ -272,11 +272,23 @@ export async function runManagementCycle({ silent = false } = {}) {
     }
     if (marketUpdates.size > 0) batchUpdateMarketData(marketUpdates);
 
-    // Record volume snapshots for sell-pressure streak (Rule 9) — reuses already-fetched market data
+    // Record volume snapshots and update Rule 9 entry-grace zone tracking per position
     for (const p of positionData) {
       const md = p._marketData;
       if (md && md.volume_5m != null) {
         addVolumeSnapshot(p.pool, { vol_5m: md.volume_5m, buys_5m: md.txn_buys_5m ?? 0, sells_5m: md.txn_sells_5m ?? 0 });
+      }
+      // Track how deep price has fallen into the range. Rule 9 is suppressed while in
+      // the SOL-rich zone; breach must persist for entryGraceConfirmMinutes before firing.
+      const rangeTotal = (p.upper_bin ?? 0) - (p.lower_bin ?? 0);
+      if (rangeTotal > 0 && p.active_bin != null && p.upper_bin != null) {
+        const depthPct = ((p.upper_bin - p.active_bin) / rangeTotal) * 100;
+        const r9tracked = getTrackedPosition(p.position);
+        const pStrat = (r9tracked?.strategy ?? config.strategy.strategy ?? "curve").toLowerCase();
+        const graceDepth = pStrat === "bid_ask"
+          ? (config.management.bidAskEntryGraceDepthPct ?? 80)
+          : (config.management.curveEntryGraceDepthPct ?? 35);
+        updateR9GraceZone(p.position, depthPct, graceDepth);
       }
     }
 
@@ -1327,12 +1339,39 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
       const ratio = (spCfg.ratio ?? 1.2) * volMult9;
       const safetyPnlPct = spCfg.safetyPnlPct ?? 5;
       const minAgeMin = spCfg.minPositionAgeMin ?? 0;
+
+      // Depth-aware entry grace: Rule 9 is suppressed while the position is still in the
+      // SOL-rich zone of the range (significant buying power remaining). Thresholds differ
+      // by strategy: curve concentrates SOL near the top (grace ≤ 35% depth) while bid_ask
+      // distributes heavily toward the bottom (grace ≤ 80% depth).
+      // Once the grace zone is breached, the breach must persist for entryGraceConfirmMinutes
+      // to filter out wick candles that briefly cross the boundary and immediately recover.
+      const rangeTotal9 = (position.upper_bin ?? 0) - (position.lower_bin ?? 0);
+      const depthPct9 = rangeTotal9 > 0 && position.active_bin != null && position.upper_bin != null
+        ? ((position.upper_bin - position.active_bin) / rangeTotal9) * 100
+        : 100;
+      const deployStrategy9 = (sp9tracked?.strategy ?? config.strategy.strategy ?? "curve").toLowerCase();
+      const graceDepth9 = deployStrategy9 === "bid_ask"
+        ? (managementConfig.bidAskEntryGraceDepthPct ?? 80)
+        : (managementConfig.curveEntryGraceDepthPct ?? 35);
+      const confirmMs9 = (managementConfig.entryGraceConfirmMinutes ?? 15) * 60_000;
+      const graceExitedAt9 = sp9tracked?.r9_grace_exited_at;
+      const inEntryAccumulation9 =
+        oorDir9 === "IN" && (
+          depthPct9 < graceDepth9 ||
+          graceExitedAt9 == null ||
+          (Date.now() - new Date(graceExitedAt9).getTime()) < confirmMs9
+        );
+
       // Safety guards: don't exit if we're profiting, price is going up, position is too young,
-      // OOR above (idle SOL), or recently transitioned from OOR ABOVE (entry phase)
+      // OOR above (idle SOL), recently transitioned from OOR ABOVE, or still in entry accumulation zone
       const pnlBelowSafety = (position.pnl_pct ?? 0) < safetyPnlPct;
       const priceFalling = (marketData.price_change_5m ?? 0) <= 0;
       const ageOk = (position.age_minutes ?? 0) >= minAgeMin;
-      if (!pnlSuspect && ageOk && oorDir9 !== "ABOVE" && !recentOorAbove9 && pnlBelowSafety && priceFalling && volumeWindow.length >= streakNeeded) {
+      if (inEntryAccumulation9) {
+        log("market_data", `Rule 9 skipped for ${position.pair}: entry grace active (depth=${depthPct9.toFixed(1)}% < ${graceDepth9}% or confirm pending, strategy=${deployStrategy9})`);
+      }
+      if (!pnlSuspect && ageOk && !inEntryAccumulation9 && oorDir9 !== "ABOVE" && !recentOorAbove9 && pnlBelowSafety && priceFalling && volumeWindow.length >= streakNeeded) {
         let streak = 0;
         for (let i = volumeWindow.length - 1; i >= 0; i--) {
           const s = volumeWindow[i];

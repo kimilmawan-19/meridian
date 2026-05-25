@@ -118,6 +118,13 @@ export const config = {
     minFeePerTvl24h:       u.minFeePerTvl24h       ?? 7,
     minAgeBeforeYieldCheck: u.minAgeBeforeYieldCheck ?? 60, // minutes before low yield can trigger close
     minAgeBeforeStopLoss:  u.minAgeBeforeStopLoss  ?? 15, // minutes before stop loss can fire
+    // Entry-grace zone: Rule 9 is suppressed while price is still in the SOL-rich part of range.
+    // curveEntryGraceDepthPct: grace while depth < 35% (curve SOL mostly near top, still buying)
+    // bidAskEntryGraceDepthPct: grace while depth < 80% (bid_ask SOL heavy at bottom, accumulating)
+    // entryGraceConfirmMinutes: sustained breach required before Rule 9 activates (wick filter)
+    curveEntryGraceDepthPct:   numericConfig(u.curveEntryGraceDepthPct)   ?? 35,
+    bidAskEntryGraceDepthPct:  numericConfig(u.bidAskEntryGraceDepthPct)  ?? 80,
+    entryGraceConfirmMinutes:  numericConfig(u.entryGraceConfirmMinutes)  ?? 15,
     breakEvenTriggerPct:   u.breakEvenTriggerPct   ?? 1,  // once peak PnL >= this, protect against going below 0%
     minSolToOpen:          u.minSolToOpen          ?? 0.55,
     deployAmountSol:       u.deployAmountSol       ?? 0.5,

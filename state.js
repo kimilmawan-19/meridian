@@ -181,6 +181,33 @@ export function wasRecentlyOorAbove(position_address, windowMs) {
 }
 
 /**
+ * Track when a position's active bin first exits the entry-grace zone (depth >= graceDepth).
+ * Clears the timestamp when price returns to the grace zone (wick recovery).
+ * Used by Rule 9 to require a sustained confirmation before firing — prevents premature
+ * closes on brief wicks that cross the grace boundary and immediately recover.
+ */
+export function updateR9GraceZone(position_address, depth_pct, graceDepth) {
+  const state = load();
+  const pos = state.positions[position_address];
+  if (!pos) return;
+  let changed = false;
+  if (depth_pct < graceDepth) {
+    // Still within (or returned to) grace zone — clear timer so a future breach restarts fresh
+    if (pos.r9_grace_exited_at != null) {
+      pos.r9_grace_exited_at = null;
+      changed = true;
+    }
+  } else {
+    // Breached grace zone — start timer only if not already running
+    if (pos.r9_grace_exited_at == null) {
+      pos.r9_grace_exited_at = new Date().toISOString();
+      changed = true;
+    }
+  }
+  if (changed) save(state);
+}
+
+/**
  * Update market data fields for multiple positions in a single disk write.
  * Migrates existing positions that predate these fields.
  *

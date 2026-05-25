@@ -433,6 +433,10 @@ const toolMap = {
       defaultBinsBelow: ["strategy", "defaultBinsBelow"],
       bidAskMinVolatility: ["strategy", "bidAskMinVolatility"],
       curveMaxVolatility: ["strategy", "curveMaxVolatility"],
+      // entry grace
+      curveEntryGraceDepthPct:  ["management", "curveEntryGraceDepthPct"],
+      bidAskEntryGraceDepthPct: ["management", "bidAskEntryGraceDepthPct"],
+      entryGraceConfirmMinutes: ["management", "entryGraceConfirmMinutes"],
       // hivemind
       hiveMindUrl: ["hiveMind", "url"],
       hiveMindApiKey: ["hiveMind", "apiKey"],
