@@ -374,10 +374,13 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
           step,
         });
 
-        // Lock deploy_position after first attempt regardless of outcome — retrying is never right
-        // For close/swap: only lock on success so genuine failures can be retried
-        if (NO_RETRY_TOOLS.has(functionName)) firedOnce.add(functionName);
-        else if (ONCE_PER_SESSION.has(functionName) && result.success === true) firedOnce.add(functionName);
+        // Lock deploy_position after the first on-chain attempt — retrying risks a double-deploy.
+        // Exception: a pre-execution safety block (result.blocked) never touches on-chain state,
+        // so the LLM may retry with corrected args (e.g. fixing a strategy/volatility mismatch).
+        // For close/swap: only lock on success so genuine failures can be retried.
+        if (NO_RETRY_TOOLS.has(functionName)) {
+          if (!result?.blocked) firedOnce.add(functionName);
+        } else if (ONCE_PER_SESSION.has(functionName) && result.success === true) firedOnce.add(functionName);
 
         return {
           role: "tool",
