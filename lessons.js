@@ -180,6 +180,12 @@ export async function recordPerformance(perf) {
   const pruned = pruneStaleLessons(data);
   if (pruned > 0) log("lessons", `Pruned ${pruned} stale lesson(s)`);
 
+  // Refresh aggregate lessons every 20 closed positions (before save — single write)
+  if (data.performance.length % AGGREGATE_REFRESH_EVERY === 0) {
+    const { config: cfg } = await import("./config.js");
+    refreshAggregateLessons(data, data.performance, cfg);
+  }
+
   save(data);
   if (lesson) {
     void pushHiveLesson(lesson);
@@ -566,6 +572,112 @@ function winnerEvidenceWeight(p) {
   if (isFiniteNum(p.pnl_pct) && p.pnl_pct >= 5) w += 0.20;
   if (isFiniteNum(p.minutes_held) && p.minutes_held < 15) w -= 0.15; // quick flip
   return clamp(w, 0, 1);
+}
+
+// ── Aggregate lesson generation ────────────────────────────────
+
+const AGGREGATE_REFRESH_EVERY = 20;
+const AGGREGATE_MIN_SAMPLES   = 5;
+const AGGREGATE_BIN_RANGES = [
+  { label: "80-100",  test: (bs) => isFiniteNum(bs) && bs <= 100 },
+  { label: "100-125", test: (bs) => isFiniteNum(bs) && bs > 100  },
+];
+
+// Unified quality weight for aggregate stats: how representative/reliable
+// is this data point regardless of whether it won or lost.
+function positionQualityWeight(p) {
+  let w = 0.30;
+  if (isFiniteNum(p.minutes_held)) {
+    if (p.minutes_held >= 60) w += 0.25;
+    else if (p.minutes_held >= 30) w += 0.15;
+    else if (p.minutes_held >= 15) w += 0.05;
+    else w -= 0.15; // wick/noise — held too briefly
+  }
+  const eff = p.range_efficiency;
+  if (isFiniteNum(eff)) {
+    if (eff >= 70) w += 0.20;
+    else if (eff >= 50) w += 0.10;
+  }
+  if (String(p.close_reason || "").trim().length > 3) w += 0.10;
+  return clamp(w, 0, 1);
+}
+
+/**
+ * Build aggregate lessons from performance data grouped by strategy × bin_step range.
+ * Uses the same recency window as evolveThresholds.
+ * Confidence scales with effective N (quality-weighted count) so outliers carry less weight.
+ */
+function generateAggregateLessons(perfData, config) {
+  const windowDays = config.screening?.evolveWindowDays;
+  let evalData = perfData;
+  if (isFiniteNum(windowDays) && windowDays > 0) {
+    const cutoff = new Date(Date.now() - windowDays * 86_400_000).toISOString();
+    const windowed = perfData.filter((p) => (p.recorded_at ?? "") >= cutoff);
+    if (windowed.length >= AGGREGATE_MIN_SAMPLES) evalData = windowed;
+  }
+
+  const lessons = [];
+
+  for (const strat of ["curve", "bid_ask", "spot"]) {
+    const stratData = evalData.filter(
+      (p) => String(p.strategy || "").toLowerCase() === strat
+    );
+    if (stratData.length === 0) continue;
+
+    for (const range of AGGREGATE_BIN_RANGES) {
+      const bucket  = stratData.filter((p) => range.test(p.bin_step));
+      if (bucket.length < AGGREGATE_MIN_SAMPLES) continue;
+
+      // Quality-weighted stats
+      const weights = bucket.map(positionQualityWeight);
+      const totalW  = weights.reduce((s, w) => s + w, 0);
+      if (totalW === 0) continue;
+
+      const wWin = bucket.reduce((s, p, i) =>
+        s + (p.pnl_pct > 0 ? weights[i] : 0), 0);
+      const wPnl = bucket.reduce((s, p, i) =>
+        s + (isFiniteNum(p.pnl_pct) ? p.pnl_pct * weights[i] : 0), 0);
+      const wEff = bucket.reduce((s, p, i) =>
+        s + (isFiniteNum(p.range_efficiency) ? p.range_efficiency * weights[i] : 0), 0);
+      const wFee = bucket.reduce((s, p, i) => {
+        const fy = isFiniteNum(p.initial_value_usd) && p.initial_value_usd > 0
+          ? ((p.fees_earned_usd || 0) / p.initial_value_usd) * 100 : 0;
+        return s + fy * weights[i];
+      }, 0);
+
+      const winRatePct  = Math.round((wWin / totalW) * 100);
+      const avgPnlPct   = Math.round((wPnl / totalW) * 10) / 10;
+      const avgRangeEff = Math.round((wEff / totalW) * 10) / 10;
+      const avgFeeYield = Math.round((wFee / totalW) * 10) / 10;
+      const effectiveN  = Math.round(totalW * 10) / 10; // quality-weighted count
+      const confidence  = Math.round(Math.min(0.95, 0.40 + effectiveN * 0.03) * 100) / 100;
+      const outcome     = winRatePct >= 55 ? "good" : winRatePct >= 45 ? "neutral" : "bad";
+      const sign        = avgPnlPct >= 0 ? "+" : "";
+
+      lessons.push({
+        id: Date.now() + lessons.length,
+        rule: `AGGREGATE: ${strat} + bin_step ${range.label} → ${winRatePct}% win, ${sign}${avgPnlPct}% avg PnL, ${avgRangeEff}% range-eff, ${avgFeeYield}% fee-yield (n=${bucket.length}, effN=${effectiveN})`,
+        tags:       ["aggregate", strat, "strategy", "screening"],
+        outcome,
+        sourceType: "aggregate",
+        confidence,
+        created_at: new Date().toISOString(),
+      });
+    }
+  }
+
+  return lessons;
+}
+
+/**
+ * Replace all existing aggregate lessons with a fresh snapshot.
+ * Aggregate lessons are point-in-time statistics, not historical events.
+ */
+function refreshAggregateLessons(data, perfData, config) {
+  data.lessons = data.lessons.filter((l) => !l.tags?.includes("aggregate"));
+  const fresh = generateAggregateLessons(perfData, config);
+  data.lessons.push(...fresh);
+  if (fresh.length > 0) log("lessons", `Refreshed ${fresh.length} aggregate lesson(s)`);
 }
 
 function avg(arr) {
