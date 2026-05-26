@@ -176,7 +176,7 @@ WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
           },
           bins_above: {
             type: "number",
-            description: "Number of bins above the current active bin. Keep this at 0 for single-side SOL deploys. Only use this for dual-sided or explicit upside-exposure deploys."
+            description: "OOR tolerance buffer above active bin. Bins above cost no capital (empty for single-side SOL). curve: 5–7 bins. bid_ask: round(bins_below × 0.25) clamped to [10, 20] — high-volatility tokens need wider headroom to oscillate without triggering an OOR close."
           },
           downside_pct: {
             type: "number",

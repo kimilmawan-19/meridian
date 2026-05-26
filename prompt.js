@@ -149,7 +149,9 @@ DEPLOY RULES:
   - Always pass top_cluster_trend to deploy_position when it appears in the candidate's okx/ath line.
   - Never use strategy="spot" here — curve is strictly better than spot at every volatility level.
 - bins_below = round(${config.strategy.minBinsBelow} + (candidate volatility / 5) × ${config.strategy.maxBinsBelow - config.strategy.minBinsBelow}) clamped to [${config.strategy.minBinsBelow}, ${config.strategy.maxBinsBelow}]. Volatility must be a positive number; 0/unknown means skip.
-- Use amount_y only, keep amount_x=0. Set bins_above to 5-7 (e.g. bins_above=5). Upper bins cost zero capital for single-sided SOL deploys (amount_x=0 means they are empty) — they are a free OOR tolerance buffer that prevents going out-of-range on a single-tick move upward.
+- Use amount_y only, keep amount_x=0. Upper bins cost zero capital (amount_x=0 means they are empty) — they are a free OOR tolerance buffer. Set bins_above based on strategy:
+  - curve: bins_above = 5–7. Low volatility means small upward swings; a narrow buffer is enough.
+  - bid_ask: bins_above = round(bins_below × 0.25), clamped to [10, 20]. High-volatility tokens can spike 10–20% before reverting. A wider buffer lets price oscillate above the active bin without triggering an OOR close, preserving fee capture on the way back down. Example: bins_below=49 → bins_above=12.
 - Pick ONE pool only when conviction is real. If only one weak candidate survives, skip and explain why none qualify.
 
 ${weightsSummary ? `${weightsSummary}\nPrioritize candidates whose strongest attributes align with high-weight signals.\n\n` : ""}${lessons ? `LESSONS LEARNED:\n${lessons}\n` : ""}Timestamp: ${new Date().toISOString()}
