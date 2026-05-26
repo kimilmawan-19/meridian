@@ -58,6 +58,32 @@ function save(data) {
   fs.writeFileSync(LESSONS_FILE, JSON.stringify(data, null, 2));
 }
 
+// ── Auto-prune stale lessons ───────────────────────────────────
+// Lessons are interpretive and lose relevance over time; performance[]
+// (raw facts) is never touched here. Protects pinned + operator-authored
+// lessons. Mutates data.lessons in place, returns count pruned.
+const LESSON_TTL_DAYS = { bad: 30, poor: 30, failed: 30, good: 60, worked: 60, evolution: 90 };
+const LESSON_CONFIDENCE_FLOOR = 0.30;
+
+function pruneStaleLessons(data) {
+  const now = Date.now();
+  const before = data.lessons.length;
+  data.lessons = data.lessons.filter((l) => {
+    // Protected: pinned + true operator input
+    if (l.pinned) return true;
+    if (l.sourceType === "manual" || l.sourceType === "config_change") return true;
+    // Mechanism B: confidence floor
+    if (typeof l.confidence === "number" && isFinite(l.confidence) && l.confidence < LESSON_CONFIDENCE_FLOOR) return false;
+    // Mechanism A: TTL (auto-evolved keyed by tag, else by outcome)
+    const ttlKey = l.tags?.includes("evolution") ? "evolution" : l.outcome;
+    const ttlDays = LESSON_TTL_DAYS[ttlKey];
+    if (!ttlDays) return true;       // unknown category → keep (conservative)
+    if (!l.created_at) return true;  // no timestamp → keep (can't age)
+    return (now - new Date(l.created_at).getTime()) < ttlDays * 86_400_000;
+  });
+  return before - data.lessons.length;
+}
+
 function buildSignalSnapshot(perf) {
   const snapshot = { ...(perf.signal_snapshot || {}) };
   if (perf.base_mint && snapshot.base_mint == null) snapshot.base_mint = perf.base_mint;
@@ -150,6 +176,9 @@ export async function recordPerformance(perf) {
     data.lessons.push(lesson);
     log("lessons", `New lesson: ${lesson.rule}`);
   }
+
+  const pruned = pruneStaleLessons(data);
+  if (pruned > 0) log("lessons", `Pruned ${pruned} stale lesson(s)`);
 
   save(data);
   if (lesson) {
