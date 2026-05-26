@@ -156,9 +156,10 @@ export const config = {
       enabled:               u.emergencyExits?.rapidPriceDrop?.enabled               ?? true,
       dropPct5m:             u.emergencyExits?.rapidPriceDrop?.dropPct5m             ?? -8,
       requireNegativePnl:    u.emergencyExits?.rapidPriceDrop?.requireNegativePnl    ?? true,
-      minPositionAgeMin:     u.emergencyExits?.rapidPriceDrop?.minPositionAgeMin     ?? 0,
+      minPositionAgeMin:     u.emergencyExits?.rapidPriceDrop?.minPositionAgeMin     ?? 10,
       requireSellConfirm:    u.emergencyExits?.rapidPriceDrop?.requireSellConfirm    ?? false,
       minSellBuyRatio:       u.emergencyExits?.rapidPriceDrop?.minSellBuyRatio       ?? 1.5,
+      minSellConfirmTxns:    u.emergencyExits?.rapidPriceDrop?.minSellConfirmTxns    ?? 5,   // min total txns (sells+buys) before sell/buy ratio is trusted
     },
     // Rule 9: persistent sell-pressure streak — slow bleed exit before stop loss fires
     sellPressureStreak: {

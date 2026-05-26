@@ -123,9 +123,10 @@
       "dropPct5m": -8,
       "dropPct1h": 0,
       "requireNegativePnl": true,
-      "minPositionAgeMin": 0,
+      "minPositionAgeMin": 10,
       "requireSellConfirm": false,
-      "minSellBuyRatio": 1.5
+      "minSellBuyRatio": 1.5,
+      "minSellConfirmTxns": 5
     },
     "sellPressureStreak": {
       "enabled": true,

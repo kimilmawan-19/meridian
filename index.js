@@ -1282,14 +1282,44 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
       const ageOk8 = (position.age_minutes ?? 0) >= (rpCfg.minPositionAgeMin ?? 0);
       const graceMs8 = (managementConfig.oorAboveGraceMin ?? 15) * 60_000;
       const recentOorAbove8 = wasRecentlyOorAbove(position.position, graceMs8);
-      if (oorDir8 !== "ABOVE" && !recentOorAbove8 && ageOk8) {
+
+      // Depth-aware entry grace (mirrors Rule 9): a SOL-rich position dumping is
+      // accumulating cheap tokens, not realizing a loss. Suppress Rule 8 while still
+      // in the entry zone. FAIL-SAFE: keep grace active when bin data is unavailable.
+      const rp8tracked = getTrackedPosition(position.position);
+      const binsKnown8 = position.active_bin != null && position.upper_bin != null && position.lower_bin != null;
+      const rangeTotal8 = binsKnown8 ? (position.upper_bin - position.lower_bin) : 0;
+      const depthPct8 = binsKnown8 && rangeTotal8 > 0
+        ? ((position.upper_bin - position.active_bin) / rangeTotal8) * 100
+        : 0;
+      const deployStrategy8 = (rp8tracked?.strategy ?? config.strategy.strategy ?? "curve").toLowerCase();
+      const graceDepth8 = deployStrategy8 === "bid_ask"
+        ? (managementConfig.bidAskEntryGraceDepthPct ?? 80)
+        : (managementConfig.curveEntryGraceDepthPct ?? 50);
+      const confirmMs8 = (managementConfig.entryGraceConfirmMinutes ?? 15) * 60_000;
+      const graceExitedAt8 = rp8tracked?.r9_grace_exited_at;
+      const inEntryAccumulation8 =
+        !binsKnown8 ||
+        (oorDir8 === "IN" && (
+          depthPct8 < graceDepth8 ||
+          graceExitedAt8 == null ||
+          (Date.now() - new Date(graceExitedAt8).getTime()) < confirmMs8
+        ));
+
+      if (inEntryAccumulation8) {
+        const why = !binsKnown8
+          ? "bin data unavailable (fail-safe)"
+          : `depth=${depthPct8.toFixed(1)}% < ${graceDepth8}% or confirm pending`;
+        log("market_data", `Rule 8 skipped for ${position.pair}: entry grace active (${why}, strategy=${deployStrategy8})`);
+      }
+
+      if (oorDir8 !== "ABOVE" && !recentOorAbove8 && ageOk8 && !inEntryAccumulation8) {
         const priceChange5m = marketData.price_change_5m;
         const priceChange1h = marketData.price_change_1h;
         const pnlOk = !rpCfg.requireNegativePnl || (!pnlSuspect && (position.pnl_pct ?? 0) < 0);
         // Scale the 5m drop threshold with deploy-time volatility. For tokens the screener
         // deliberately selected for high volatility, a -8% 5m candle is normal oscillation.
         // Vol <= 2 → 1× (-8%). Vol 4 → 2× (-16%, cap). dropPct5m is negative, so ×mult widens it.
-        const rp8tracked = getTrackedPosition(position.position);
         const volMult8 = (rp8tracked?.volatility > 0)
           ? Math.max(1, Math.min(2, rp8tracked.volatility / 2))
           : 1;
@@ -1305,13 +1335,16 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
             const sells = marketData.txn_sells_5m;
             const buys = marketData.txn_buys_5m;
             const ratio = rpCfg.minSellBuyRatio ?? 1.5;
-            if (sells == null || buys == null || sells <= buys * ratio) {
-              log("market_data", `Rule 8 skipped: price ${priceChange5m}% but sell/buy ratio insufficient (sells=${sells ?? "?"} buys=${buys ?? "?"} minRatio=${ratio})`);
+            // Minimum absolute transaction floor: a sell/buy ratio is meaningless in a
+            // near-dead window (e.g. 2 sells vs 0 buys). Require enough txns to be signal.
+            const minTxns = rpCfg.minSellConfirmTxns ?? 5;
+            if (sells == null || buys == null || (sells + buys) < minTxns || sells <= buys * ratio) {
+              log("market_data", `Rule 8 skipped: price ${priceChange5m}% but sell pressure insufficient (sells=${sells ?? "?"} buys=${buys ?? "?"} total<${minTxns}? minRatio=${ratio})`);
             } else {
-              return { action: "CLOSE", rule: 8, reason: `rapid dump + sell pressure (sells=${sells} buys=${buys} ratio=${ratio}, drop<${effectiveDrop5m.toFixed(1)}% vol=${rp8tracked?.volatility ?? "?"}×${volMult8.toFixed(2)})` };
+              return { action: "CLOSE", rule: 8, reason: `rapid dump + sell pressure (sells=${sells} buys=${buys} ratio=${ratio}, drop<${effectiveDrop5m.toFixed(1)}% vol=${rp8tracked?.volatility ?? "?"}×${volMult8.toFixed(2)} depth=${depthPct8.toFixed(0)}% strat=${deployStrategy8})` };
             }
           } else {
-            return { action: "CLOSE", rule: 8, reason: `rapid dump (drop<${effectiveDrop5m.toFixed(1)}% vol=${rp8tracked?.volatility ?? "?"}×${volMult8.toFixed(2)})` };
+            return { action: "CLOSE", rule: 8, reason: `rapid dump (drop<${effectiveDrop5m.toFixed(1)}% vol=${rp8tracked?.volatility ?? "?"}×${volMult8.toFixed(2)} depth=${depthPct8.toFixed(0)}% strat=${deployStrategy8})` };
           }
         }
       }
