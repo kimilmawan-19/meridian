@@ -155,18 +155,28 @@ async function validateDeployPoolThresholds(args) {
   // price spends most of its time — best fee capture and lowest bag-holding risk at every
   // volatility level. bid_ask only pays off on extreme oscillation that genuinely reaches the
   // deep accumulation skirt; below the floor it strands the bulk of capital in idle bins.
+  //
+  // Exception: top_cluster_trend="bullish" (OKX smart-money buying) signals upward price
+  // pressure where curve goes OOR above quickly. Allow bid_ask down to (curveMaxVol - 1.0)
+  // in that case — but never below 1.5 absolute, where even bid_ask bins go idle.
   const chosenStrategy = (args.strategy ?? config.strategy.strategy ?? "curve").toLowerCase();
   const curveMaxVol = numberOrNull(config.strategy.curveMaxVolatility) ?? 3;
+  const bullishOverride = args.top_cluster_trend === "bullish";
+  const bidAskVolFloor = bullishOverride
+    ? Math.max(1.5, curveMaxVol - 1.0)
+    : curveMaxVol;
   if (chosenStrategy === "spot") {
     return {
       pass: false,
       reason: `strategy="spot" is not used for auto-deploys — curve is strictly better (more fee, less idle capital) at every volatility level. Deploy with strategy="curve".`,
     };
   }
-  if (chosenStrategy === "bid_ask" && volatility <= curveMaxVol) {
+  if (chosenStrategy === "bid_ask" && volatility <= bidAskVolFloor) {
     return {
       pass: false,
-      reason: `Pool ${volatilityTimeframe} volatility ${volatility} is at or below curveMaxVolatility ${curveMaxVol}. Deploy with strategy="curve" (bid_ask strands capital in deep bins that rarely activate at this volatility).`,
+      reason: bullishOverride
+        ? `strategy="bid_ask" requested with bullish cluster override, but volatility ${volatility} is still below floor ${bidAskVolFloor.toFixed(1)} (curveMaxVol ${curveMaxVol} − 1.0, min 1.5). Deploy with strategy="curve".`
+        : `Pool ${volatilityTimeframe} volatility ${volatility} is at or below curveMaxVolatility ${curveMaxVol}. Deploy with strategy="curve" (bid_ask strands capital in deep bins that rarely activate at this volatility).`,
     };
   }
 

@@ -142,10 +142,12 @@ ${config.strategy.strategy === "bid_ask" ? `BID_ASK CHARACTERISTICS — read car
 `}
 DEPLOY RULES:
 - COMPOUNDING: Use the deploy amount from the goal EXACTLY. Do NOT default to a smaller number.
-- STRATEGY SELECTION (by volatility): set the deploy_position "strategy" param based on the candidate's volatility:
-  - volatility <= ${config.strategy.curveMaxVolatility} → strategy="curve". Concentrates SOL near the active bin where price spends most of its time, so capital meets activity and earns the most fees. Lowest bag-holding risk. This is the default for almost all candidates.
-  - volatility > ${config.strategy.curveMaxVolatility} → strategy="bid_ask". Only for extreme oscillation where price genuinely reaches the deep bins — the accumulation skirt buys dips aggressively and pays off on a recovery bounce. Higher risk if the token dumps and stays down.
-  - Never use strategy="spot" here — curve is strictly better at every volatility level.
+- STRATEGY SELECTION: set the deploy_position "strategy" param using BOTH volatility AND top_cluster_trend (when available):
+  - volatility > ${config.strategy.curveMaxVolatility} → strategy="bid_ask". Extreme oscillation — price genuinely reaches the deep accumulation bins.
+  - volatility <= ${config.strategy.curveMaxVolatility} AND top_cluster_trend="bullish" → strategy="bid_ask". Smart money is accumulating; price is trending up. Curve would go OOR above quickly (as in the TOLYBOT case). bid_ask covers both directions and survives the upward move.
+  - volatility <= ${config.strategy.curveMaxVolatility} AND (top_cluster_trend="bearish", "neutral", absent, or OKX data unavailable) → strategy="curve". Concentrates SOL near active bin where price spends most time — highest fee efficiency, lowest bag-holding risk. Default for most candidates.
+  - Always pass top_cluster_trend to deploy_position when it appears in the candidate's okx/ath line.
+  - Never use strategy="spot" here — curve is strictly better than spot at every volatility level.
 - bins_below = round(${config.strategy.minBinsBelow} + (candidate volatility / 5) × ${config.strategy.maxBinsBelow - config.strategy.minBinsBelow}) clamped to [${config.strategy.minBinsBelow}, ${config.strategy.maxBinsBelow}]. Volatility must be a positive number; 0/unknown means skip.
 - Use amount_y only, keep amount_x=0. Set bins_above to 5-7 (e.g. bins_above=5). Upper bins cost zero capital for single-sided SOL deploys (amount_x=0 means they are empty) — they are a free OOR tolerance buffer that prevents going out-of-range on a single-tick move upward.
 - Pick ONE pool only when conviction is real. If only one weak candidate survives, skip and explain why none qualify.
