@@ -338,12 +338,38 @@ export function evolveThresholds(perfData, config) {
   const winRate    = total > 0 ? winners.length / total : 0;
   const pnlVals    = evalData.map((p) => p.pnl_pct).filter(isFiniteNum);
   const avgPnlPct  = pnlVals.length ? avg(pnlVals) : 0;
+
+  // Confidence-weighted effective counts — weak/noise outcomes contribute little
+  const effectiveLosers  = losers.reduce((s, l) => s + loserEvidenceWeight(l), 0);
+  const effectiveWinners = winners.reduce((s, w) => s + winnerEvidenceWeight(w), 0);
+
+  // ── Raise gate ────────────────────────────────────────────────
+  // Tighten ONLY when there is strong, demonstrated harm: enough quality
+  // losers (not noise) plus sufficient data. Avoids false-positive raises
+  // from a couple of unlucky wick-closes, and reinforces #1 anti-ratchet —
+  // we only tighten when loose filters provably caused losses.
+  const RAISE_EFFECTIVE_LOSERS = 2.5;
+  const RAISE_MIN_POSITIONS    = 10;
+  const raiseAllowed =
+    effectiveLosers >= RAISE_EFFECTIVE_LOSERS &&
+    winners.length >= 2 &&
+    evalData.length >= RAISE_MIN_POSITIONS;
+
+  // ── Relax gate ────────────────────────────────────────────────
+  // When the filter is over-tight in a thin market, allow thresholds to
+  // step DOWN. Asymmetric vs raising: smaller step, stricter evidence,
+  // hard floor. Three OR paths qualify; safeguards always required.
   const RELAX_POSITION_FLOOR = 10; // only relax when window is thin (dry market)
   const relaxQualifies =
     (winRate > 0.60 && evalData.length >= 5) ||  // path 1: win-rate dominant
     (winRate > 0.50 && avgPnlPct > 2) ||         // path 2: positive expected value
     (avgPnlPct > 5);                             // path 3: strong returns
-  const relaxAllowed = relaxQualifies && evalData.length < RELAX_POSITION_FLOOR;
+  const RELAX_MAX_LOSER_EVIDENCE = 1.5; // block relax when quality losers prove harm
+  const relaxAllowed =
+    relaxQualifies &&
+    evalData.length < RELAX_POSITION_FLOOR &&
+    effectiveWinners >= 2 &&                       // require quality winner evidence
+    effectiveLosers < RELAX_MAX_LOSER_EVIDENCE;    // don't loosen if losses are real
 
   const changes   = {};
   const rationale = {};
@@ -355,7 +381,7 @@ export function evolveThresholds(perfData, config) {
     const loserFees  = losers.map((p) => p.fee_tvl_ratio).filter(isFiniteNum);
     const current    = config.screening.minFeeActiveTvlRatio;
 
-    if (winnerFees.length >= 2) {
+    if (raiseAllowed && winnerFees.length >= 2) {
       // Minimum fee/TVL among winners — we know pools below this don't work for us
       const minWinnerFee = Math.min(...winnerFees);
       if (minWinnerFee > current * 1.2) {
@@ -369,7 +395,7 @@ export function evolveThresholds(perfData, config) {
       }
     }
 
-    if (loserFees.length >= 2) {
+    if (raiseAllowed && loserFees.length >= 2) {
       // If losers had low fee/TVL, raise min
       const maxLoserFee = Math.max(...loserFees);
       if (maxLoserFee < current * 1.5 && winnerFees.length > 0) {
@@ -406,7 +432,7 @@ export function evolveThresholds(perfData, config) {
     const winnerOrganics = winners.map((p) => p.organic_score).filter(isFiniteNum);
     const current        = config.screening.minOrganic;
 
-    if (loserOrganics.length >= 2 && winnerOrganics.length >= 1) {
+    if (raiseAllowed && loserOrganics.length >= 2 && winnerOrganics.length >= 1) {
       const avgLoserOrganic  = avg(loserOrganics);
       const avgWinnerOrganic = avg(winnerOrganics);
       // Only raise if there's a clear gap (winners consistently more organic)
@@ -471,6 +497,46 @@ export function evolveThresholds(perfData, config) {
 
 function isFiniteNum(n) {
   return typeof n === "number" && isFinite(n);
+}
+
+// ── Evidence weighting ─────────────────────────────────────────
+// Confidence weight ∈ [0,1] for how strongly a closed position proves the
+// FILTER was wrong (not just bad luck). Used to compute weighted effective
+// counts so raise/relax react to evidence quality, not raw counts.
+function loserEvidenceWeight(p) {
+  let w = 0.30;
+  const pnl = p.pnl_pct;
+  if (isFiniteNum(pnl)) {
+    if (pnl <= -15) w += 0.30;
+    else if (pnl <= -10) w += 0.20;
+    else if (pnl <= -5) w += 0.10;
+  }
+  const reason = String(p.close_reason || "").toLowerCase();
+  if (/out of range|oor|volume|low yield/.test(reason)) w += 0.25;
+  const eff = p.range_efficiency;
+  if (isFiniteNum(eff)) {
+    if (eff <= 30) w += 0.20;
+    else if (eff <= 50) w += 0.10;
+  }
+  if (isFiniteNum(p.minutes_held) && p.minutes_held < 15) w -= 0.20; // wick/noise
+  return clamp(w, 0, 1);
+}
+
+function winnerEvidenceWeight(p) {
+  let w = 0.30;
+  const feeYield = isFiniteNum(p.initial_value_usd) && p.initial_value_usd > 0
+    ? ((p.fees_earned_usd || 0) / p.initial_value_usd) * 100
+    : 0;
+  if (feeYield >= 3) w += 0.30;
+  else if (feeYield >= 1) w += 0.15;
+  const eff = p.range_efficiency;
+  if (isFiniteNum(eff)) {
+    if (eff >= 80) w += 0.20;
+    else if (eff >= 60) w += 0.10;
+  }
+  if (isFiniteNum(p.pnl_pct) && p.pnl_pct >= 5) w += 0.20;
+  if (isFiniteNum(p.minutes_held) && p.minutes_held < 15) w -= 0.15; // quick flip
+  return clamp(w, 0, 1);
 }
 
 function avg(arr) {
