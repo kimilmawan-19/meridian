@@ -150,7 +150,8 @@ export const config = {
       dropThresholdPct:  u.emergencyExits?.volumeCollapse?.dropThresholdPct  ?? 30,
       minPositionAgeMin: u.emergencyExits?.volumeCollapse?.minPositionAgeMin ?? 10,
       minPeakVolumeUsd:  u.emergencyExits?.volumeCollapse?.minPeakVolumeUsd  ?? 2000,
-      sellPressureRatio: u.emergencyExits?.volumeCollapse?.sellPressureRatio ?? 2,
+      sellPressureRatio:  u.emergencyExits?.volumeCollapse?.sellPressureRatio  ?? 2,
+      minSellConfirmTxns: u.emergencyExits?.volumeCollapse?.minSellConfirmTxns ?? 5,   // min total txns before sell/buy ratio is trusted
     },
     rapidPriceDrop: {
       enabled:               u.emergencyExits?.rapidPriceDrop?.enabled               ?? true,

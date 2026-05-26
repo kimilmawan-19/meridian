@@ -116,7 +116,8 @@
       "dropThresholdPct": 30,
       "minPositionAgeMin": 10,
       "minPeakVolumeUsd": 2000,
-      "sellPressureRatio": 2
+      "sellPressureRatio": 2,
+      "minSellConfirmTxns": 5
     },
     "rapidPriceDrop": {
       "enabled": true,

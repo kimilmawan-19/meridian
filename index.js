@@ -1217,7 +1217,7 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
     // The next management cycle will re-evaluate; this prevents closing into a bounce.
     const oorBelowBuys = marketData?.txn_buys_5m ?? 0;
     const oorBelowSells = marketData?.txn_sells_5m ?? 0;
-    if (oorBelowBuys > 0 && oorBelowBuys > oorBelowSells) {
+    if ((oorBelowBuys + oorBelowSells) >= 3 && oorBelowBuys > oorBelowSells) {
       log("cron_warn", `Rule 4 OOR below deferred for ${position.pair}: buy pressure detected (buys=${oorBelowBuys} sells=${oorBelowSells})`);
     } else {
       return { action: "CLOSE", rule: 4, reason: `OOR below (cycle complete, ${position.minutes_out_of_range}m)` };
@@ -1239,6 +1239,7 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
   // Skip when:
   //   - OOR ABOVE: price above range, SOL is idle — no capital at risk from a dying pool
   //   - In range AND PnL >= 0: still earning fees, a volume dip may be temporary
+  //   - Entry accumulation zone: SOL-rich position is absorbing sells, not bleeding out
   if (marketData) {
     const vcCfg = config.emergencyExits.volumeCollapse;
     if (vcCfg.enabled) {
@@ -1257,15 +1258,49 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
         ? Math.max(1, Math.min(1.5, vc7tracked.volatility / 2))
         : 1;
       const effectiveSellRatio7 = vcCfg.sellPressureRatio * volMult7;
+
+      // Depth-aware entry grace (mirrors Rule 8/9): a SOL-rich position experiencing a
+      // volume collapse is still in its token-accumulation phase — not a capital-loss event.
+      // FAIL-SAFE: keep grace active when bin data is unavailable.
+      const binsKnown7 = position.active_bin != null && position.upper_bin != null && position.lower_bin != null;
+      const rangeTotal7 = binsKnown7 ? (position.upper_bin - position.lower_bin) : 0;
+      const depthPct7 = binsKnown7 && rangeTotal7 > 0
+        ? ((position.upper_bin - position.active_bin) / rangeTotal7) * 100
+        : 0;
+      const deployStrategy7 = (vc7tracked?.strategy ?? config.strategy.strategy ?? "curve").toLowerCase();
+      const graceDepth7 = deployStrategy7 === "bid_ask"
+        ? (managementConfig.bidAskEntryGraceDepthPct ?? 80)
+        : (managementConfig.curveEntryGraceDepthPct ?? 50);
+      const confirmMs7 = (managementConfig.entryGraceConfirmMinutes ?? 15) * 60_000;
+      const graceExitedAt7 = vc7tracked?.r9_grace_exited_at;
+      const inEntryAccumulation7 =
+        !binsKnown7 ||
+        (oorDir7 === "IN" && (
+          depthPct7 < graceDepth7 ||
+          graceExitedAt7 == null ||
+          (Date.now() - new Date(graceExitedAt7).getTime()) < confirmMs7
+        ));
+
+      if (inEntryAccumulation7) {
+        const why7 = !binsKnown7
+          ? "bin data unavailable (fail-safe)"
+          : `depth=${depthPct7.toFixed(1)}% < ${graceDepth7}% or confirm pending`;
+        log("market_data", `Rule 7 skipped for ${position.pair}: entry grace active (${why7}, strategy=${deployStrategy7})`);
+      }
+
+      // Minimum absolute transaction floor: a sell/buy ratio is meaningless in a near-dead
+      // window (e.g. 1 sell vs 0 buys). Require enough total txns to be a valid signal.
+      const minTxns7 = vcCfg.minSellConfirmTxns ?? 5;
       if (
         oorDir7 !== "ABOVE" &&
         !inRangeAndGreen &&
+        !inEntryAccumulation7 &&
         ageMin >= vcCfg.minPositionAgeMin &&
         peakVol >= vcCfg.minPeakVolumeUsd &&
         curVol != null && curVol < peakVol * (vcCfg.dropThresholdPct / 100) &&
-        sells != null && buys != null && sells > buys * effectiveSellRatio7
+        sells != null && buys != null && (sells + buys) >= minTxns7 && sells > buys * effectiveSellRatio7
       ) {
-        return { action: "CLOSE", rule: 7, reason: `volume collapse (sells>${effectiveSellRatio7.toFixed(2)}× buys, vol=${vc7tracked?.volatility ?? "?"}×${volMult7.toFixed(2)})` };
+        return { action: "CLOSE", rule: 7, reason: `volume collapse (sells>${effectiveSellRatio7.toFixed(2)}× buys, vol=${vc7tracked?.volatility ?? "?"}×${volMult7.toFixed(2)} depth=${depthPct7.toFixed(0)}% strat=${deployStrategy7})` };
       }
     }
   }
