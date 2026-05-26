@@ -63,6 +63,10 @@ export const config = {
   screening: {
     excludeHighSupplyConcentration: u.excludeHighSupplyConcentration ?? true,
     minFeeActiveTvlRatio: u.minFeeActiveTvlRatio ?? 0.05,
+    // Adaptive evolution (lessons.js evolveThresholds)
+    evolveWindowDays:          numericConfig(u.evolveWindowDays)          ?? 14,   // only evaluate closed positions within this window (0/null = all history)
+    minFeeActiveTvlRatioFloor: numericConfig(u.minFeeActiveTvlRatioFloor) ?? 0.04, // relax can never lower minFeeActiveTvlRatio below this
+    minOrganicFloor:           numericConfig(u.minOrganicFloor)           ?? 55,   // relax can never lower minOrganic below this
     minTvl:            u.minTvl            ?? 10_000,
     maxTvl:            u.maxTvl !== undefined ? u.maxTvl : 150_000,
     minVolume:         u.minVolume         ?? 500,
@@ -301,6 +305,9 @@ export function reloadScreeningThresholds() {
     const fresh = JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"));
     const s = config.screening;
     if (fresh.minFeeActiveTvlRatio != null) s.minFeeActiveTvlRatio = fresh.minFeeActiveTvlRatio;
+    if (fresh.evolveWindowDays          != null) s.evolveWindowDays          = numericConfig(fresh.evolveWindowDays);
+    if (fresh.minFeeActiveTvlRatioFloor != null) s.minFeeActiveTvlRatioFloor = numericConfig(fresh.minFeeActiveTvlRatioFloor);
+    if (fresh.minOrganicFloor           != null) s.minOrganicFloor           = numericConfig(fresh.minOrganicFloor);
     if (fresh.minTokenFeesSol  != null) s.minTokenFeesSol  = fresh.minTokenFeesSol;
     if (fresh.maxTop10Pct      != null) s.maxTop10Pct      = fresh.maxTop10Pct;
     if (fresh.useDiscordSignals !== undefined) s.useDiscordSignals = fresh.useDiscordSignals;

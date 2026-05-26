@@ -311,12 +311,39 @@ function derivLesson(perf) {
 export function evolveThresholds(perfData, config) {
   if (!perfData || perfData.length < MIN_EVOLVE_POSITIONS) return null;
 
-  const winners = perfData.filter((p) => p.pnl_pct > 0);
-  const losers  = perfData.filter((p) => p.pnl_pct < -5);
+  // ── Recency window ────────────────────────────────────────────
+  // Evaluate only positions closed within evolveWindowDays so thresholds
+  // track current market conditions, not stale history. Fall back to full
+  // history when the recent window is too thin to be meaningful.
+  const windowDays = config.screening?.evolveWindowDays;
+  let evalData = perfData;
+  if (isFiniteNum(windowDays) && windowDays > 0) {
+    const cutoff = new Date(Date.now() - windowDays * 86_400_000).toISOString();
+    const windowed = perfData.filter((p) => (p.recorded_at ?? "") >= cutoff);
+    if (windowed.length >= MIN_EVOLVE_POSITIONS) evalData = windowed;
+  }
+
+  const winners = evalData.filter((p) => p.pnl_pct > 0);
+  const losers  = evalData.filter((p) => p.pnl_pct < -5);
 
   // Need at least some signal in both directions before adjusting
   const hasSignal = winners.length >= 2 || losers.length >= 2;
   if (!hasSignal) return null;
+
+  // ── Relax gate (shared by all threshold blocks) ───────────────
+  // When the filter is over-tight in a thin market, allow thresholds to
+  // step DOWN. Asymmetric vs raising: smaller step, stricter evidence,
+  // hard floor. Three OR paths qualify; safeguards always required.
+  const total      = winners.length + evalData.filter((p) => p.pnl_pct <= 0).length;
+  const winRate    = total > 0 ? winners.length / total : 0;
+  const pnlVals    = evalData.map((p) => p.pnl_pct).filter(isFiniteNum);
+  const avgPnlPct  = pnlVals.length ? avg(pnlVals) : 0;
+  const RELAX_POSITION_FLOOR = 10; // only relax when window is thin (dry market)
+  const relaxQualifies =
+    (winRate > 0.60 && evalData.length >= 5) ||  // path 1: win-rate dominant
+    (winRate > 0.50 && avgPnlPct > 2) ||         // path 2: positive expected value
+    (avgPnlPct > 5);                             // path 3: strong returns
+  const relaxAllowed = relaxQualifies && evalData.length < RELAX_POSITION_FLOOR;
 
   const changes   = {};
   const rationale = {};
@@ -358,6 +385,18 @@ export function evolveThresholds(perfData, config) {
         }
       }
     }
+
+    // Relax (step down) — only when no raise was applied and gate qualifies
+    if (!changes.minFeeActiveTvlRatio && relaxAllowed) {
+      const floor   = config.screening.minFeeActiveTvlRatioFloor ?? 0.04;
+      const target  = current * 0.90; // smaller step than raise (10%)
+      const newVal  = clamp(nudge(current, target, MAX_CHANGE_PER_STEP), floor, 10.0);
+      const rounded = Number(newVal.toFixed(2));
+      if (rounded < current) {
+        changes.minFeeActiveTvlRatio = rounded;
+        rationale.minFeeActiveTvlRatio = `Relaxed: winRate=${(winRate * 100).toFixed(0)}% avgPnl=${avgPnlPct.toFixed(1)}% n=${evalData.length} (thin market) — lowered floor from ${current} → ${rounded}`;
+      }
+    }
   }
 
   // ── 2. minOrganic ─────────────────────────────────────────────
@@ -380,6 +419,17 @@ export function evolveThresholds(perfData, config) {
           changes.minOrganic = newVal;
           rationale.minOrganic = `Winner avg organic ${avgWinnerOrganic.toFixed(0)} vs loser avg ${avgLoserOrganic.toFixed(0)} — raised from ${current} → ${newVal}`;
         }
+      }
+    }
+
+    // Relax (step down) — only when no raise was applied and gate qualifies
+    if (!changes.minOrganic && relaxAllowed) {
+      const floor  = config.screening.minOrganicFloor ?? 55;
+      const target = current * 0.95; // smaller step than fee floor (5% for organic)
+      const newVal = clamp(Math.round(nudge(current, target, MAX_CHANGE_PER_STEP)), floor, 90);
+      if (newVal < current) {
+        changes.minOrganic = newVal;
+        rationale.minOrganic = `Relaxed: winRate=${(winRate * 100).toFixed(0)}% avgPnl=${avgPnlPct.toFixed(1)}% n=${evalData.length} (thin market) — lowered from ${current} → ${newVal}`;
       }
     }
   }
