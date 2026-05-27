@@ -138,7 +138,12 @@ ${config.strategy.strategy === "bid_ask" ? `BID_ASK CHARACTERISTICS — read car
 - AVOID: tokens in unilateral pump (price will run away from your range upward — no oscillation, no fees) or in unilateral dump (you catch a falling knife and end up holding bag).
 - PREFER: tokens with high volatility (volatility >= 3) AND signs of oscillation (not pure trend). Smart wallet presence is a strong signal of accumulation zone.
 - ATH context matters: deploying near ATH is risky for bid_ask — price has more room to drop through your range, but also more risk of dump-and-stay. Mid-range entries (20-40% below ATH) are often the sweet spot.
-` : `STRATEGY ${config.strategy.strategy}: liquidity distribution differs from bid_ask. Apply general DLMM principles.
+` : `CURVE CHARACTERISTICS — read carefully, this shapes your candidate selection:
+- Liquidity is concentrated AROUND the active bin (bell-curve shape centred at current price). As price moves slightly below entry, SOL converts to token gradually — designed to accumulate on mild dips and earn fees from oscillation near the centre.
+- IDEAL setup: token with stable-to-moderate volatility that oscillates around a support zone. Mild pullbacks are expected and healthy — curve earns fees on both directions of small swings.
+- AVOID: tokens in confirmed freefall / unilateral dump with no reversal signal. Curve WILL convert SOL to tokens as price drops, turning you into a bag-holder if the dump continues well below your range. A 1h price drop beyond -30% with no smart wallet presence is a falling-knife — skip it.
+- PREFER: tokens where price is pulling back from a moderate local high with volume support (not collapsing). Entry near an oscillation support zone with bullish smart wallet activity is the sweet spot.
+- ATH context: deploying a curve when price is far below ATH is fine — curve is designed for mid-range, not ATH chasing. Deploying a curve into a token that just dumped -40% in 1h is not fine.
 `}
 DEPLOY RULES:
 - COMPOUNDING: Use the deploy amount from the goal EXACTLY. Do NOT default to a smaller number.

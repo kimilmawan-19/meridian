@@ -648,6 +648,19 @@ export async function runScreeningCycle({ silent = false } = {}) {
         return false;
       }
 
+      // RULE: anti-dump / falling-knife hard floor — drop tokens in severe 1h freefall.
+      // Smart-wallet presence overrides (accumulation by KOLs can accompany a dip).
+      const maxDump = config.screening.maxDump1hPct ?? null;
+      if (maxDump != null && pump1h != null && pump1h < maxDump) {
+        const smartWalletsDump = Math.max(sw?.in_pool?.length ?? 0, Number(pool.gmgn_smart_wallets ?? 0) || 0);
+        if (smartWalletsDump === 0) {
+          log("screening", `Dump filter: dropped ${pool.name} — 1h ${pump1h}% < ${maxDump}% (no smart wallets)`);
+          filteredOut.push({ name: pool.name, reason: `1h dump ${pump1h}% < ${maxDump}%` });
+          return false;
+        }
+        log("screening", `Dump filter: kept ${pool.name} — 1h ${pump1h}% but smart wallets present (${smartWalletsDump})`);
+      }
+
       // 🆕 RULE: rugpull + PVP hard filter — applied uniformly to all candidates.
       // Override only when smart wallets are present in the pool.
       const smartWalletCount = Math.max(sw?.in_pool?.length ?? 0, Number(pool.gmgn_smart_wallets ?? 0) || 0);

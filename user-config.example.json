@@ -53,6 +53,7 @@
   "minPoolAgeHours": null,
   "athFilterPct": null,
   "maxPump1hPct": null,
+  "maxDump1hPct": -35,
 
   "minClaimAmount": 5,
   "autoSwapAfterClaim": false,

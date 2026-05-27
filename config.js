@@ -93,6 +93,7 @@ export const config = {
     maxTokenAgeHours:   u.maxTokenAgeHours   ?? null, // null = no maximum
     athFilterPct:       u.athFilterPct       ?? null, // e.g. -20 = only deploy if price is >= 20% below ATH
     maxPump1hPct:       u.maxPump1hPct       ?? null, // null = disabled. Use athFilterPct for position-based anti-uptrend. Set e.g. 80 to also block extreme short-term pumps.
+    maxDump1hPct:       u.maxDump1hPct       ?? -35, // default -35. Drop candidates whose 1h price change is below this. Smart-money escape hatch. Set null to disable.
     minPoolAgeHours:    u.minPoolAgeHours    ?? null, // null = disabled. Measures token age (not LP pool age). Set to 1-2 to block very new tokens without conflicting with category="trending".
     // Volume TA entry signals (soft hints to LLM, not hard filters)
     volumeTrendDeclineThreshold: u.volumeTrendDeclineThreshold ?? 0.6,  // trend_ratio < 0.6 → DECLINING
@@ -336,6 +337,7 @@ export function reloadScreeningThresholds() {
     if (fresh.athFilterPct      !== undefined) s.athFilterPct     = fresh.athFilterPct;
     if (fresh.filterDecliningVolume        !== undefined) s.filterDecliningVolume        = fresh.filterDecliningVolume;
     if (fresh.volumeCollapseRejectThreshold != null)      s.volumeCollapseRejectThreshold = fresh.volumeCollapseRejectThreshold;
+    if (fresh.maxDump1hPct               !== undefined) s.maxDump1hPct               = fresh.maxDump1hPct;
     if (fresh.maxBundlePct      != null) s.maxBundlePct     = fresh.maxBundlePct;
     if (fresh.avoidPvpSymbols   !== undefined) s.avoidPvpSymbols = fresh.avoidPvpSymbols;
     if (fresh.blockPvpSymbols   !== undefined) s.blockPvpSymbols = fresh.blockPvpSymbols;
