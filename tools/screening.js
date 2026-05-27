@@ -190,8 +190,12 @@ async function applyVolatilityTimeframe(rawPools, sourceTimeframe) {
   if (!Array.isArray(rawPools) || rawPools.length === 0) return rawPools;
   const volatilityTimeframe = getVolatilityTimeframe(sourceTimeframe);
   if (sourceTimeframe === volatilityTimeframe) {
+    // Source is already at/above the volatility-timeframe floor (>=30m), so its own
+    // volume_change_pct is already measured over a noise-resistant window.
     for (const pool of rawPools) {
-      if (pool) pool.volatility_timeframe = volatilityTimeframe;
+      if (!pool) continue;
+      pool.volatility_timeframe = volatilityTimeframe;
+      pool.long_volume_change_pct = numeric(pool.volume_change_pct);
     }
     return rawPools;
   }
@@ -200,21 +204,29 @@ async function applyVolatilityTimeframe(rawPools, sourceTimeframe) {
   const volatilityResults = await Promise.allSettled(
     uniquePoolAddresses.map((poolAddress) =>
       fetchPoolDiscoveryDetail({ poolAddress, timeframe: volatilityTimeframe })
-        .then((pool) => ({ poolAddress, volatility: numeric(pool?.volatility) }))
+        .then((pool) => ({
+          poolAddress,
+          volatility: numeric(pool?.volatility),
+          // Same detail response also carries volume_change_pct at the volatility
+          // timeframe — reuse it for the declining-volume filter (no extra API call).
+          longVolumeChangePct: numeric(pool?.volume_change_pct),
+        }))
     )
   );
 
-  const volatilityByPool = new Map();
+  const detailByPool = new Map();
   for (const result of volatilityResults) {
     if (result.status !== "fulfilled") continue;
     if (result.value.volatility == null) continue;
-    volatilityByPool.set(result.value.poolAddress, result.value.volatility);
+    detailByPool.set(result.value.poolAddress, result.value);
   }
 
   for (const pool of rawPools) {
-    if (!pool?.pool_address || !volatilityByPool.has(pool.pool_address)) continue;
-    pool.volatility = volatilityByPool.get(pool.pool_address);
+    if (!pool?.pool_address || !detailByPool.has(pool.pool_address)) continue;
+    const detail = detailByPool.get(pool.pool_address);
+    pool.volatility = detail.volatility;
     pool.volatility_timeframe = volatilityTimeframe;
+    if (detail.longVolumeChangePct != null) pool.long_volume_change_pct = detail.longVolumeChangePct;
   }
 
   return rawPools;
@@ -638,6 +650,28 @@ export async function getTopCandidates({ limit = 10 } = {}) {
         return true;
       }));
       if (eligible.length < before) log("screening", `ATH filter removed ${before - eligible.length} pool(s)`);
+    }
+
+    // Declining-volume hard filter — a pool whose volume is collapsing is a dying fee
+    // engine. fee/TVL is backward-looking (24h) and can stay attractive while today's
+    // volume evaporates, baiting the LLM into a dead pool. Measured on the volatility
+    // timeframe (>=30m), NOT the noisy 5m screening window. Smart-money presence overrides.
+    if (config.screening.filterDecliningVolume) {
+      const rejectPct = config.screening.volumeCollapseRejectThreshold ?? -50;
+      const before2 = eligible.length;
+      eligible.splice(0, eligible.length, ...eligible.filter((p) => {
+        const vc = p.long_volume_change_pct;
+        if (vc == null) return true;       // no data → fail-open
+        if (vc > rejectPct) return true;   // not collapsing
+        if (p.smart_money_buy || p.kol_in_clusters) {
+          log("screening", `Volume filter: kept ${p.name} despite vol_change ${vc}% (${p.volatility_timeframe}) — smart money present`);
+          return true;
+        }
+        log("screening", `Volume filter: dropped ${p.name} — vol_change ${vc}% over ${p.volatility_timeframe} (limit: ${rejectPct}%)`);
+        pushFilteredReason(filteredOut, p, `volume collapsing ${vc}% over ${p.volatility_timeframe} < ${rejectPct}% limit`);
+        return false;
+      }));
+      if (eligible.length < before2) log("screening", `Volume filter removed ${before2 - eligible.length} pool(s)`);
     }
 
     // Drop any pools whose creator is on the dev blocklist (caught via advanced-info)

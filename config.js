@@ -98,6 +98,10 @@ export const config = {
     volumeTrendDeclineThreshold: u.volumeTrendDeclineThreshold ?? 0.6,  // trend_ratio < 0.6 → DECLINING
     volumeTrendExpandThreshold:  u.volumeTrendExpandThreshold  ?? 1.4,  // trend_ratio > 1.4 → EXPANDING
     entryBuySellRatio:           u.entryBuySellRatio           ?? 1.5,  // sells/buys > 1.5 → BEARISH signal
+    // Declining-volume HARD filter (rejects candidate before LLM). Uses volume_change_pct
+    // at the volatility timeframe (>=30m), not the noisy 5m window. Smart money overrides.
+    filterDecliningVolume:        u.filterDecliningVolume        ?? true, // toggle the hard filter
+    volumeCollapseRejectThreshold: u.volumeCollapseRejectThreshold ?? -50,  // reject if vol_change < -50% over the volatility timeframe
   },
 
   // ─── Position Management ────────────────
@@ -330,6 +334,8 @@ export function reloadScreeningThresholds() {
     if (fresh.minTokenAgeHours  !== undefined) s.minTokenAgeHours = fresh.minTokenAgeHours;
     if (fresh.maxTokenAgeHours  !== undefined) s.maxTokenAgeHours = fresh.maxTokenAgeHours;
     if (fresh.athFilterPct      !== undefined) s.athFilterPct     = fresh.athFilterPct;
+    if (fresh.filterDecliningVolume        !== undefined) s.filterDecliningVolume        = fresh.filterDecliningVolume;
+    if (fresh.volumeCollapseRejectThreshold != null)      s.volumeCollapseRejectThreshold = fresh.volumeCollapseRejectThreshold;
     if (fresh.maxBundlePct      != null) s.maxBundlePct     = fresh.maxBundlePct;
     if (fresh.avoidPvpSymbols   !== undefined) s.avoidPvpSymbols = fresh.avoidPvpSymbols;
     if (fresh.blockPvpSymbols   !== undefined) s.blockPvpSymbols = fresh.blockPvpSymbols;

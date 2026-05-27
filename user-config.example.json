@@ -32,6 +32,8 @@
   "maxMcap": 10000000,
   "minBinStep": 80,
   "maxBinStep": 125,
+  "filterDecliningVolume": true,
+  "volumeCollapseRejectThreshold": -50,
   "minFeeActiveTvlRatio": 0.05,
   "evolveWindowDays": 14,
   "minFeeActiveTvlRatioFloor": 0.04,
