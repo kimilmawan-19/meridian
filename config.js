@@ -143,6 +143,14 @@ export const config = {
     trailingTakeProfit:    u.trailingTakeProfit    ?? true,
     trailingTriggerPct:    u.trailingTriggerPct    ?? 3,    // activate trailing at X% PnL
     trailingDropPct:       u.trailingDropPct       ?? 1.5,  // close when drops X% from peak
+    // ── Layer B: LLM-set per-position risk thresholds (clamped) ──
+    allowLlmRiskParams:    u.allowLlmRiskParams     ?? true, // let SCREENER set per-position sl/trailing overrides
+    stopLossFloorPct:      u.stopLossFloorPct       ?? -50,  // loosest (most negative) SL the LLM may set
+    stopLossTightestPct:   u.stopLossTightestPct    ?? -10,  // tightest (least negative) SL the LLM may set
+    // ── Layer A: LLM veto on trailing take-profit (soft exit only) ──
+    allowTpVeto:           u.allowTpVeto            ?? true, // let MANAGER hold a triggered trailing TP
+    maxTpVetos:            u.maxTpVetos             ?? 3,    // max consecutive holds before force-close
+    tpVetoFloorDivisor:    u.tpVetoFloorDivisor     ?? 2,    // force-close once give-back >= peak / divisor
     pnlSanityMaxDiffPct:   u.pnlSanityMaxDiffPct   ?? 5,    // max allowed diff between reported and derived pnl % before ignoring a tick
     // SOL mode — positions, PnL, and balances reported in SOL instead of USD
     solMode:               u.solMode               ?? false,

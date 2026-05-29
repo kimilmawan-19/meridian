@@ -158,6 +158,11 @@ DEPLOY RULES:
   - curve: bins_above = 5–7. Low volatility means small upward swings; a narrow buffer is enough.
   - bid_ask: bins_above = round(bins_below × 0.25), clamped to [10, 20]. High-volatility tokens can spike 10–20% before reverting. A wider buffer lets price oscillate above the active bin without triggering an OOR close, preserving fee capture on the way back down. Example: bins_below=49 → bins_above=12.
 - Pick ONE pool only when conviction is real. If only one weak candidate survives, skip and explain why none qualify.
+- RISK PARAMS (optional, per-position — set on deploy_position to tailor exits to THIS token):
+  - sl_pct (negative): tighter (e.g. -30) for fragile / very-high-volatility / weak-narrative tokens or when smart money is exiting → cut losers fast. Looser (toward ${config.management.stopLossFloorPct ?? -50}) for high-conviction tokens with smart-money accumulation. Clamped to [${config.management.stopLossFloorPct ?? -50}, ${config.management.stopLossTightestPct ?? -10}].
+  - trailing_trigger_pct: raise (e.g. 5–6) for strong runners so trailing arms later and lets the move build; keep low for choppy tokens.
+  - trailing_drop_pct: widen (e.g. 2.5–3) for volatile tokens that wick hard; keep tight for stable ones.
+  - These are heuristics for autonomous deploys. When unsure, OMIT them — the global defaults apply. A direct user instruction always overrides.
 
 ${weightsSummary ? `${weightsSummary}\nPrioritize candidates whose strongest attributes align with high-weight signals.\n\n` : ""}${lessons ? `LESSONS LEARNED:\n${lessons}\n` : ""}Timestamp: ${new Date().toISOString()}
 `;
@@ -168,6 +173,8 @@ Your goal: Manage positions to maximize total Fee + PnL yield.
 INSTRUCTION CHECK (HIGHEST PRIORITY): If a position has an instruction set (e.g. "close at 5% profit"), check get_position_pnl and compare against the condition FIRST. If the condition IS MET → close immediately. No further analysis, no hesitation. BIAS TO HOLD does NOT apply when an instruction condition is met.
 
 BIAS TO HOLD: Unless an instruction fires, a pool is dying, volume has collapsed, or yield has vanished, hold.
+
+TRAILING TAKE-PROFIT (TP_PROPOSAL): When a position is flagged TP_PROPOSAL, trailing take-profit has triggered — price has given back part of its gains from the peak. This is the ONE place you decide: take profit now (close_position) or hold. Hold ONLY when there is clear evidence the move continues (volume rising, price reclaiming, smart money still in). Otherwise take the profit — a confirmed give-back usually means the move is over. To hold, do nothing for that position; holds are budget-limited and the system force-closes once the budget runs out or the give-back gets too deep.
 
 Decision Factors for Closing (no instruction):
 - Yield Health: Call get_position_pnl. Is the current Fee/TVL still one of the best available?

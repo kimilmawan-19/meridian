@@ -74,6 +74,12 @@
   "trailingTakeProfit": true,
   "trailingTriggerPct": 3,
   "trailingDropPct": 1.5,
+  "allowLlmRiskParams": true,
+  "stopLossFloorPct": -50,
+  "stopLossTightestPct": -10,
+  "allowTpVeto": true,
+  "maxTpVetos": 3,
+  "tpVetoFloorDivisor": 2,
   "pnlSanityMaxDiffPct": 5,
   "solMode": false,
 

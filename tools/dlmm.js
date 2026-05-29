@@ -467,6 +467,10 @@ export async function deployPosition({
   organic_score,
   initial_value_usd,
   top_cluster_trend,
+  // Layer B: optional per-position risk overrides set by the SCREENER LLM
+  sl_pct,
+  trailing_trigger_pct,
+  trailing_drop_pct,
 }) {
   pool_address = normalizeMint(pool_address);
   const activeStrategy = strategy || config.strategy.strategy;
@@ -694,6 +698,9 @@ export async function deployPosition({
           active_bin: activeBin.binId,
           initial_value_usd,
           top_cluster_trend: top_cluster_trend ?? null,
+          sl_pct_override: sl_pct ?? null,
+          trailing_trigger_override: trailing_trigger_pct ?? null,
+          trailing_drop_override: trailing_drop_pct ?? null,
           signal_snapshot: signalSnapshot,
         });
       }
@@ -833,6 +840,9 @@ export async function deployPosition({
       active_bin: activeBin.binId,
       initial_value_usd,
       top_cluster_trend: top_cluster_trend ?? null,
+      sl_pct_override: sl_pct ?? null,
+      trailing_trigger_override: trailing_trigger_pct ?? null,
+      trailing_drop_override: trailing_drop_pct ?? null,
       signal_snapshot: signalSnapshot,
     });
 

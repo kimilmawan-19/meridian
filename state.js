@@ -68,6 +68,10 @@ export function trackPosition({
   organic_score,
   initial_value_usd,
   signal_snapshot = null,
+  top_cluster_trend = null,
+  sl_pct_override = null,
+  trailing_trigger_override = null,
+  trailing_drop_override = null,
 }) {
   const state = load();
   state.positions[position] = {
@@ -105,6 +109,14 @@ export function trackPosition({
     confirmed_trailing_exit_until: null,
     trailing_active: false,
     break_even_active: false,
+    top_cluster_trend: top_cluster_trend ?? null,
+    // Layer B: per-position risk overrides (raw; clamped at read time)
+    sl_pct_override: sl_pct_override ?? null,
+    trailing_trigger_override: trailing_trigger_override ?? null,
+    trailing_drop_override: trailing_drop_override ?? null,
+    // Layer A: trailing-TP veto budget tracking
+    tp_veto_count: 0,
+    tp_veto_peak: null,
     peak_volume_5m_usd: null,
     last_market_data_at: null,
     volume_history: [],
@@ -205,6 +217,49 @@ export function updateR9GraceZone(position_address, depth_pct, graceDepth) {
     }
   }
   if (changed) save(state);
+}
+
+/**
+ * Layer B: resolve the effective stop-loss % for a position, honoring an LLM-set
+ * override but clamping it between the loosest (floor) and tightest bounds so a bad
+ * override can neither remove the safety net nor make it fire on normal oscillation.
+ */
+export function effectiveStopLossPct(tracked, mgmtConfig) {
+  const floor = mgmtConfig.stopLossFloorPct ?? -50;     // most negative allowed
+  const tightest = mgmtConfig.stopLossTightestPct ?? -10; // least negative allowed
+  const raw = (mgmtConfig.allowLlmRiskParams && tracked?.sl_pct_override != null)
+    ? tracked.sl_pct_override
+    : mgmtConfig.stopLossPct;
+  if (raw == null) return mgmtConfig.stopLossPct;
+  // clamp into [floor, tightest], e.g. [-50, -10]
+  return Math.min(tightest, Math.max(floor, raw));
+}
+
+/**
+ * Layer A: record that the MANAGER LLM chose to HOLD a triggered trailing take-profit.
+ * Stores the peak at veto time so a later new high can refund the veto budget.
+ * Returns the new veto count.
+ */
+export function recordTpVeto(position_address, peakPnlPct) {
+  const state = load();
+  const pos = state.positions[position_address];
+  if (!pos) return 0;
+  pos.tp_veto_count = (pos.tp_veto_count ?? 0) + 1;
+  pos.tp_veto_peak = peakPnlPct ?? pos.peak_pnl_pct ?? null;
+  save(state);
+  return pos.tp_veto_count;
+}
+
+/**
+ * Layer A: reset the trailing-TP veto budget (e.g. after a new peak made the hold pay off).
+ */
+export function resetTpVeto(position_address) {
+  const state = load();
+  const pos = state.positions[position_address];
+  if (!pos || (pos.tp_veto_count ?? 0) === 0) return;
+  pos.tp_veto_count = 0;
+  pos.tp_veto_peak = null;
+  save(state);
 }
 
 /**
@@ -498,8 +553,16 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
 
   let changed = false;
 
+  // Layer B: per-position trailing overrides (clamped to sane minimums)
+  const effTrailingTrigger = (mgmtConfig.allowLlmRiskParams && pos.trailing_trigger_override != null)
+    ? Math.max(1, pos.trailing_trigger_override)
+    : mgmtConfig.trailingTriggerPct;
+  const effTrailingDropFloor = (mgmtConfig.allowLlmRiskParams && pos.trailing_drop_override != null)
+    ? Math.max(0.5, pos.trailing_drop_override)
+    : mgmtConfig.trailingDropPct;
+
   // Activate trailing TP once trigger threshold is reached
-  if (mgmtConfig.trailingTakeProfit && !pos.trailing_active && (pos.peak_pnl_pct ?? 0) >= mgmtConfig.trailingTriggerPct) {
+  if (mgmtConfig.trailingTakeProfit && !pos.trailing_active && (pos.peak_pnl_pct ?? 0) >= effTrailingTrigger) {
     pos.trailing_active = true;
     changed = true;
     log("state", `Position ${position_address} trailing TP activated (confirmed peak: ${pos.peak_pnl_pct}%)`);
@@ -555,16 +618,18 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   // ── Stop loss ──────────────────────────────────────────────────
   const { age_minutes: slAgeMin } = positionData;
   const minAgeForStopLoss = mgmtConfig.minAgeBeforeStopLoss ?? 15;
+  const effSL = effectiveStopLossPct(pos, mgmtConfig);
   if (
     !pnl_pct_suspicious &&
     currentPnlPct != null &&
-    mgmtConfig.stopLossPct != null &&
-    currentPnlPct <= mgmtConfig.stopLossPct &&
+    effSL != null &&
+    currentPnlPct <= effSL &&
     (slAgeMin == null || slAgeMin >= minAgeForStopLoss)
   ) {
+    const slTag = pos.sl_pct_override != null && mgmtConfig.allowLlmRiskParams ? " [per-position]" : "";
     return {
       action: "STOP_LOSS",
-      reason: `Stop loss: PnL ${currentPnlPct.toFixed(2)}% <= ${mgmtConfig.stopLossPct}% (age: ${slAgeMin ?? "?"}m)`,
+      reason: `Stop loss: PnL ${currentPnlPct.toFixed(2)}% <= ${effSL}%${slTag} (age: ${slAgeMin ?? "?"}m)`,
     };
   }
 
@@ -574,8 +639,8 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   if (!pnl_pct_suspicious && pos.trailing_active && in_range !== true) {
     const dropFromPeak = pos.peak_pnl_pct - currentPnlPct;
     // Widen drop tolerance proportionally at higher peaks: give back at most 1/3 of gains.
-    // trailingDropPct acts as floor so low-peak positions keep their tight stop.
-    const effectiveDrop = Math.max(mgmtConfig.trailingDropPct, pos.peak_pnl_pct / 3);
+    // trailingDropPct (or per-position override) acts as floor so low-peak positions keep their tight stop.
+    const effectiveDrop = Math.max(effTrailingDropFloor, pos.peak_pnl_pct / 3);
     if (dropFromPeak >= effectiveDrop) {
       return {
         action: "TRAILING_TP",

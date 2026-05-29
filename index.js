@@ -28,7 +28,7 @@ import {
   createLiveMessage,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop, batchUpdateMarketData, getOorDirection, wasRecentlyOorAbove, updateR9GraceZone } from "./state.js";
+import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop, batchUpdateMarketData, getOorDirection, wasRecentlyOorAbove, updateR9GraceZone, effectiveStopLossPct, recordTpVeto, resetTpVeto } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote, addVolumeSnapshot, getVolumeWindow } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
@@ -310,7 +310,7 @@ export async function runManagementCycle({ silent = false } = {}) {
           }
           continue;
         }
-        exitMap.set(p.position, exit.reason);
+        exitMap.set(p.position, exit);
         log("state", `Exit alert for ${p.pair}: ${exit.reason}`);
       }
     }
@@ -321,7 +321,35 @@ export async function runManagementCycle({ silent = false } = {}) {
     for (const p of positionData) {
       // Hard exit — highest priority
       if (exitMap.has(p.position)) {
-        actionMap.set(p.position, { action: "CLOSE", rule: "exit", reason: exitMap.get(p.position) });
+        const exit = exitMap.get(p.position);
+        const mgmt = config.management;
+        // Layer A: only TRAILING_TP is vetoable. STOP_LOSS / BREAK_EVEN are non-negotiable
+        // (force-close always exits in profit for trailing; break-even/SL guard against loss).
+        if (exit.action === "TRAILING_TP" && mgmt.allowTpVeto) {
+          const tr = getTrackedPosition(p.position);
+          const peak = exit.peak_pnl_pct ?? tr?.peak_pnl_pct ?? 0;
+          const current = exit.current_pnl_pct ?? p.pnl_pct ?? 0;
+          const dropFromPeak = peak - current;
+          const floorDrop = peak / (mgmt.tpVetoFloorDivisor ?? 2);
+          // Refund the veto budget if a new peak was reached since the last hold (it paid off).
+          let vetoCount = tr?.tp_veto_count ?? 0;
+          if (tr?.tp_veto_peak != null && peak > tr.tp_veto_peak + 0.01) {
+            resetTpVeto(p.position);
+            vetoCount = 0;
+          }
+          const budgetLeft = vetoCount < (mgmt.maxTpVetos ?? 3);
+          const aboveFloor = dropFromPeak < floorDrop;
+          if (budgetLeft && aboveFloor) {
+            actionMap.set(p.position, { action: "TP_PROPOSAL", reason: exit.reason, peak, current, dropFromPeak, vetoCount });
+            continue;
+          }
+          const forcedWhy = !budgetLeft
+            ? `veto budget exhausted (${vetoCount}/${mgmt.maxTpVetos ?? 3})`
+            : `give-back ${dropFromPeak.toFixed(1)}% >= peak/${mgmt.tpVetoFloorDivisor ?? 2} (${floorDrop.toFixed(1)}%)`;
+          actionMap.set(p.position, { action: "CLOSE", rule: "exit", reason: `${exit.reason} [forced: ${forcedWhy}]` });
+          continue;
+        }
+        actionMap.set(p.position, { action: "CLOSE", rule: "exit", reason: exit.reason });
         continue;
       }
       // Instruction-set — pass to LLM, can't parse in JS
@@ -413,9 +441,12 @@ export async function runManagementCycle({ silent = false } = {}) {
       const inRange = p.in_range ? "🟢 IN" : `🔴 OOR${oorDir ? ` ${oorDir}` : ""} ${p.minutes_out_of_range ?? 0}m`;
       const val = config.management.solMode ? `◎${p.total_value_usd ?? "?"}` : `$${p.total_value_usd ?? "?"}`;
       const unclaimed = config.management.solMode ? `◎${p.unclaimed_fees_usd ?? "?"}` : `$${p.unclaimed_fees_usd ?? "?"}`;
-      const statusLabel = act.action === "INSTRUCTION" ? "HOLD (instruction)" : act.action;
+      const statusLabel = act.action === "INSTRUCTION" ? "HOLD (instruction)"
+        : act.action === "TP_PROPOSAL" ? "TP? (LLM decides)"
+        : act.action;
       let line = `**${p.pair}** | Age: ${p.age_minutes ?? "?"}m | Val: ${val} | Unclaimed: ${unclaimed} | PnL: ${p.pnl_pct ?? "?"}% | Yield: ${p.fee_per_tvl_24h ?? "?"}% | ${inRange} | ${statusLabel}`;
       if (p.instruction) line += `\nNote: "${p.instruction}"`;
+      if (act.action === "TP_PROPOSAL") line += `\n🎯 Trailing TP triggered: peak ${act.peak.toFixed(1)}% → ${act.current.toFixed(1)}% (gave back ${act.dropFromPeak.toFixed(1)}%, veto ${act.vetoCount}/${config.management.maxTpVetos ?? 3}) — LLM hold/close`;
       if (act.action === "CLOSE" && act.rule === "exit") line += `\n⚡ Trailing TP: ${act.reason}`;
       if (act.action === "CLOSE" && act.rule && act.rule !== "exit") line += `\nRule ${act.rule}: ${act.reason}`;
       if (act.action === "CLAIM") line += `\n→ Claiming fees`;
@@ -442,10 +473,21 @@ export async function runManagementCycle({ silent = false } = {}) {
 
       const actionBlocks = actionPositions.map((p) => {
         const act = actionMap.get(p.position);
+        if (act.action === "TP_PROPOSAL") {
+          return [
+            `POSITION: ${p.pair} (${p.position})`,
+            `  pool: ${p.pool}`,
+            `  action: TP_PROPOSAL — trailing take-profit triggered: ${act.reason}`,
+            `  peak_pnl: ${act.peak.toFixed(2)}% | current_pnl: ${act.current.toFixed(2)}% | given_back: ${act.dropFromPeak.toFixed(2)}% | holds_used: ${act.vetoCount}/${config.management.maxTpVetos ?? 3}`,
+            `  unclaimed_fees: ${cur}${p.unclaimed_fees_usd} | value: ${cur}${p.total_value_usd} | fee_per_tvl_24h: ${p.fee_per_tvl_24h ?? "?"}%`,
+            `  context: in_range=${p.in_range} | bins lower=${p.lower_bin} upper=${p.upper_bin} active=${p.active_bin} | oor_minutes=${p.minutes_out_of_range ?? 0} | price_5m=${p._marketData?.price_change_5m ?? "?"}% | vol_5m=$${p._marketData?.volume_5m ?? "?"}`,
+            `  DECISION: take profit now (close_position) OR hold (do nothing) only if there is clear continued upward momentum. Bias toward taking profit — a confirmed give-back usually means the move is done.`,
+          ].join("\n");
+        }
         return [
           `POSITION: ${p.pair} (${p.position})`,
           `  pool: ${p.pool}`,
-          `  action: ${act.action}${act.rule && act.rule !== "exit" ? ` — Rule ${act.rule}: ${act.reason}` : ""}${act.rule === "exit" ? ` — ⚡ Trailing TP: ${act.reason}` : ""}`,
+          `  action: ${act.action}${act.rule && act.rule !== "exit" ? ` — Rule ${act.rule}: ${act.reason}` : ""}${act.rule === "exit" ? ` — ⚡ exit: ${act.reason}` : ""}`,
           `  pnl_pct: ${p.pnl_pct}% | unclaimed_fees: ${cur}${p.unclaimed_fees_usd} | value: ${cur}${p.total_value_usd} | fee_per_tvl_24h: ${p.fee_per_tvl_24h ?? "?"}%`,
           `  bins: lower=${p.lower_bin} upper=${p.upper_bin} active=${p.active_bin} | oor_minutes: ${p.minutes_out_of_range ?? 0}`,
           p.instruction ? `  instruction: "${p.instruction}"` : null,
@@ -461,9 +503,10 @@ RULES:
 - CLOSE: call close_position only — it handles fee claiming internally, do NOT call claim_fees first
 - CLAIM: call claim_fees with position address
 - INSTRUCTION: evaluate the instruction condition. If met → close_position. If not → HOLD, do nothing.
+- TP_PROPOSAL: this is a JUDGMENT call, the only one where you decide. Take profit (close_position) unless the context shows clear continued upward momentum. To hold, simply do nothing for that position. Holds are budget-limited and force-close eventually.
 - ⚡ exit alerts: close immediately, no exceptions
 
-Execute the required actions. Do NOT re-evaluate CLOSE/CLAIM — rules already applied. Just execute.
+Execute the required actions. Do NOT re-evaluate CLOSE/CLAIM — rules already applied. TP_PROPOSAL is the only decision to make. Just execute.
 After executing, write a brief one-line result per position.
       `, config.llm.maxSteps, [], "MANAGER", config.llm.managementModel, 2048, {
         onToolStart: async ({ name }) => { await liveMessage?.toolStart(name); },
@@ -479,6 +522,19 @@ After executing, write a brief one-line result per position.
     // Trigger screening after management
     const afterPositions = await getMyPositions({ force: true }).catch(() => null);
     const afterCount = afterPositions?.positions?.length ?? 0;
+
+    // Layer A: reconcile trailing-TP proposals — any still-open proposal means the LLM
+    // chose to HOLD, so spend a veto. Closed ones were taken (no veto, position is gone).
+    const tpProposals = [...actionMap.entries()].filter(([, a]) => a.action === "TP_PROPOSAL");
+    if (tpProposals.length > 0) {
+      const stillOpen = new Set((afterPositions?.positions ?? []).map((p) => p.position));
+      for (const [addr, act] of tpProposals) {
+        if (stillOpen.has(addr)) {
+          const n = recordTpVeto(addr, act.peak);
+          log("state", `Trailing TP held by LLM for ${addr.slice(0, 8)} — veto ${n}/${config.management.maxTpVetos ?? 3} (peak ${act.peak.toFixed(1)}%)`);
+        }
+      }
+    }
     if (afterCount < config.risk.maxPositions && Date.now() - _screeningLastTriggered > screeningCooldownMs) {
       log("cron", `Post-management: ${afterCount}/${config.risk.maxPositions} positions — triggering screening`);
       runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
@@ -1188,8 +1244,9 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
     return { action: "CLOSE", rule: 1, reason: "break-even stop" };
   }
 
-  if (!pnlSuspect && position.pnl_pct != null && position.pnl_pct <= managementConfig.stopLossPct && posAgeMin >= minAgeForStopLoss) {
-    return { action: "CLOSE", rule: 1, reason: "stop loss" };
+  const effSL1 = effectiveStopLossPct(tracked, managementConfig);
+  if (!pnlSuspect && position.pnl_pct != null && effSL1 != null && position.pnl_pct <= effSL1 && posAgeMin >= minAgeForStopLoss) {
+    return { action: "CLOSE", rule: 1, reason: `stop loss (<=${effSL1}%)` };
   }
   // Skip hard take profit when trailing TP is enabled — let trailing handle it.
   // Bid_ask positions can run 8-15% via fee accumulation; hard TP at 5% caps profit prematurely.

@@ -194,7 +194,10 @@ WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
           fee_tvl_ratio: { type: "number", description: "fee/TVL ratio at deploy time" },
           organic_score: { type: "number", description: "Base token organic score at deploy time" },
           initial_value_usd: { type: "number", description: "Estimated USD value being deployed" },
-          top_cluster_trend: { type: "string", enum: ["bullish", "bearish", "neutral"], description: "OKX top holder cluster sentiment at screening time. Pass whenever present in candidate data — used to refine strategy selection." }
+          top_cluster_trend: { type: "string", enum: ["bullish", "bearish", "neutral"], description: "OKX top holder cluster sentiment at screening time. Pass whenever present in candidate data — used to refine strategy selection." },
+          sl_pct: { type: "number", description: "Optional per-position stop-loss %, negative (e.g. -30). Tighter for fragile/high-vol tokens, looser for high-conviction. Clamped to a safe range; omit to use the global default." },
+          trailing_trigger_pct: { type: "number", description: "Optional per-position PnL % at which trailing take-profit activates (e.g. 5). Higher lets strong runners build more before trailing arms. Omit to use the global default." },
+          trailing_drop_pct: { type: "number", description: "Optional per-position give-back floor % from peak before trailing TP fires (e.g. 2.5). Wider for volatile tokens. Omit to use the global default." }
         },
         required: ["pool_address"]
       }
