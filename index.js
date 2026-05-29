@@ -1260,7 +1260,7 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
     const graceExitedAt5 = r5tracked?.r9_grace_exited_at;
     const inEntryAccumulation5 =
       !binsKnown5 ||
-      (getOorDirection(position) === "IN" && (
+      (position.in_range !== false && (
         depthPct5 < graceDepth5 ||
         graceExitedAt5 == null ||
         (Date.now() - new Date(graceExitedAt5).getTime()) < confirmMs5
@@ -1294,7 +1294,7 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
       const sells = marketData.txn_sells_5m;
       const buys = marketData.txn_buys_5m;
       const oorDir7 = getOorDirection(position);
-      const inRangeAndGreen = oorDir7 === "IN" && (position.pnl_pct ?? 0) >= 0;
+      const inRangeAndGreen = position.in_range !== false && (position.pnl_pct ?? 0) >= 0;
       // Scale sell-pressure threshold with deploy-time volatility. The screener prefers
       // volatile tokens (vol>=3), where elevated sells:buys is normal oscillation, not collapse.
       // Vol <= 2 → 1× (no change). Vol 4 → 1.5× (cap). Requires 3:1 sells instead of 2:1.
@@ -1319,7 +1319,7 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
       const graceExitedAt7 = vc7tracked?.r9_grace_exited_at;
       const inEntryAccumulation7 =
         !binsKnown7 ||
-        (oorDir7 === "IN" && (
+        (position.in_range !== false && (
           depthPct7 < graceDepth7 ||
           graceExitedAt7 == null ||
           (Date.now() - new Date(graceExitedAt7).getTime()) < confirmMs7
@@ -1379,7 +1379,7 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
       const graceExitedAt8 = rp8tracked?.r9_grace_exited_at;
       const inEntryAccumulation8 =
         !binsKnown8 ||
-        (oorDir8 === "IN" && (
+        (position.in_range !== false && (
           depthPct8 < graceDepth8 ||
           graceExitedAt8 == null ||
           (Date.now() - new Date(graceExitedAt8).getTime()) < confirmMs8
@@ -1473,7 +1473,7 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
       const graceExitedAt9 = sp9tracked?.r9_grace_exited_at;
       const inEntryAccumulation9 =
         !binsKnown9 ||
-        (oorDir9 === "IN" && (
+        (position.in_range !== false && (
           depthPct9 < graceDepth9 ||
           graceExitedAt9 == null ||
           (Date.now() - new Date(graceExitedAt9).getTime()) < confirmMs9
