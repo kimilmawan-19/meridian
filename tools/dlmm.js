@@ -1598,6 +1598,20 @@ export async function closePosition({ position_address, reason }) {
       }
 
       if (!closedConfirmed) {
+        // TX was submitted on-chain but position still shows after retries. Untrack it so
+        // the bot doesn't keep managing a ghost position. Don't call recordPerformance —
+        // PnL data is unreliable when settlement is uncertain.
+        recordClose(position_address, reason || "agent decision");
+        appendDecision({
+          type: "close",
+          actor: "MANAGER",
+          pool: poolAddress,
+          pool_name: poolMeta.name || poolAddress.slice(0, 8),
+          position: position_address,
+          summary: "Relay close submitted but position still showing (verification timeout — untracked)",
+          reason: reason || "agent decision",
+          metrics: { close_txs: closeTxHashes },
+        });
         return {
           success: false,
           error: "Close submit succeeded but position still appears open after verification window",
@@ -1607,8 +1621,6 @@ export async function closePosition({ position_address, reason }) {
           txs: txHashes,
         };
       }
-
-      recordClose(position_address, reason || "agent decision");
 
       if (tracked) {
         const deployedAt = new Date(tracked.deployed_at).getTime();
@@ -1663,26 +1675,30 @@ export async function closePosition({ position_address, reason }) {
           tracked,
         });
 
-        await recordPerformance({
-          position: position_address,
-          pool: poolAddress,
-          pool_name: tracked.pool_name || poolMeta.name || poolAddress.slice(0, 8),
-          base_mint: closeBaseMint,
-          strategy: tracked.strategy,
-          bin_range: tracked.bin_range,
-          bin_step: tracked.bin_step || null,
-          volatility: tracked.volatility ?? null,
-          fee_tvl_ratio: tracked.fee_tvl_ratio || null,
-          organic_score: tracked.organic_score || null,
-          amount_sol: tracked.amount_sol,
-          fees_earned_usd: feesUsd,
-          final_value_usd: finalValueUsd,
-          initial_value_usd: initialUsd,
-          minutes_in_range: minutesHeld - minutesOOR,
-          minutes_held: minutesHeld,
-          close_reason: reason || "agent decision",
-          signal_snapshot: signalSnapshot,
-        });
+        try {
+          await recordPerformance({
+            position: position_address,
+            pool: poolAddress,
+            pool_name: tracked.pool_name || poolMeta.name || poolAddress.slice(0, 8),
+            base_mint: closeBaseMint,
+            strategy: tracked.strategy,
+            bin_range: tracked.bin_range,
+            bin_step: tracked.bin_step || null,
+            volatility: tracked.volatility ?? null,
+            fee_tvl_ratio: tracked.fee_tvl_ratio || null,
+            organic_score: tracked.organic_score || null,
+            amount_sol: tracked.amount_sol,
+            fees_earned_usd: feesUsd,
+            final_value_usd: finalValueUsd,
+            initial_value_usd: initialUsd,
+            minutes_in_range: minutesHeld - minutesOOR,
+            minutes_held: minutesHeld,
+            close_reason: reason || "agent decision",
+            signal_snapshot: signalSnapshot,
+          });
+        } catch (e) {
+          log("close_warn", `recordPerformance (relay) failed — close succeeded but not recorded: ${e.message}`);
+        }
 
         appendDecision({
           type: "close",
@@ -1720,13 +1736,29 @@ export async function closePosition({ position_address, reason }) {
         };
       }
 
+      // Position was not in the tracking registry (e.g. bot restarted mid-position).
+      // Record with minimal data so the lessons system at least counts this close.
+      await recordPerformance({
+        position: position_address,
+        pool: poolAddress,
+        pool_name: poolMeta.name || poolAddress.slice(0, 8),
+        base_mint: livePosition?.base_mint || pool.lbPair.tokenXMint.toString(),
+        strategy: null,
+        close_reason: reason || "agent decision",
+        fees_earned_usd: 0,
+        final_value_usd: 0,
+        initial_value_usd: 0,
+        minutes_in_range: 0,
+        minutes_held: 0,
+      }).catch(e => log("close_warn", `recordPerformance (relay untracked) failed: ${e.message}`));
+
       appendDecision({
         type: "close",
         actor: "MANAGER",
         pool: poolAddress,
         pool_name: poolMeta.name || poolAddress.slice(0, 8),
         position: position_address,
-        summary: "Relay closed position",
+        summary: "Relay closed position (untracked — no deploy record found)",
         reason: reason || "agent decision",
         metrics: {},
       });
@@ -1847,6 +1879,20 @@ export async function closePosition({ position_address, reason }) {
     }
 
     if (!closedConfirmed) {
+      // sendAndConfirmTransaction already confirmed on-chain, but position still shows in
+      // getMyPositions after retries — likely a cache lag. Untrack it so the bot doesn't
+      // keep managing a stale entry. Don't call recordPerformance (PnL would be all zeros).
+      recordClose(position_address, reason || "agent decision");
+      appendDecision({
+        type: "close",
+        actor: "MANAGER",
+        pool: poolAddress,
+        pool_name: poolMeta.name || poolAddress.slice(0, 8),
+        position: position_address,
+        summary: "Close txs confirmed on-chain but position still showing (verification timeout — untracked)",
+        reason: reason || "agent decision",
+        metrics: { close_txs: closeTxHashes.join(",") },
+      });
       return {
         success: false,
         error: "Close transactions sent but position still appears open after verification window",
@@ -1857,8 +1903,6 @@ export async function closePosition({ position_address, reason }) {
         txs: txHashes,
       };
     }
-
-    recordClose(position_address, reason || "agent decision");
 
     // Record performance for learning
     if (tracked) {
@@ -1959,26 +2003,30 @@ export async function closePosition({ position_address, reason }) {
         tracked,
       });
 
-      await recordPerformance({
-        position: position_address,
-        pool: poolAddress,
-        pool_name: tracked.pool_name || poolMeta.name || poolAddress.slice(0, 8),
-        base_mint: closeBaseMint,
-        strategy: tracked.strategy,
-        bin_range: tracked.bin_range,
-        bin_step: tracked.bin_step || null,
-        volatility: tracked.volatility ?? null,
-        fee_tvl_ratio: tracked.fee_tvl_ratio || null,
-        organic_score: tracked.organic_score || null,
-        amount_sol: tracked.amount_sol,
-        fees_earned_usd: feesUsd,
-        final_value_usd: finalValueUsd,
-        initial_value_usd: initialUsd,
-        minutes_in_range: minutesHeld - minutesOOR,
-        minutes_held: minutesHeld,
-        close_reason: reason || "agent decision",
-        signal_snapshot: signalSnapshot,
-      });
+      try {
+        await recordPerformance({
+          position: position_address,
+          pool: poolAddress,
+          pool_name: tracked.pool_name || poolMeta.name || poolAddress.slice(0, 8),
+          base_mint: closeBaseMint,
+          strategy: tracked.strategy,
+          bin_range: tracked.bin_range,
+          bin_step: tracked.bin_step || null,
+          volatility: tracked.volatility ?? null,
+          fee_tvl_ratio: tracked.fee_tvl_ratio || null,
+          organic_score: tracked.organic_score || null,
+          amount_sol: tracked.amount_sol,
+          fees_earned_usd: feesUsd,
+          final_value_usd: finalValueUsd,
+          initial_value_usd: initialUsd,
+          minutes_in_range: minutesHeld - minutesOOR,
+          minutes_held: minutesHeld,
+          close_reason: reason || "agent decision",
+          signal_snapshot: signalSnapshot,
+        });
+      } catch (e) {
+        log("close_warn", `recordPerformance (SDK) failed — close succeeded but not recorded: ${e.message}`);
+      }
 
       appendDecision({
         type: "close",
@@ -2014,13 +2062,29 @@ export async function closePosition({ position_address, reason }) {
       };
     }
 
+    // Position was not in the tracking registry (e.g. bot restarted mid-position).
+    // Record with minimal data so the lessons system at least counts this close.
+    await recordPerformance({
+      position: position_address,
+      pool: poolAddress,
+      pool_name: poolMeta.name || poolAddress.slice(0, 8),
+      base_mint: pool.lbPair.tokenXMint.toString(),
+      strategy: null,
+      close_reason: reason || "agent decision",
+      fees_earned_usd: 0,
+      final_value_usd: 0,
+      initial_value_usd: 0,
+      minutes_in_range: 0,
+      minutes_held: 0,
+    }).catch(e => log("close_warn", `recordPerformance (SDK untracked) failed: ${e.message}`));
+
     appendDecision({
       type: "close",
       actor: "MANAGER",
       pool: poolAddress,
       pool_name: poolMeta.name || poolAddress.slice(0, 8),
       position: position_address,
-      summary: "Closed position",
+      summary: "Closed position (untracked — no deploy record found)",
       reason: reason || "agent decision",
       metrics: {},
     });
