@@ -834,6 +834,16 @@ export async function runScreeningCycle({ silent = false } = {}) {
         filteredOut.push({ name: pool.name, reason: `bot holders ${botPct}% > ${maxBotHoldersPct}%` });
         return false;
       }
+      // RULE: bundle concentration — coordinated wallets funded by the same source at launch.
+      // Orthogonal to top10/bot/wash. Only enforced when OKX bundle data is available
+      // (null fallback = let LLM decide). No smart-wallet override — bundling is a launch red flag.
+      const bundlePct = pool.bundle_pct;
+      const maxBundlePct = config.screening.maxBundlePct;
+      if (bundlePct != null && maxBundlePct != null && bundlePct > maxBundlePct) {
+        log("screening", `Bundle filter: dropped ${pool.name} — bundle ${bundlePct}% > ${maxBundlePct}%`);
+        filteredOut.push({ name: pool.name, reason: `bundle concentration ${bundlePct}% > ${maxBundlePct}%` });
+        return false;
+      }
       return true;
     });
 
@@ -896,7 +906,6 @@ export async function runScreeningCycle({ silent = false } = {}) {
       const top10Pct = ti?.audit?.top_holders_pct ?? "?";
       const feesSol = ti?.global_fees_sol ?? "?";
       const launchpad = ti?.launchpad ?? null;
-      const priceChange = ti?.stats_1h?.price_change;
       const netBuyers = ti?.stats_1h?.net_buyers;
       const activeBin = activeBinResults[i]?.status === "fulfilled" ? activeBinResults[i].value?.binId : null;
 
@@ -969,6 +978,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
         r1h  ? `1h=${r1h}(${md.price_change_1h >= 0 ? "+" : ""}${(md.price_change_1h ?? 0).toFixed(1)}%,vol×${volRatio1h != null ? volRatio1h.toFixed(1) : "?"})` : null,
         r6h  ? `6h=${r6h}(${md.price_change_6h >= 0 ? "+" : ""}${(md.price_change_6h ?? 0).toFixed(1)}%,vol×${volRatio6h != null ? volRatio6h.toFixed(1) : "?"})` : null,
         orderFlowLabel ? `order_flow=${orderFlowLabel}` : null,
+        netBuyers != null ? `net_buyers_1h=${netBuyers}` : null,
         longVolLabel,
       ].filter(Boolean);
       const flowRegimeLine = flowParts.length > 0
@@ -979,6 +989,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
         `POOL: ${pool.name} (${pool.pool})`,
         `  metrics: bin_step=${pool.bin_step}, fee_pct=${pool.fee_pct}%, fee_tvl=${pool.fee_active_tvl_ratio}, vol=$${pool.volume_window}, tvl=$${pool.tvl ?? pool.active_tvl}, volatility_${pool.volatility_timeframe || "30m"}=${pool.volatility}, mcap=$${pool.mcap}, organic=${pool.organic_score}${pool.token_age_hours != null ? `, age=${pool.token_age_hours}h` : ""}`,
         `  audit: top10=${top10Pct}%, bots=${botPct}%, fees=${feesSol}SOL${launchpad ? `, launchpad=${launchpad}` : ""}`,
+        (pool.active_pct != null || pool.unique_traders != null) ? `  structure:${pool.active_pct != null ? ` active_liq=${pool.active_pct}%` : ""}${pool.unique_traders != null ? ` unique_traders=${pool.unique_traders}` : ""}`.trimEnd() : null,
         pvpLine,
         flowRegimeLine,
         okxParts ? `  okx: ${okxParts}` : okxUnavailable ? `  okx: unavailable` : null,
@@ -986,7 +997,6 @@ export async function runScreeningCycle({ silent = false } = {}) {
         pool.price_vs_ath_pct != null ? `  ath: price_vs_ath=${pool.price_vs_ath_pct}%${pool.top_cluster_trend ? `, top_cluster=${pool.top_cluster_trend}` : ""}` : null,
         `  smart_wallets: ${sw?.in_pool?.length ?? 0} present${sw?.in_pool?.length ? ` → CONFIDENCE BOOST (${sw.in_pool.map(w => w.name).join(", ")})` : ""}`,
         activeBin != null ? `  active_bin: ${activeBin}` : null,
-        priceChange != null ? `  1h: price${priceChange >= 0 ? "+" : ""}${priceChange}%, net_buyers=${netBuyers ?? "?"}` : null,
         n?.narrative ? `  narrative_untrusted: ${sanitizeUntrustedPromptText(n.narrative, 500)}` : `  narrative_untrusted: none`,
         mem ? `  memory_untrusted: ${sanitizeUntrustedPromptText(mem, 500)}` : null,
       ].filter(Boolean).join("\n");

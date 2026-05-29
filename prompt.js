@@ -129,16 +129,21 @@ ALREADY HARD-FILTERED BEFORE YOU SEE THE LIST (do not re-evaluate, just trust):
 - fees_sol < ${config.screening.minTokenFeesSol} SOL
 - bots > ${config.screening.maxBotHoldersPct}%
 - top10 > ${config.screening.maxTop10Pct}%
+- bundle > ${config.screening.maxBundlePct}%
 - wash trading flag from OKX
 - rugpull flag with no smart wallets
 - PVP symbol conflict with no smart wallets
 
 RISK SIGNALS (guidelines — use judgment):
 - top10 close to ${config.screening.maxTop10Pct}% → still concentrated, prefer lower
-- bundle_pct from OKX = secondary context only, not a hard filter
+- bundle close to ${config.screening.maxBundlePct}% → already capped, but lower is safer
 - rugpull flag with smart wallets present → still risky, only deploy if conviction is otherwise high
 - PVP flag with smart wallets present → still risky, only deploy if setup is exceptional
 - no narrative + no smart wallets → skip
+
+STRUCTURE (line "structure:" — liquidity + participation health):
+- active_liq% = share of pool liquidity sitting in the active range. Very low (<10%) = wide/inactive pool, little fee capture. Very high (>85%) = liquidity trapped, often a post-dump pool with no room to oscillate. Mid-range is healthiest.
+- unique_traders = breadth of participation in the window. Low count with high volume = few wallets churning (manipulation / thin real demand). Higher, broader participation is stronger.
 
 NARRATIVE QUALITY (your main judgment call):
 - GOOD: specific origin — real event, viral moment, named entity, active community
