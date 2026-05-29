@@ -99,6 +99,7 @@ export function trackPosition({
     closed_at: null,
     notes: [],
     peak_pnl_pct: 0,
+    peak_pnl_at: null,
     pending_peak_pnl_pct: null,
     pending_peak_started_at: null,
     pending_trailing_current_pnl_pct: null,
@@ -359,6 +360,7 @@ export function queuePeakConfirmation(position_address, candidatePnlPct, options
 
   if (options.immediate) {
     pos.peak_pnl_pct = candidatePnlPct;
+    pos.peak_pnl_at = new Date().toISOString();
     pos.pending_peak_pnl_pct = null;
     pos.pending_peak_started_at = null;
     save(state);
@@ -389,7 +391,12 @@ export function resolvePendingPeak(position_address, currentPnlPct, toleranceRat
   pos.pending_peak_started_at = null;
 
   if (currentPnlPct != null && currentPnlPct >= pendingPeak * toleranceRatio) {
-    pos.peak_pnl_pct = Math.max(pos.peak_pnl_pct ?? 0, pendingPeak, currentPnlPct);
+    const prevPeak = pos.peak_pnl_pct ?? 0;
+    const newPeak = Math.max(prevPeak, pendingPeak, currentPnlPct);
+    // Stamp the time only when the peak actually advances, so peak_pnl_at marks
+    // when the all-time high was set (used by trailing TP to detect stale peaks).
+    if (newPeak > prevPeak || pos.peak_pnl_at == null) pos.peak_pnl_at = new Date().toISOString();
+    pos.peak_pnl_pct = newPeak;
     save(state);
     log("state", `Position ${position_address} peak PnL confirmed at ${pos.peak_pnl_pct.toFixed(2)}% after recheck`);
     return { confirmed: true, peak: pos.peak_pnl_pct };
@@ -640,11 +647,23 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
     const dropFromPeak = pos.peak_pnl_pct - currentPnlPct;
     // Widen drop tolerance proportionally at higher peaks: give back at most 1/3 of gains.
     // trailingDropPct (or per-position override) acts as floor so low-peak positions keep their tight stop.
-    const effectiveDrop = Math.max(effTrailingDropFloor, pos.peak_pnl_pct / 3);
+    let effectiveDrop = Math.max(effTrailingDropFloor, pos.peak_pnl_pct / 3);
+    // Stale-peak widening: if the all-time peak was set long ago and price has since settled
+    // lower, the trailing stop is measuring against a high that no longer reflects reality.
+    // Widen tolerance so a stabilized position is not force-exited against an outdated peak.
+    let stalePeak = false;
+    const stalePeakMin = mgmtConfig.trailingStalePeakMinutes;
+    if (stalePeakMin != null && pos.peak_pnl_at) {
+      const peakAgeMin = (Date.now() - new Date(pos.peak_pnl_at).getTime()) / 60_000;
+      if (peakAgeMin >= stalePeakMin) {
+        effectiveDrop *= (mgmtConfig.trailingStalePeakDropMult ?? 1.75);
+        stalePeak = true;
+      }
+    }
     if (dropFromPeak >= effectiveDrop) {
       return {
         action: "TRAILING_TP",
-        reason: `Trailing TP: peak ${pos.peak_pnl_pct.toFixed(2)}% → current ${currentPnlPct.toFixed(2)}% (dropped ${dropFromPeak.toFixed(2)}% >= ${effectiveDrop.toFixed(2)}%)`,
+        reason: `Trailing TP: peak ${pos.peak_pnl_pct.toFixed(2)}% → current ${currentPnlPct.toFixed(2)}% (dropped ${dropFromPeak.toFixed(2)}% >= ${effectiveDrop.toFixed(2)}%${stalePeak ? ", stale-peak widened" : ""})`,
         needs_confirmation: true,
         peak_pnl_pct: pos.peak_pnl_pct,
         current_pnl_pct: currentPnlPct,

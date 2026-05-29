@@ -1483,7 +1483,16 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
     if (vcCfg.enabled) {
       const vc7tracked = getTrackedPosition(position.position);
       const ageMin = position.age_minutes ?? 0;
-      const peakVol = vc7tracked?.peak_volume_5m_usd ?? 0;
+      // Reference volume for collapse detection. The all-time peak_volume_5m_usd never decays
+      // and can stay pinned to an early outlier spike, making the collapse threshold relative to
+      // a volume level the pool may not have seen in hours. Prefer a recent rolling-window peak
+      // (last few cycles of volume_history) so the reference tracks the pool's current regime;
+      // fall back to the all-time peak only while history is too sparse to be meaningful.
+      const volHist7 = Array.isArray(vc7tracked?.volume_history) ? vc7tracked.volume_history : [];
+      const recentVols7 = volHist7.map((v) => v?.volume_5m).filter((v) => v != null);
+      const peakVol = recentVols7.length >= 3
+        ? Math.max(...recentVols7)
+        : (vc7tracked?.peak_volume_5m_usd ?? 0);
       const curVol = marketData.volume_5m;
       const sells = marketData.txn_sells_5m;
       const buys = marketData.txn_buys_5m;

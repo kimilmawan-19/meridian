@@ -143,6 +143,11 @@ export const config = {
     trailingTakeProfit:    u.trailingTakeProfit    ?? true,
     trailingTriggerPct:    u.trailingTriggerPct    ?? 3,    // activate trailing at X% PnL
     trailingDropPct:       u.trailingDropPct       ?? 1.5,  // close when drops X% from peak
+    // Stale-peak handling: a peak set long ago no longer reflects the current price regime.
+    // Once the all-time peak is older than trailingStalePeakMinutes, widen the trailing drop
+    // tolerance by trailingStalePeakDropMult so a settled position is not closed against a stale high.
+    trailingStalePeakMinutes:  u.trailingStalePeakMinutes  ?? 90,
+    trailingStalePeakDropMult: u.trailingStalePeakDropMult ?? 1.75,
     // ── Layer B: LLM-set per-position risk thresholds (clamped) ──
     allowLlmRiskParams:    u.allowLlmRiskParams     ?? true, // let SCREENER set per-position sl/trailing overrides
     stopLossFloorPct:      u.stopLossFloorPct       ?? -50,  // loosest (most negative) SL the LLM may set

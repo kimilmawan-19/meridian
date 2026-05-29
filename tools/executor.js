@@ -661,7 +661,13 @@ export async function executeTool(name, args) {
               if (swapResult?.amount_out) result.sol_received = swapResult.amount_out;
             }
           } catch (e) {
+            // Surface the failure to the model: the base token is still sitting in the wallet,
+            // so the next deploy would see an understated SOL balance and size down (or fail
+            // minSolToOpen). Tell the agent to recover the SOL with a manual swap.
             log("executor_warn", `Auto-swap after close failed: ${e.message}`);
+            result.auto_swapped = false;
+            result.auto_swap_failed = true;
+            result.auto_swap_note = `Auto-swap of base token (${result.base_mint.slice(0, 8)}) back to SOL FAILED: ${e.message}. The base token is still in the wallet — call swap_token (input_mint=base_mint, output_mint=SOL) to recover SOL before deploying again.`;
           }
         }
       } else if (name === "claim_fees" && config.management.autoSwapAfterClaim && result.base_mint) {
