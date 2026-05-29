@@ -33,6 +33,7 @@ import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote, addVolumeSnapshot, getVolumeWindow } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
 import { getTokenNarrative, getTokenInfo } from "./tools/token.js";
+import { confirmIndicatorPreset } from "./tools/chart-indicators.js";
 import { stageSignals } from "./signal-tracker.js";
 import { getWeightsSummary } from "./signal-weights.js";
 import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, isHiveMindEnabled, pullHiveMindLessons, pullHiveMindPresets, registerHiveMindAgent, startHiveMindBackgroundSync } from "./hivemind.js";
@@ -315,6 +316,67 @@ export async function runManagementCycle({ silent = false } = {}) {
       }
     }
 
+    // ── TA exit modulator: RSI overbought → tighten trailing or force TP_PROPOSAL ──
+    // Runs only when taExitEnabled, position is profitable, and price is near/above range.
+    // Fail-safe: API errors are caught per-position; no TA → no change.
+    if (config.indicators.taExitEnabled) {
+      const taExitMinPnl    = config.indicators.taExitMinPnlPct      ?? 2;
+      const taExitRsiLen    = config.indicators.taExitRsiLength       ?? 14;
+      const taExitNearPct   = config.indicators.taExitNearAbovePct    ?? 80;
+      const taModulatorDrop = config.indicators.taExitModulatorDropPct ?? 0.5;
+      const taPreset        = config.indicators.exitPreset             ?? "rsi_reversal";
+      const taIntervals     = config.indicators.intervals;
+
+      const taChecks = positionData
+        .filter((p) => {
+          if (exitMap.has(p.position)) return false; // already flagged
+          const pnl = p.pnl_pct ?? 0;
+          if (pnl < taExitMinPnl) return false;
+          const oorDir = getOorDirection(p);
+          if (oorDir === "ABOVE") return true; // OOR above: always eligible
+          const rangeTotal = (p.upper_bin ?? 0) - (p.lower_bin ?? 0);
+          if (rangeTotal <= 0 || p.active_bin == null) return false;
+          const depthPct = ((p.upper_bin - p.active_bin) / rangeTotal) * 100;
+          return depthPct >= taExitNearPct; // depth% near top → near-above
+        })
+        .map(async (p) => {
+          if (!p.base_mint) return;
+          try {
+            const taResult = await confirmIndicatorPreset({
+              mint: p.base_mint,
+              side: "exit",
+              preset: taPreset,
+              intervals: taIntervals,
+              rsiLength: taExitRsiLen,
+              skipEnabledCheck: true, // TA exit is independent of entry indicator toggle
+            });
+            if (!taResult?.confirmed || taResult.skipped) return;
+            const tracked = getTrackedPosition(p.position);
+            const peak = tracked?.peak_pnl_pct ?? (p.pnl_pct ?? 0);
+            const pnl  = p.pnl_pct ?? 0;
+            const effTrigger = tracked?.trailing_trigger_override ?? config.management.trailingTriggerPct;
+            // Modulator fires when trailing is active AND tightened drop threshold is crossed
+            const modulatorFires = peak >= effTrigger && (peak - pnl) >= taModulatorDrop;
+            const reason = modulatorFires
+              ? `RSI overbought + tightened trailing drop ${taModulatorDrop}% (peak ${peak.toFixed(1)}% → ${pnl.toFixed(1)}%)`
+              : `RSI overbought exit signal — TA-triggered (peak ${peak.toFixed(1)}%, current ${pnl.toFixed(1)}%)`;
+            exitMap.set(p.position, {
+              action: "TRAILING_TP",
+              reason,
+              peak_pnl_pct: peak,
+              current_pnl_pct: pnl,
+              needs_confirmation: false,
+              ta_triggered: true,
+            });
+            log("indicators", `TA exit: ${p.pair} — ${taResult.reason} → ${reason}`);
+          } catch (e) {
+            log("indicators_warn", `TA exit check failed for ${p.pair}: ${e.message}`);
+          }
+        });
+
+      await Promise.all(taChecks);
+    }
+
     // ── Deterministic rule checks (no LLM) ──────────────────────────
     // action: CLOSE | CLAIM | STAY | INSTRUCTION (needs LLM)
     const actionMap = new Map();
@@ -340,7 +402,7 @@ export async function runManagementCycle({ silent = false } = {}) {
           const budgetLeft = vetoCount < (mgmt.maxTpVetos ?? 3);
           const aboveFloor = dropFromPeak < floorDrop;
           if (budgetLeft && aboveFloor) {
-            actionMap.set(p.position, { action: "TP_PROPOSAL", reason: exit.reason, peak, current, dropFromPeak, vetoCount });
+            actionMap.set(p.position, { action: "TP_PROPOSAL", reason: exit.reason, peak, current, dropFromPeak, vetoCount, ta_triggered: !!exit.ta_triggered });
             continue;
           }
           const forcedWhy = !budgetLeft
@@ -474,6 +536,9 @@ export async function runManagementCycle({ silent = false } = {}) {
       const actionBlocks = actionPositions.map((p) => {
         const act = actionMap.get(p.position);
         if (act.action === "TP_PROPOSAL") {
+          const taNote = act.ta_triggered
+            ? `\n  ta_signal: RSI overbought detected — momentum may be fading; bias strongly toward closing`
+            : "";
           return [
             `POSITION: ${p.pair} (${p.position})`,
             `  pool: ${p.pool}`,
@@ -481,7 +546,7 @@ export async function runManagementCycle({ silent = false } = {}) {
             `  peak_pnl: ${act.peak.toFixed(2)}% | current_pnl: ${act.current.toFixed(2)}% | given_back: ${act.dropFromPeak.toFixed(2)}% | holds_used: ${act.vetoCount}/${config.management.maxTpVetos ?? 3}`,
             `  unclaimed_fees: ${cur}${p.unclaimed_fees_usd} | value: ${cur}${p.total_value_usd} | fee_per_tvl_24h: ${p.fee_per_tvl_24h ?? "?"}%`,
             `  context: in_range=${p.in_range} | bins lower=${p.lower_bin} upper=${p.upper_bin} active=${p.active_bin} | oor_minutes=${p.minutes_out_of_range ?? 0} | price_5m=${p._marketData?.price_change_5m ?? "?"}% | vol_5m=$${p._marketData?.volume_5m ?? "?"}`,
-            `  DECISION: take profit now (close_position) OR hold (do nothing) only if there is clear continued upward momentum. Bias toward taking profit — a confirmed give-back usually means the move is done.`,
+            `  DECISION: take profit now (close_position) OR hold (do nothing) only if there is clear continued upward momentum. Bias toward taking profit — a confirmed give-back usually means the move is done.` + taNote,
           ].join("\n");
         }
         return [

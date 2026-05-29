@@ -111,13 +111,18 @@
   "chartIndicators": {
     "enabled": false,
     "entryPreset": "supertrend_break",
-    "exitPreset": "supertrend_break",
+    "exitPreset": "rsi_reversal",
     "rsiLength": 2,
     "intervals": ["5_MINUTE"],
     "candles": 298,
     "rsiOversold": 30,
     "rsiOverbought": 80,
-    "requireAllIntervals": false
+    "requireAllIntervals": false,
+    "taExitEnabled": false,
+    "taExitMinPnlPct": 2,
+    "taExitRsiLength": 14,
+    "taExitNearAbovePct": 80,
+    "taExitModulatorDropPct": 0.5
   },
   "emergencyExits": {
     "volumeCollapse": {

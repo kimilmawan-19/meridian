@@ -229,10 +229,15 @@ export async function confirmIndicatorPreset({
   side,
   preset = side === "entry" ? config.indicators.entryPreset : config.indicators.exitPreset,
   intervals = config.indicators.intervals,
+  rsiLength = config.indicators.rsiLength ?? 2,
   refresh = false,
+  skipEnabledCheck = false,
 } = {}) {
-  if (!config.indicators.enabled || !mint || !preset) {
+  if (!skipEnabledCheck && (!config.indicators.enabled || !mint || !preset)) {
     return { enabled: false, confirmed: true, reason: "Indicators disabled or not configured", intervals: [] };
+  }
+  if (skipEnabledCheck && (!mint || !preset)) {
+    return { enabled: false, confirmed: true, reason: "Indicators not configured", intervals: [] };
   }
 
   const targets = normalizeIntervals(intervals);
@@ -243,7 +248,7 @@ export async function confirmIndicatorPreset({
   const results = [];
   for (const interval of targets) {
     try {
-      const payload = await fetchChartIndicatorsForMint(mint, { interval, refresh });
+      const payload = await fetchChartIndicatorsForMint(mint, { interval, rsiLength, refresh });
       const evaluation = evaluatePreset(side, preset, payload);
       results.push({
         interval,

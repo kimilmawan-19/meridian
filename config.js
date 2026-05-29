@@ -269,7 +269,7 @@ export const config = {
   indicators: {
     enabled: indicatorUserConfig.enabled ?? false,
     entryPreset: indicatorUserConfig.entryPreset ?? "supertrend_break",
-    exitPreset: indicatorUserConfig.exitPreset ?? "supertrend_break",
+    exitPreset: indicatorUserConfig.exitPreset ?? "rsi_reversal",
     rsiLength: indicatorUserConfig.rsiLength ?? 2,
     intervals: Array.isArray(indicatorUserConfig.intervals)
       ? indicatorUserConfig.intervals
@@ -278,6 +278,12 @@ export const config = {
     rsiOversold: indicatorUserConfig.rsiOversold ?? 30,
     rsiOverbought: indicatorUserConfig.rsiOverbought ?? 80,
     requireAllIntervals: indicatorUserConfig.requireAllIntervals ?? false,
+    // TA-based exit (independent of entry indicator gate)
+    taExitEnabled:         indicatorUserConfig.taExitEnabled         ?? false,
+    taExitMinPnlPct:       indicatorUserConfig.taExitMinPnlPct       ?? 2,    // min PnL % before TA exit can trigger
+    taExitRsiLength:       indicatorUserConfig.taExitRsiLength       ?? 14,   // RSI length for exit (longer = smoother than entry default 2)
+    taExitNearAbovePct:    indicatorUserConfig.taExitNearAbovePct    ?? 80,   // depth% at which position is "near above" (0% = OOR above, 100% = deep in range)
+    taExitModulatorDropPct: indicatorUserConfig.taExitModulatorDropPct ?? 0.5, // tightened trailing drop % when RSI overbought
   },
 };
 
