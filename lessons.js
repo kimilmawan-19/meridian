@@ -118,6 +118,10 @@ function buildSignalSnapshot(perf) {
  * @param {number} perf.minutes_in_range  - Total minutes position was in range
  * @param {number} perf.minutes_held      - Total minutes position was held
  * @param {string} perf.close_reason   - Why it was closed
+ * @param {number} [perf.peak_pnl_pct]        - All-time peak PnL % during hold
+ * @param {string} [perf.peak_pnl_at]         - ISO timestamp when peak was reached
+ * @param {number} [perf.tp_veto_count]       - How many trailing-TP vetos were burned
+ * @param {boolean} [perf.ta_exit_triggered]  - Whether RSI/TA signal drove the exit
  */
 export async function recordPerformance(perf) {
   const data = load();
@@ -282,6 +286,20 @@ function derivLesson(perf) {
     } else if (outcome === "bad" && perf.close_reason?.includes("volume")) {
       rule = `AVOID: Pools with fee_tvl_ratio=${perf.fee_tvl_ratio} that showed volume collapse — fees evaporated quickly. Minimum sustained volume check needed before deploying.`;
       tags.push("volume_collapse");
+    // TP veto burned: LLM held the trailing TP — was it a good or bad call?
+    } else if ((perf.tp_veto_count ?? 0) >= 2 && outcome === "bad") {
+      rule = `AVOID: Holding trailing TP (${perf.tp_veto_count} vetos) on ${perf.pool_name}-type pools hurt — position closed at ${perf.pnl_pct}% after giving back from peak ${perf.peak_pnl_pct ?? "?"}%. When trailing TP fires, bias toward taking profit.`;
+      tags.push("tp_veto_bad");
+    } else if ((perf.tp_veto_count ?? 0) >= 2 && outcome === "good") {
+      rule = `WORKED: Holding trailing TP (${perf.tp_veto_count} vetos) on ${perf.pool_name}-type pools paid off — final PnL +${perf.pnl_pct}% (peak ${perf.peak_pnl_pct ?? "?"}%).`;
+      tags.push("tp_veto_good");
+    // TA-triggered exit quality
+    } else if (perf.ta_exit_triggered && outcome === "good") {
+      rule = `WORKED: RSI overbought exit on ${perf.pool_name} locked in +${perf.pnl_pct}% from a ${perf.peak_pnl_pct ?? "?"}% peak — TA exit signal was accurate.`;
+      tags.push("ta_exit", "worked");
+    } else if (perf.ta_exit_triggered && outcome === "bad") {
+      rule = `AVOID: RSI overbought exit on ${perf.pool_name} fired too early — closed at ${perf.pnl_pct}%, peak was only ${perf.peak_pnl_pct ?? "?"}%. TA exit may have a false-positive issue on this type of pool.`;
+      tags.push("ta_exit", "failed");
     } else if (outcome === "good") {
       rule = `WORKED: ${context} → PnL +${perf.pnl_pct}%, range efficiency ${perf.range_efficiency}%.`;
       tags.push("worked");

@@ -1705,6 +1705,11 @@ export async function closePosition({ position_address, reason }) {
             minutes_held: minutesHeld,
             close_reason: reason || "agent decision",
             signal_snapshot: signalSnapshot,
+            // Exit quality fields — enable lessons to learn from peak timing and TA signals
+            peak_pnl_pct:     tracked.peak_pnl_pct    ?? null,
+            peak_pnl_at:      tracked.peak_pnl_at      ?? null,
+            tp_veto_count:    tracked.tp_veto_count    ?? 0,
+            ta_exit_triggered: tracked.ta_exit_triggered ?? false,
           });
         } catch (e) {
           log("close_warn", `recordPerformance (relay) failed — close succeeded but not recorded: ${e.message}`);
@@ -2033,6 +2038,11 @@ export async function closePosition({ position_address, reason }) {
           minutes_held: minutesHeld,
           close_reason: reason || "agent decision",
           signal_snapshot: signalSnapshot,
+          // Exit quality fields — enable lessons to learn from peak timing and TA signals
+          peak_pnl_pct:     tracked.peak_pnl_pct    ?? null,
+          peak_pnl_at:      tracked.peak_pnl_at      ?? null,
+          tp_veto_count:    tracked.tp_veto_count    ?? 0,
+          ta_exit_triggered: tracked.ta_exit_triggered ?? false,
         });
       } catch (e) {
         log("close_warn", `recordPerformance (SDK) failed — close succeeded but not recorded: ${e.message}`);

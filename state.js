@@ -336,6 +336,18 @@ export function recordClose(position_address, reason) {
 }
 
 /**
+ * Flag that a TA-driven exit (RSI overbought) triggered for this position.
+ * Stored so recordPerformance can include it even after state is closed.
+ */
+export function markTaExitTriggered(position_address) {
+  const state = load();
+  const pos = state.positions[position_address];
+  if (!pos || pos.closed) return;
+  pos.ta_exit_triggered = true;
+  save(state);
+}
+
+/**
  * Set a persistent instruction for a position (e.g. "hold until 5% profit").
  * Overwrites any previous instruction. Pass null to clear.
  */

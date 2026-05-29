@@ -28,7 +28,7 @@ import {
   createLiveMessage,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop, batchUpdateMarketData, getOorDirection, wasRecentlyOorAbove, updateR9GraceZone, effectiveStopLossPct, recordTpVeto, resetTpVeto } from "./state.js";
+import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop, batchUpdateMarketData, getOorDirection, wasRecentlyOorAbove, updateR9GraceZone, effectiveStopLossPct, recordTpVeto, resetTpVeto, markTaExitTriggered } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote, addVolumeSnapshot, getVolumeWindow } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
@@ -368,6 +368,7 @@ export async function runManagementCycle({ silent = false } = {}) {
               needs_confirmation: false,
               ta_triggered: true,
             });
+            markTaExitTriggered(p.position);
             log("indicators", `TA exit: ${p.pair} — ${taResult.reason} → ${reason}`);
           } catch (e) {
             log("indicators_warn", `TA exit check failed for ${p.pair}: ${e.message}`);
