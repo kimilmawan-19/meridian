@@ -923,38 +923,64 @@ export async function runScreeningCycle({ silent = false } = {}) {
         ? `  pvp: HIGH — rival ${pool.pvp_rival_name || pool.pvp_symbol} (${pool.pvp_rival_mint?.slice(0, 8)}...) has pool ${pool.pvp_rival_pool?.slice(0, 8)}..., tvl=$${pool.pvp_rival_tvl}, holders=${pool.pvp_rival_holders}, fees=${pool.pvp_rival_fees}SOL`
         : null;
 
-      // Volume TA soft signals — hint to LLM, not hard filter
-      const volSignalParts = [];
-      const volChangePct = pool.volume_change_pct;
-      if (volChangePct != null) {
-        const trendRatio = 1 + volChangePct / 100;
-        const dt = config.screening.volumeTrendDeclineThreshold ?? 0.6;
-        const et = config.screening.volumeTrendExpandThreshold ?? 1.4;
-        if (trendRatio < dt) volSignalParts.push(`vol_trend=DECLINING(${volChangePct}%)`);
-        else if (trendRatio > et) volSignalParts.push(`vol_trend=EXPANDING(${volChangePct}%)`);
-        else volSignalParts.push(`vol_trend=STABLE(${volChangePct}%)`);
-      }
+      // Multi-timeframe flow regime: volume × price composite signal
+      // Each TF: volRatio = current-period-vol / baseline (next-longer TF average)
+      // 5m baseline = 1h/12, 1h baseline = 6h/6, 6h baseline = 24h/4
+      const vol5m  = md?.volume_5m;
+      const vol1h  = md?.volume_1h;
+      const vol6h  = md?.volume_6h;
+      const vol24h = md?.volume_24h;
+      const volRatio5m = vol5m  != null && vol1h  > 0 ? vol5m  / (vol1h  / 12) : null;
+      const volRatio1h = vol1h  != null && vol6h  > 0 ? vol1h  / (vol6h  / 6)  : null;
+      const volRatio6h = vol6h  != null && vol24h > 0 ? vol6h  / (vol24h / 4)  : null;
+      const r5m  = md ? tfFlowRegime(md.price_change_5m, volRatio5m, 0.5) : null;
+      const r1h  = md ? tfFlowRegime(md.price_change_1h, volRatio1h, 1.5) : null;
+      const r6h  = md ? tfFlowRegime(md.price_change_6h, volRatio6h, 3.0) : null;
+      const regimeConsensus = flowConsensus([r5m, r1h, r6h]);
+
+      // Microstructure: txn buy/sell count (5m) as confirmation layer
+      let orderFlowLabel = null;
       if (md?.txn_buys_5m != null && md?.txn_sells_5m != null) {
         const total = md.txn_buys_5m + md.txn_sells_5m;
         const bsRatio = config.screening.entryBuySellRatio ?? 1.5;
         if (total >= 10) {
-          if (md.txn_sells_5m > md.txn_buys_5m * bsRatio) {
-            volSignalParts.push(`order_flow=BEARISH(S:${md.txn_sells_5m}/B:${md.txn_buys_5m})`);
-          } else if (md.txn_buys_5m > md.txn_sells_5m * bsRatio) {
-            volSignalParts.push(`order_flow=BULLISH(B:${md.txn_buys_5m}/S:${md.txn_sells_5m})`);
-          } else {
-            volSignalParts.push(`order_flow=BALANCED(B:${md.txn_buys_5m}/S:${md.txn_sells_5m})`);
-          }
+          if (md.txn_sells_5m > md.txn_buys_5m * bsRatio)
+            orderFlowLabel = `BEARISH(S:${md.txn_sells_5m}/B:${md.txn_buys_5m})`;
+          else if (md.txn_buys_5m > md.txn_sells_5m * bsRatio)
+            orderFlowLabel = `BULLISH(B:${md.txn_buys_5m}/S:${md.txn_sells_5m})`;
+          else
+            orderFlowLabel = `BALANCED(B:${md.txn_buys_5m}/S:${md.txn_sells_5m})`;
         }
       }
-      const volSignalLine = volSignalParts.length > 0 ? `  vol_signal: ${volSignalParts.join(", ")}` : null;
+
+      // Long-window volume trend (Meteora API, volatility timeframe ≥30m) — separate source
+      const longVolPct = pool.volume_change_pct;
+      let longVolLabel = null;
+      if (longVolPct != null) {
+        const tr = 1 + longVolPct / 100;
+        const dt = config.screening.volumeTrendDeclineThreshold ?? 0.6;
+        const et = config.screening.volumeTrendExpandThreshold ?? 1.4;
+        if (tr < dt) longVolLabel = `long_vol=DECLINING(${longVolPct}%)`;
+        else if (tr > et) longVolLabel = `long_vol=EXPANDING(${longVolPct}%)`;
+      }
+
+      const flowParts = [
+        r5m  ? `5m=${r5m}(${md.price_change_5m >= 0 ? "+" : ""}${(md.price_change_5m ?? 0).toFixed(1)}%,vol×${volRatio5m != null ? volRatio5m.toFixed(1) : "?"})` : null,
+        r1h  ? `1h=${r1h}(${md.price_change_1h >= 0 ? "+" : ""}${(md.price_change_1h ?? 0).toFixed(1)}%,vol×${volRatio1h != null ? volRatio1h.toFixed(1) : "?"})` : null,
+        r6h  ? `6h=${r6h}(${md.price_change_6h >= 0 ? "+" : ""}${(md.price_change_6h ?? 0).toFixed(1)}%,vol×${volRatio6h != null ? volRatio6h.toFixed(1) : "?"})` : null,
+        orderFlowLabel ? `order_flow=${orderFlowLabel}` : null,
+        longVolLabel,
+      ].filter(Boolean);
+      const flowRegimeLine = flowParts.length > 0
+        ? `  flow_regime: ${flowParts.join(", ")} → ${regimeConsensus}`
+        : null;
 
       const block = [
         `POOL: ${pool.name} (${pool.pool})`,
         `  metrics: bin_step=${pool.bin_step}, fee_pct=${pool.fee_pct}%, fee_tvl=${pool.fee_active_tvl_ratio}, vol=$${pool.volume_window}, tvl=$${pool.tvl ?? pool.active_tvl}, volatility_${pool.volatility_timeframe || "30m"}=${pool.volatility}, mcap=$${pool.mcap}, organic=${pool.organic_score}${pool.token_age_hours != null ? `, age=${pool.token_age_hours}h` : ""}`,
         `  audit: top10=${top10Pct}%, bots=${botPct}%, fees=${feesSol}SOL${launchpad ? `, launchpad=${launchpad}` : ""}`,
         pvpLine,
-        volSignalLine,
+        flowRegimeLine,
         okxParts ? `  okx: ${okxParts}` : okxUnavailable ? `  okx: unavailable` : null,
         okxTags ? `  tags: ${okxTags}` : null,
         pool.price_vs_ath_pct != null ? `  ath: price_vs_ath=${pool.price_vs_ath_pct}%${pool.top_cluster_trend ? `, top_cluster=${pool.top_cluster_trend}` : ""}` : null,
@@ -1287,6 +1313,42 @@ function formatCandidates(candidates) {
     "  " + "─".repeat(68),
     ...lines,
   ].join("\n");
+}
+
+// ── Flow-regime helpers ──────────────────────────────────────────────────────
+// Classify a single timeframe as MARKUP / DISTRIBUTION / EXHAUSTION / CAPITULATION / NEUTRAL.
+// priceChangePct: % move (positive = up). volRatio: current-vol / baseline-vol (>1 = expanding).
+// priceThreshold: minimum absolute % to call the move "directional" (filters out noise).
+function tfFlowRegime(priceChangePct, volRatio, priceThreshold) {
+  if (priceChangePct == null) return null;
+  const up   = priceChangePct >  priceThreshold;
+  const down = priceChangePct < -priceThreshold;
+  if (!up && !down) return "NEUTRAL";
+  if (volRatio == null) return up ? "UP" : "DOWN"; // price signal only, no vol context
+  const volHigh = volRatio > 1.1;
+  if (up   && volHigh)  return "MARKUP";
+  if (down && volHigh)  return "DISTRIBUTION";
+  if (up   && !volHigh) return "EXHAUSTION";
+  return "CAPITULATION"; // down && !volHigh
+}
+
+// Derive consensus label from an array of per-TF regimes.
+// Returns the dominant regime name, or MIXED/NEUTRAL.
+function flowConsensus(regimes) {
+  const defined = regimes.filter((r) => r != null && r !== "NEUTRAL");
+  if (defined.length === 0) return "NEUTRAL";
+  const counts = {};
+  for (const r of defined) counts[r] = (counts[r] || 0) + 1;
+  // Specific regime majority
+  for (const label of ["DISTRIBUTION", "MARKUP", "CAPITULATION", "EXHAUSTION"]) {
+    if ((counts[label] || 0) >= 2) return label;
+  }
+  // Directional majority (weaker signal names)
+  const bearish = (counts.DISTRIBUTION || 0) + (counts.CAPITULATION || 0) + (counts.DOWN || 0);
+  const bullish  = (counts.MARKUP || 0) + (counts.EXHAUSTION || 0) + (counts.UP || 0);
+  if (bearish > bullish) return "BEARISH_MIXED";
+  if (bullish > bearish) return "BULLISH_MIXED";
+  return "MIXED";
 }
 
 function getDeterministicCloseRule(position, managementConfig, marketData = null, volumeWindow = []) {

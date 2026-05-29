@@ -95,6 +95,22 @@ TOKEN TAGS (from OKX advanced-info):
 - is_honeypot = HARD SKIP
 - low_liquidity = CAUTION
 
+FLOW REGIME (multi-timeframe volume × price composite — soft signal, not a hard filter):
+Each timeframe is classified by crossing volume expansion/contraction with price direction:
+- MARKUP:       vol expanding + price rising  → healthy buy demand, ideal entry zone
+- DISTRIBUTION: vol expanding + price falling → sellers absorbing bids, exit liquidity risk — AVOID unless smart money present
+- EXHAUSTION:   vol contracting + price rising → rally running out of fuel, late entry risk
+- CAPITULATION: vol contracting + price falling → dying pool, avoid
+- UP/DOWN:      price directional but no vol data (weaker signal)
+- NEUTRAL:      price flat (< threshold), regime inconclusive
+
+→ consensus: majority vote across 5m / 1h / 6h timeframes.
+- DISTRIBUTION or CAPITULATION consensus: strong skip signal. Override only for exceptional narrative + confirmed smart wallet accumulation.
+- MARKUP consensus: ideal — confirms fee engine is active on buy side.
+- MIXED / BULLISH_MIXED / BEARISH_MIXED: use narrative + smart wallets as tiebreaker.
+- long_vol=DECLINING/EXPANDING: Meteora API signal over volatility window (≥30m), independent source — confirm vs DexScreener regime.
+- order_flow=BEARISH/BULLISH: 5m txn-count microstructure, confirms or refutes 5m regime.
+
 IMPORTANT: fee_active_tvl_ratio values are ALREADY in percentage form. 0.29 = 0.29%. Do NOT multiply by 100. A value of 1.0 = 1.0%, a value of 22 = 22%. Never convert.
 
 Current screening timeframe: ${config.screening.timeframe} — interpret all non-volatility metrics relative to this window. Interpret volatility using the candidate's volatility_* label.
