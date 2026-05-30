@@ -430,6 +430,20 @@ export async function discoverPools({
     }
   }
 
+  // Enforce SOL-only quote token. The executor only supports single-side SOL deploys
+  // (amount_x=0, amount_y>0), so USDC/USDT/other-quote pools will always fail on-chain.
+  // Filter here so the LLM never sees non-SOL candidates.
+  const SOL_MINT = "So11111111111111111111111111111111111111112";
+  const beforeSolFilter = rawPools.length;
+  rawPools = rawPools.filter((p) => {
+    const sym = p.token_y?.symbol ?? p.quote?.symbol ?? "";
+    const mint = p.token_y?.address ?? p.quote?.mint ?? "";
+    return sym === "SOL" || mint === SOL_MINT;
+  });
+  if (rawPools.length < beforeSolFilter) {
+    log("screening", `SOL-only filter: removed ${beforeSolFilter - rawPools.length} non-SOL-quote pools (${rawPools.length} remain)`);
+  }
+
   rawPools = await applyVolatilityTimeframe(rawPools, s.timeframe);
   await enrichDiscordSignalLaunchpads(rawPools);
 
