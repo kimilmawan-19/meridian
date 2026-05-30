@@ -750,6 +750,26 @@ export async function getPoolDetail({ pool_address, timeframe = "5m" }) {
 }
 
 /**
+ * Fetch current volatility for a pool from the Meteora pool discovery API.
+ * Uses the volatility timeframe (>=30m) to avoid noisy short-window values.
+ * Returns null on any failure — never throws.
+ *
+ * @param {string} poolAddress
+ * @returns {Promise<number|null>}
+ */
+export async function fetchPoolVolatility(poolAddress) {
+  if (!poolAddress) return null;
+  try {
+    const timeframe = getVolatilityTimeframe(config.screening.timeframe ?? "5m");
+    const pool = await fetchPoolDiscoveryDetail({ poolAddress, timeframe });
+    const v = numeric(pool?.volatility);
+    return v != null && Number.isFinite(v) && v > 0 ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Condense a pool object for LLM consumption.
  * Raw API returns ~100+ fields per pool. The LLM only needs ~20.
  */

@@ -297,6 +297,27 @@ export function batchUpdateMarketData(updates) {
 }
 
 /**
+ * Update live_volatility for all positions in a pool.
+ * Called once per management cycle per unique pool.
+ * Keyed by pool_address → volatility number.
+ *
+ * @param {Map<string, number>} updates  pool_address → live volatility value
+ */
+export function batchUpdateLiveVolatility(updates) {
+  if (!updates || updates.size === 0) return;
+  const state = load();
+  for (const pos of Object.values(state.positions)) {
+    if (pos.closed) continue;
+    const v = updates.get(pos.pool);
+    if (v != null && Number.isFinite(v) && v > 0) {
+      pos.live_volatility = v;
+      pos.live_volatility_at = new Date().toISOString();
+    }
+  }
+  save(state);
+}
+
+/**
  * Record a fee claim event.
  */
 export function recordClaim(position_address, fees_usd) {

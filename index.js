@@ -7,7 +7,7 @@ import { agentLoop } from "./agent.js";
 import { log } from "./logger.js";
 import { getMyPositions, closePosition, getActiveBin } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
-import { getTopCandidates } from "./tools/screening.js";
+import { getTopCandidates, fetchPoolVolatility } from "./tools/screening.js";
 import { assessMarketRegime } from "./market-regime.js";
 import { fetchPoolMarketData, getMarketDataStats } from "./tools/market-data.js";
 import { config, configMeta, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
@@ -28,7 +28,7 @@ import {
   createLiveMessage,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop, batchUpdateMarketData, getOorDirection, wasRecentlyOorAbove, updateR9GraceZone, effectiveStopLossPct, recordTpVeto, resetTpVeto, markTaExitTriggered } from "./state.js";
+import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop, batchUpdateMarketData, batchUpdateLiveVolatility, getOorDirection, wasRecentlyOorAbove, updateR9GraceZone, effectiveStopLossPct, recordTpVeto, resetTpVeto, markTaExitTriggered } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote, addVolumeSnapshot, getVolumeWindow } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
@@ -272,6 +272,25 @@ export async function runManagementCycle({ silent = false } = {}) {
       }
     }
     if (marketUpdates.size > 0) batchUpdateMarketData(marketUpdates);
+
+    // Refresh live volatility from Meteora once per management cycle per unique pool.
+    // Rules 3/7/8/9 use tracked.volatility (set at deploy) to scale their thresholds.
+    // A token whose volatility has changed since deploy (quieted down or spiked) causes
+    // those thresholds to mis-fire for the rest of the position's life. We fetch the
+    // current pool volatility and store it as live_volatility in state; each Rule then
+    // reads live_volatility ?? volatility so the override is graceful and backward-compatible.
+    // Fetches run in parallel and fail-safe (null → falls back to deploy-time value).
+    void (async () => {
+      try {
+        const volResults = await Promise.all(
+          uniquePools.map(async (pool) => [pool, await fetchPoolVolatility(pool)])
+        );
+        const volUpdates = new Map(volResults.filter(([, v]) => v != null));
+        if (volUpdates.size > 0) batchUpdateLiveVolatility(volUpdates);
+      } catch (e) {
+        log("cron_warn", `Live volatility refresh failed: ${e.message}`);
+      }
+    })();
 
     // Record volume snapshots and update Rule 9 entry-grace zone tracking per position
     for (const p of positionData) {
@@ -1395,15 +1414,15 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
     position.active_bin != null &&
     position.upper_bin != null
   ) {
-    // Scale outOfRangeBinsToClose with pool volatility at deploy time.
+    // Scale outOfRangeBinsToClose with current pool volatility.
     // Vol ≤ 2 → 1× base (no change). Vol 4.6 → 2.3× base. Vol 6+ → 3× base (cap).
     // Prevents premature close on high-volatility pools where 10 bins = normal oscillation.
-    const volMult = (tracked?.volatility > 0)
-      ? Math.max(1, Math.min(3, tracked.volatility / 2))
-      : 1;
+    // live_volatility is refreshed each cycle; falls back to deploy-time value if unavailable.
+    const r3Vol = tracked?.live_volatility ?? tracked?.volatility ?? 0;
+    const volMult = r3Vol > 0 ? Math.max(1, Math.min(3, r3Vol / 2)) : 1;
     const effectiveBinsToClose = Math.round(managementConfig.outOfRangeBinsToClose * volMult);
     if (position.active_bin > position.upper_bin + effectiveBinsToClose) {
-      return { action: "CLOSE", rule: 3, reason: `pumped far above range (>${effectiveBinsToClose} bins, vol=${tracked?.volatility ?? "?"}×${volMult.toFixed(2)})` };
+      return { action: "CLOSE", rule: 3, reason: `pumped far above range (>${effectiveBinsToClose} bins, vol=${r3Vol}×${volMult.toFixed(2)})` };
     }
   }
   const oorAboveWaitMin = managementConfig.outOfRangeWaitMinutesAbove ?? managementConfig.outOfRangeWaitMinutes;
@@ -1499,12 +1518,12 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
       const buys = marketData.txn_buys_5m;
       const oorDir7 = getOorDirection(position);
       const inRangeAndGreen = position.in_range !== false && (position.pnl_pct ?? 0) >= 0;
-      // Scale sell-pressure threshold with deploy-time volatility. The screener prefers
+      // Scale sell-pressure threshold with current pool volatility. The screener prefers
       // volatile tokens (vol>=3), where elevated sells:buys is normal oscillation, not collapse.
       // Vol <= 2 → 1× (no change). Vol 4 → 1.5× (cap). Requires 3:1 sells instead of 2:1.
-      const volMult7 = (vc7tracked?.volatility > 0)
-        ? Math.max(1, Math.min(1.5, vc7tracked.volatility / 2))
-        : 1;
+      // live_volatility is refreshed each cycle; falls back to deploy-time value if unavailable.
+      const r7Vol = vc7tracked?.live_volatility ?? vc7tracked?.volatility ?? 0;
+      const volMult7 = r7Vol > 0 ? Math.max(1, Math.min(1.5, r7Vol / 2)) : 1;
       const effectiveSellRatio7 = vcCfg.sellPressureRatio * volMult7;
 
       // Depth-aware entry grace (mirrors Rule 8/9): a SOL-rich position experiencing a
@@ -1548,7 +1567,7 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
         curVol != null && curVol < peakVol * (vcCfg.dropThresholdPct / 100) &&
         sells != null && buys != null && (sells + buys) >= minTxns7 && sells > buys * effectiveSellRatio7
       ) {
-        return { action: "CLOSE", rule: 7, reason: `volume collapse (sells>${effectiveSellRatio7.toFixed(2)}× buys, vol=${vc7tracked?.volatility ?? "?"}×${volMult7.toFixed(2)} depth=${depthPct7.toFixed(0)}% strat=${deployStrategy7})` };
+        return { action: "CLOSE", rule: 7, reason: `volume collapse (sells>${effectiveSellRatio7.toFixed(2)}× buys, vol=${r7Vol}×${volMult7.toFixed(2)} depth=${depthPct7.toFixed(0)}% strat=${deployStrategy7})` };
       }
     }
   }
@@ -1600,12 +1619,12 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
         const priceChange5m = marketData.price_change_5m;
         const priceChange1h = marketData.price_change_1h;
         const pnlOk = !rpCfg.requireNegativePnl || (!pnlSuspect && (position.pnl_pct ?? 0) < 0);
-        // Scale the 5m drop threshold with deploy-time volatility. For tokens the screener
+        // Scale the 5m drop threshold with current pool volatility. For tokens the screener
         // deliberately selected for high volatility, a -8% 5m candle is normal oscillation.
         // Vol <= 2 → 1× (-8%). Vol 4 → 2× (-16%, cap). dropPct5m is negative, so ×mult widens it.
-        const volMult8 = (rp8tracked?.volatility > 0)
-          ? Math.max(1, Math.min(2, rp8tracked.volatility / 2))
-          : 1;
+        // live_volatility is refreshed each cycle; falls back to deploy-time value if unavailable.
+        const r8Vol = rp8tracked?.live_volatility ?? rp8tracked?.volatility ?? 0;
+        const volMult8 = r8Vol > 0 ? Math.max(1, Math.min(2, r8Vol / 2)) : 1;
         const effectiveDrop5m = rpCfg.dropPct5m * volMult8;
         // 1h confirmation: if dropPct1h is set, require 1h trend to also be below that threshold.
         // Prevents closing on a 5m spike-dump while the broader 1h trend is still bullish/flat.
@@ -1649,9 +1668,9 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
       // prefers vol>=3) naturally produce sell-heavy windows; raise the bar before counting.
       // Vol <= 3 → 1× (no change). Vol 4.5+ → 1.5× (cap).
       const sp9tracked = getTrackedPosition(position.position);
-      const volMult9 = (sp9tracked?.volatility > 0)
-        ? Math.max(1, Math.min(1.5, sp9tracked.volatility / 3))
-        : 1;
+      // live_volatility is refreshed each cycle; falls back to deploy-time value if unavailable.
+      const r9Vol = sp9tracked?.live_volatility ?? sp9tracked?.volatility ?? 0;
+      const volMult9 = r9Vol > 0 ? Math.max(1, Math.min(1.5, r9Vol / 3)) : 1;
       const ratio = (spCfg.ratio ?? 1.2) * volMult9;
       const safetyPnlPct = spCfg.safetyPnlPct ?? 5;
       const minAgeMin = spCfg.minPositionAgeMin ?? 0;
