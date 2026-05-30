@@ -80,6 +80,22 @@ function formatCountdown(seconds) {
   return m > 0 ? `${m}m ${s}s` : `${s}s`;
 }
 
+// Render where the active price sits inside a position's bin range as a visual bar.
+// Uses bin IDs already on the position object — no SDK call or price conversion.
+// "▲" marks the active bin; 0% = bottom of range, 100% = top edge.
+function renderRangeBar(lowerBin, upperBin, activeBin, width = 20) {
+  if (lowerBin == null || upperBin == null || activeBin == null || upperBin <= lowerBin) return null;
+  const span = upperBin - lowerBin;
+  const rawPct = ((activeBin - lowerBin) / span) * 100;
+  const pct = Math.max(0, Math.min(100, rawPct));
+  // Clamp the marker inside the bar; OOR is flagged by the label, not the bar position.
+  const pos = Math.round((pct / 100) * (width - 1));
+  const cells = Array.from({ length: width }, (_, i) => (i === pos ? "▲" : i < pos ? "█" : "░"));
+  // When price has blown past the range, show the true (>100% / <0%) figure for clarity.
+  const label = rawPct > 100 ? `${Math.round(rawPct)}%↑` : rawPct < 0 ? `${Math.round(rawPct)}%↓` : `${Math.round(rawPct)}%`;
+  return `[${cells.join("")}] ${label} (active ${activeBin} / ${lowerBin}–${upperBin})`;
+}
+
 function buildPrompt() {
   const mgmt = formatCountdown(nextRunIn(timers.managementLastRun, config.schedule.managementIntervalMin));
   const scrn = formatCountdown(nextRunIn(timers.screeningLastRun, config.schedule.screeningIntervalMin));
@@ -540,7 +556,11 @@ export async function runManagementCycle({ silent = false } = {}) {
       const statusLabel = act.action === "INSTRUCTION" ? "HOLD (instruction)"
         : act.action === "TP_PROPOSAL" ? "TP? (LLM decides)"
         : act.action;
-      let line = `**${p.pair}** | Age: ${p.age_minutes ?? "?"}m | Val: ${val} | Unclaimed: ${unclaimed} | PnL: ${p.pnl_pct ?? "?"}% | Yield: ${p.fee_per_tvl_24h ?? "?"}% | ${inRange} | ${statusLabel}`;
+      const trackedP = getTrackedPosition(p.position);
+      const strat = (trackedP?.strategy ?? config.strategy.strategy ?? "?").toString();
+      let line = `**${p.pair}** | ${strat} | Age: ${p.age_minutes ?? "?"}m | Val: ${val} | Unclaimed: ${unclaimed} | PnL: ${p.pnl_pct ?? "?"}% | Yield: ${p.fee_per_tvl_24h ?? "?"}% | ${inRange} | ${statusLabel}`;
+      const rangeBar = renderRangeBar(p.lower_bin, p.upper_bin, p.active_bin);
+      if (rangeBar) line += `\n${rangeBar}`;
       if (p.instruction) line += `\nNote: "${p.instruction}"`;
       if (act.action === "TP_PROPOSAL") line += `\n🎯 Trailing TP triggered: peak ${act.peak.toFixed(1)}% → ${act.current.toFixed(1)}% (gave back ${act.dropFromPeak.toFixed(1)}%, veto ${act.vetoCount}/${config.management.maxTpVetos ?? 3}) — LLM hold/close`;
       if (act.action === "CLOSE" && act.rule === "exit") line += `\n⚡ Trailing TP: ${act.reason}`;
