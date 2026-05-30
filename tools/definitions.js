@@ -306,6 +306,39 @@ WARNING: This executes a real on-chain transaction. Cannot be undone.`,
   {
     type: "function",
     function: {
+      name: "partial_close_position",
+      description: `Scale out of a WINNING position: remove part of the liquidity now and let the rest keep running.
+Use ONLY when presented with a TP_PROPOSAL and you judge the move may continue but want to lock in gains:
+- Take part of the profit off the table (converted back to SOL) while a "runner" stays in to capture more upside.
+- The remainder's trailing stop is automatically tightened, so the runner is well-protected.
+Prefer this over a full close when momentum is mixed (e.g. flow_regime NEUTRAL/MARKUP) but you still want to de-risk.
+Prefer a FULL close_position when the signal is clearly bearish (flow_regime DISTRIBUTION, RSI overbought + reversal, heavy sell pressure).
+
+WARNING: This executes a real on-chain transaction. Cannot be undone. The position stays open with reduced size.`,
+      parameters: {
+        type: "object",
+        properties: {
+          position_address: {
+            type: "string",
+            description: "The position public key to partially close"
+          },
+          pct: {
+            type: "number",
+            description: "Percent of the CURRENT position to scale out now (e.g. 50 = take half). Clamped to the configured min/max so a runner always remains."
+          },
+          reason: {
+            type: "string",
+            description: "Why scaling out now, e.g. 'partial take-profit at peak, holding runner for continuation'."
+          }
+        },
+        required: ["position_address", "pct"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
       name: "get_wallet_positions",
       description: `Get all open DLMM positions for any Solana wallet address.
 Use this when the user asks about another wallet's positions, wants to monitor a wallet,

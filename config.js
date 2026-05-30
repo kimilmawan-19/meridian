@@ -157,6 +157,16 @@ export const config = {
     maxTpVetos:            u.maxTpVetos             ?? 3,    // max consecutive holds before force-close
     tpVetoFloorDivisor:    u.tpVetoFloorDivisor     ?? 2,    // force-close once give-back >= peak / divisor
     pnlSanityMaxDiffPct:   u.pnlSanityMaxDiffPct   ?? 5,    // max allowed diff between reported and derived pnl % before ignoring a tick
+    // ── Partial exit (scale-out) — let MANAGER take part of a winner at the trailing-TP point ──
+    partialExit: {
+      enabled:               u.partialExit?.enabled               ?? false, // opt-in; off → existing binary TP behaviour
+      minPeakPct:            u.partialExit?.minPeakPct            ?? 4,     // partial only offered once peak PnL >= this
+      defaultPct:            u.partialExit?.defaultPct            ?? 50,    // suggested scale-out size shown to the LLM
+      minPct:                u.partialExit?.minPct                ?? 25,    // clamp: smallest allowed scale-out
+      maxPct:                u.partialExit?.maxPct                ?? 75,    // clamp: largest allowed scale-out (always leave a runner)
+      stage2TrailingDropPct: u.partialExit?.stage2TrailingDropPct ?? 0.8,  // tighten remainder's trailing drop after a partial
+      minRemainderUsd:       u.partialExit?.minRemainderUsd       ?? 15,    // skip partial if the leftover position would be dust
+    },
     // SOL mode — positions, PnL, and balances reported in SOL instead of USD
     solMode:               u.solMode               ?? false,
   },

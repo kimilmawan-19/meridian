@@ -7,6 +7,7 @@ import {
   getPositionPnl,
   claimFees,
   closePosition,
+  partialClosePosition,
   searchPools,
 } from "./dlmm.js";
 import { getWalletBalances, swapToken } from "./wallet.js";
@@ -43,7 +44,7 @@ const TIMEFRAME_MINUTES = {
   "24h": 1440,
 };
 import { log, logAction } from "../logger.js";
-import { notifyDeploy, notifyClose, notifySwap } from "../telegram.js";
+import { notifyDeploy, notifyClose, notifyPartialClose, notifySwap } from "../telegram.js";
 
 function numberOrNull(value) {
   const n = Number(value);
@@ -284,6 +285,7 @@ const toolMap = {
   check_smart_wallets_on_pool: checkSmartWalletsOnPool,
   claim_fees: claimFees,
   close_position: closePosition,
+  partial_close_position: partialClosePosition,
   get_wallet_balance: getWalletBalances,
   swap_token: swapToken,
   get_top_lpers: studyTopLPers,
@@ -583,6 +585,7 @@ const WRITE_TOOLS = new Set([
   "deploy_position",
   "claim_fees",
   "close_position",
+  "partial_close_position",
   "swap_token",
 ]);
 const PROTECTED_TOOLS = new Set([
@@ -668,6 +671,25 @@ export async function executeTool(name, args) {
             result.auto_swapped = false;
             result.auto_swap_failed = true;
             result.auto_swap_note = `Auto-swap of base token (${result.base_mint.slice(0, 8)}) back to SOL FAILED: ${e.message}. The base token is still in the wallet — call swap_token (input_mint=base_mint, output_mint=SOL) to recover SOL before deploying again.`;
+          }
+        }
+      } else if (name === "partial_close_position" && result.success) {
+        notifyPartialClose({ pair: result.pool_name || args.position_address?.slice(0, 8), pct: result.pct, lockedUsd: result.locked_usd ?? 0, peakPct: result.peak_pnl_pct ?? null }).catch(() => {});
+        // Auto-swap the scaled-out base token back to SOL so it is immediately redeployable.
+        if (!args.skip_swap && result.base_mint) {
+          try {
+            const balances = await getWalletBalances({});
+            const token = balances.tokens?.find(t => t.mint === result.base_mint);
+            if (token && token.usd >= 0.10) {
+              log("executor", `Auto-swapping partial scale-out ${token.symbol || result.base_mint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to SOL`);
+              await swapToken({ input_mint: result.base_mint, output_mint: "SOL", amount: token.balance });
+              result.auto_swapped = true;
+              result.auto_swap_note = `Scaled-out base token already auto-swapped back to SOL. Do NOT call swap_token again. The runner (remaining position) is still open with a tightened trailing stop.`;
+            }
+          } catch (e) {
+            log("executor_warn", `Auto-swap after partial close failed: ${e.message}`);
+            result.auto_swap_failed = true;
+            result.auto_swap_note = `Auto-swap of scaled-out base token FAILED: ${e.message}. Call swap_token (input_mint=base_mint, output_mint=SOL) to recover SOL.`;
           }
         }
       } else if (name === "claim_fees" && config.management.autoSwapAfterClaim && result.base_mint) {

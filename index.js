@@ -422,7 +422,21 @@ export async function runManagementCycle({ silent = false } = {}) {
           const budgetLeft = vetoCount < (mgmt.maxTpVetos ?? 3);
           const aboveFloor = dropFromPeak < floorDrop;
           if (budgetLeft && aboveFloor) {
-            actionMap.set(p.position, { action: "TP_PROPOSAL", reason: exit.reason, peak, current, dropFromPeak, vetoCount, ta_triggered: !!exit.ta_triggered });
+            // Partial scale-out is offered alongside hold/close once the position has
+            // a meaningful peak AND the leftover runner would still be a real position
+            // (not dust). Emergency rules never reach here — they full-close by construction.
+            const pe = mgmt.partialExit ?? {};
+            const remainderAfterDefault = (p.total_value_usd ?? 0) * (1 - (pe.defaultPct ?? 50) / 100);
+            const partialAvailable = !!pe.enabled
+              && peak >= (pe.minPeakPct ?? 4)
+              && remainderAfterDefault >= (pe.minRemainderUsd ?? 15);
+            actionMap.set(p.position, {
+              action: "TP_PROPOSAL", reason: exit.reason, peak, current, dropFromPeak, vetoCount,
+              ta_triggered: !!exit.ta_triggered,
+              partial_available: partialAvailable,
+              partial_default_pct: pe.defaultPct ?? 50,
+              partial_taken_count: tr?.partial_taken_count ?? 0,
+            });
             continue;
           }
           const forcedWhy = !budgetLeft
@@ -559,14 +573,35 @@ export async function runManagementCycle({ silent = false } = {}) {
           const taNote = act.ta_triggered
             ? `\n  ta_signal: RSI overbought detected — momentum may be fading; bias strongly toward closing`
             : "";
+          // Partial scale-out option: present only when available (peak high enough,
+          // runner would not be dust). Bias depends on signal strength.
+          const md = p._marketData;
+          let decisionLine;
+          if (act.partial_available) {
+            const runnerNote = (act.partial_taken_count ?? 0) > 0
+              ? ` (already scaled out ${act.partial_taken_count}× before)`
+              : "";
+            const biasNote = act.ta_triggered
+              ? `RSI overbought + give-back suggests the move is done — prefer a FULL close, or a LARGE partial (>=${act.partial_default_pct}%) if you still see a runner.`
+              : `Signal is mixed — a partial scale-out (~${act.partial_default_pct}%) is often the best play: lock gains, keep a protected runner. Full close if momentum looks clearly done; hold (do nothing) only if continuation is clear.`;
+            decisionLine =
+              `  DECISION (choose ONE):\n` +
+              `    • partial_close_position(pct=${act.partial_default_pct}) — scale out part now, runner kept with tightened trailing stop${runnerNote}\n` +
+              `    • close_position — exit fully\n` +
+              `    • do nothing — hold (burns 1 of ${config.management.maxTpVetos ?? 3} holds, force-closes eventually)\n` +
+              `  GUIDANCE: ${biasNote}`;
+          } else {
+            decisionLine =
+              `  DECISION: take profit now (close_position) OR hold (do nothing) only if there is clear continued upward momentum. Bias toward taking profit — a confirmed give-back usually means the move is done.` + taNote;
+          }
           return [
             `POSITION: ${p.pair} (${p.position})`,
             `  pool: ${p.pool}`,
             `  action: TP_PROPOSAL — trailing take-profit triggered: ${act.reason}`,
             `  peak_pnl: ${act.peak.toFixed(2)}% | current_pnl: ${act.current.toFixed(2)}% | given_back: ${act.dropFromPeak.toFixed(2)}% | holds_used: ${act.vetoCount}/${config.management.maxTpVetos ?? 3}`,
             `  unclaimed_fees: ${cur}${p.unclaimed_fees_usd} | value: ${cur}${p.total_value_usd} | fee_per_tvl_24h: ${p.fee_per_tvl_24h ?? "?"}%`,
-            `  context: in_range=${p.in_range} | bins lower=${p.lower_bin} upper=${p.upper_bin} active=${p.active_bin} | oor_minutes=${p.minutes_out_of_range ?? 0} | price_5m=${p._marketData?.price_change_5m ?? "?"}% | vol_5m=$${p._marketData?.volume_5m ?? "?"}`,
-            `  DECISION: take profit now (close_position) OR hold (do nothing) only if there is clear continued upward momentum. Bias toward taking profit — a confirmed give-back usually means the move is done.` + taNote,
+            `  context: in_range=${p.in_range} | bins lower=${p.lower_bin} upper=${p.upper_bin} active=${p.active_bin} | oor_minutes=${p.minutes_out_of_range ?? 0} | price_5m=${md?.price_change_5m ?? "?"}% | price_1h=${md?.price_change_1h ?? "?"}% | vol_5m=$${md?.volume_5m ?? "?"}`,
+            decisionLine,
           ].join("\n");
         }
         return [
@@ -588,7 +623,7 @@ RULES:
 - CLOSE: call close_position only — it handles fee claiming internally, do NOT call claim_fees first
 - CLAIM: call claim_fees with position address
 - INSTRUCTION: evaluate the instruction condition. If met → close_position. If not → HOLD, do nothing.
-- TP_PROPOSAL: this is a JUDGMENT call, the only one where you decide. Take profit (close_position) unless the context shows clear continued upward momentum. To hold, simply do nothing for that position. Holds are budget-limited and force-close eventually.
+- TP_PROPOSAL: this is a JUDGMENT call, the only one where you decide. Follow the per-position DECISION/GUIDANCE lines. If a partial_close_position option is offered, it is a valid middle path — scale out part and keep a protected runner. To hold, simply do nothing for that position. Holds are budget-limited and force-close eventually.
 - ⚡ exit alerts: close immediately, no exceptions
 
 Execute the required actions. Do NOT re-evaluate CLOSE/CLAIM — rules already applied. TP_PROPOSAL is the only decision to make. Just execute.
@@ -610,14 +645,23 @@ After executing, write a brief one-line result per position.
 
     // Layer A: reconcile trailing-TP proposals — any still-open proposal means the LLM
     // chose to HOLD, so spend a veto. Closed ones were taken (no veto, position is gone).
+    // Exception: if a partial scale-out was taken this cycle the position stays open by
+    // design — that is an exit decision, not a hold, and markPartialExit already reset the
+    // veto budget. Detect it via a fresh partial_taken_at timestamp and skip the veto.
     const tpProposals = [...actionMap.entries()].filter(([, a]) => a.action === "TP_PROPOSAL");
     if (tpProposals.length > 0) {
       const stillOpen = new Set((afterPositions?.positions ?? []).map((p) => p.position));
+      const cycleStartMs = Date.now() - 5 * 60 * 1000; // partial counts as "this cycle" if within 5m
       for (const [addr, act] of tpProposals) {
-        if (stillOpen.has(addr)) {
-          const n = recordTpVeto(addr, act.peak);
-          log("state", `Trailing TP held by LLM for ${addr.slice(0, 8)} — veto ${n}/${config.management.maxTpVetos ?? 3} (peak ${act.peak.toFixed(1)}%)`);
+        if (!stillOpen.has(addr)) continue;
+        const tr = getTrackedPosition(addr);
+        const partialThisCycle = tr?.partial_taken_at && new Date(tr.partial_taken_at).getTime() >= cycleStartMs;
+        if (partialThisCycle) {
+          log("state", `Trailing TP partial scale-out for ${addr.slice(0, 8)} — no veto spent (runner kept, budget reset)`);
+          continue;
         }
+        const n = recordTpVeto(addr, act.peak);
+        log("state", `Trailing TP held by LLM for ${addr.slice(0, 8)} — veto ${n}/${config.management.maxTpVetos ?? 3} (peak ${act.peak.toFixed(1)}%)`);
       }
     }
     if (afterCount < config.risk.maxPositions && Date.now() - _screeningLastTriggered > screeningCooldownMs) {

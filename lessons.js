@@ -122,6 +122,8 @@ function buildSignalSnapshot(perf) {
  * @param {string} [perf.peak_pnl_at]         - ISO timestamp when peak was reached
  * @param {number} [perf.tp_veto_count]       - How many trailing-TP vetos were burned
  * @param {boolean} [perf.ta_exit_triggered]  - Whether RSI/TA signal drove the exit
+ * @param {number} [perf.partial_taken_count] - How many partial scale-outs were taken
+ * @param {number} [perf.partial_taken_pct]   - Cumulative % scaled out before final close
  */
 export async function recordPerformance(perf) {
   const data = load();
@@ -293,6 +295,13 @@ function derivLesson(perf) {
     } else if ((perf.tp_veto_count ?? 0) >= 2 && outcome === "good") {
       rule = `WORKED: Holding trailing TP (${perf.tp_veto_count} vetos) on ${perf.pool_name}-type pools paid off — final PnL +${perf.pnl_pct}% (peak ${perf.peak_pnl_pct ?? "?"}%).`;
       tags.push("tp_veto_good");
+    // Partial scale-out quality: did taking part off the table help or leave money behind?
+    } else if ((perf.partial_taken_count ?? 0) > 0 && outcome === "good") {
+      rule = `WORKED: Scaling out (${perf.partial_taken_pct}% partial) on ${perf.pool_name}-type pools locked gains while a runner captured more — final PnL +${perf.pnl_pct}% (peak ${perf.peak_pnl_pct ?? "?"}%).`;
+      tags.push("partial_exit", "worked");
+    } else if ((perf.partial_taken_count ?? 0) > 0 && outcome === "bad") {
+      rule = `NOTE: Scaled out ${perf.partial_taken_pct}% on ${perf.pool_name}-type pools but the runner still closed at ${perf.pnl_pct}% — partial protected part of the position, but consider fuller exits when the signal is clearly bearish.`;
+      tags.push("partial_exit", "failed");
     // TA-triggered exit quality
     } else if (perf.ta_exit_triggered && outcome === "good") {
       rule = `WORKED: RSI overbought exit on ${perf.pool_name} locked in +${perf.pnl_pct}% from a ${perf.peak_pnl_pct ?? "?"}% peak — TA exit signal was accurate.`;

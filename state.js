@@ -121,6 +121,12 @@ export function trackPosition({
     peak_volume_5m_usd: null,
     last_market_data_at: null,
     volume_history: [],
+    // Partial exit (scale-out) tracking
+    partial_taken_count: 0,
+    partial_taken_pct: 0,
+    partial_taken_usd: 0,
+    partial_taken_at: null,
+    partial_peak_at_exit: null,
   };
   pushEvent(state, { action: "deploy", position, pool_name: pool_name || pool });
   save(state);
@@ -366,6 +372,42 @@ export function markTaExitTriggered(position_address) {
   if (!pos || pos.closed) return;
   pos.ta_exit_triggered = true;
   save(state);
+}
+
+/**
+ * Record a partial scale-out. Accumulates the % and USD locked in, stamps the
+ * peak at which it was taken, and tightens the remainder's trailing stop via the
+ * existing Layer B trailing_drop_override. Resets the TP veto budget — a partial
+ * is an exit decision, not a hold, so the remainder starts a fresh trailing leg.
+ *
+ * @param {string} position_address
+ * @param {object} info
+ * @param {number} info.pct            - % of remaining liquidity taken this round
+ * @param {number} info.usd            - USD value pulled out this round
+ * @param {number} info.peak_pnl_pct   - peak PnL at the moment of partial
+ * @param {number} info.tightenDropPct - new (tighter) trailing drop for remainder
+ */
+export function markPartialExit(position_address, { pct, usd, peak_pnl_pct, tightenDropPct } = {}) {
+  const state = load();
+  const pos = state.positions[position_address];
+  if (!pos || pos.closed) return false;
+  pos.partial_taken_count = (pos.partial_taken_count ?? 0) + 1;
+  pos.partial_taken_pct   = (pos.partial_taken_pct ?? 0) + (pct ?? 0);
+  pos.partial_taken_usd   = (pos.partial_taken_usd ?? 0) + (usd ?? 0);
+  pos.partial_taken_at    = new Date().toISOString();
+  if (peak_pnl_pct != null) pos.partial_peak_at_exit = peak_pnl_pct;
+  // Tighten the remainder's trailing stop (Layer B override; keep the tightest of the two).
+  if (tightenDropPct != null) {
+    pos.trailing_drop_override = pos.trailing_drop_override != null
+      ? Math.min(pos.trailing_drop_override, tightenDropPct)
+      : tightenDropPct;
+  }
+  // A partial is an exit, not a hold — start the remainder on a clean veto budget.
+  pos.tp_veto_count = 0;
+  pos.tp_veto_peak = null;
+  save(state);
+  log("state", `Position ${position_address} partial exit #${pos.partial_taken_count}: took ${pct}% ($${(usd ?? 0).toFixed(2)}), remainder trailing drop tightened to ${tightenDropPct}%`);
+  return true;
 }
 
 /**

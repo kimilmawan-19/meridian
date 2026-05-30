@@ -22,6 +22,7 @@ import {
   getTrackedPosition,
   minutesOutOfRange,
   syncOpenPositions,
+  markPartialExit,
 } from "../state.js";
 import { recordPerformance } from "../lessons.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
@@ -1504,6 +1505,137 @@ export async function claimFees({ position_address }) {
   }
 }
 
+// ─── Partial Close (scale-out) ─────────────────────────────────
+// Removes a fraction (pct) of the position's liquidity while keeping the
+// position account open. Always uses the local Meteora SDK path — the LPAgent
+// relay zap-out is hardcoded to full close (bps=10000, verification assumes the
+// position disappears), so partial must not go through it. Claims fees first,
+// then removeLiquidity(bps<10000, shouldClaimAndClose=false). The remainder
+// keeps earning; index.js tightens its trailing stop via markPartialExit.
+export async function partialClosePosition({ position_address, pct, reason }) {
+  position_address = normalizeMint(position_address);
+  const cfg = config.management.partialExit;
+
+  if (process.env.DRY_RUN === "true") {
+    return { dry_run: true, would_partial_close: position_address, pct, message: "DRY RUN — no transaction sent" };
+  }
+
+  // Clamp the requested percentage to the configured bounds — always leave a runner.
+  const requested = Number(pct);
+  if (!Number.isFinite(requested) || requested <= 0) {
+    return { success: false, error: `Invalid partial pct: ${pct}` };
+  }
+  const clampedPct = Math.max(cfg.minPct, Math.min(cfg.maxPct, Math.round(requested)));
+  const bps = Math.round(clampedPct * 100); // 50% → 5000 bps
+
+  const tracked = getTrackedPosition(position_address);
+
+  try {
+    log("close", `Partial close ${clampedPct}% of position: ${position_address}`);
+    const wallet = getWallet();
+    const poolAddress = await lookupPoolForPosition(position_address, wallet.publicKey.toString());
+
+    // Capture pre-partial value so we can estimate USD locked in.
+    const beforePositions = await getMyPositions({ force: true, silent: true });
+    const beforePos = beforePositions?.positions?.find((p) => p.position === position_address);
+    const beforeValueUsd = beforePos?.total_value_usd ?? null;
+    const peakAtExit = tracked?.peak_pnl_pct ?? beforePos?.pnl_pct ?? null;
+
+    poolCache.delete(poolAddress.toString());
+    const pool = await getPool(poolAddress);
+    const positionPubKey = new PublicKey(position_address);
+    const claimTxHashes = [];
+    const partialTxHashes = [];
+
+    // ─── Step 1: Claim fees first (clears accrued-fee accounting) ───
+    const recentlyClaimed = tracked?.last_claim_at && (Date.now() - new Date(tracked.last_claim_at).getTime()) < 60_000;
+    try {
+      if (!recentlyClaimed) {
+        const positionData = await pool.getPosition(positionPubKey);
+        const claimTxs = await pool.claimSwapFee({ owner: wallet.publicKey, position: positionData });
+        for (const tx of (claimTxs || [])) {
+          const claimHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet]);
+          claimTxHashes.push(claimHash);
+        }
+        if (claimTxHashes.length) recordClaim(position_address);
+      }
+    } catch (e) {
+      log("close_warn", `Partial step 1 (claim) failed or nothing to claim: ${e.message}`);
+    }
+
+    // ─── Step 2: Remove a fraction of liquidity (keep account open) ──
+    let fromBinId = tracked?.bin_range?.min ?? -887272;
+    let toBinId = tracked?.bin_range?.max ?? 887272;
+    try {
+      const processed = (await pool.getPosition(positionPubKey))?.positionData;
+      if (processed) {
+        fromBinId = processed.lowerBinId ?? fromBinId;
+        toBinId = processed.upperBinId ?? toBinId;
+      }
+    } catch (e) {
+      log("close_warn", `Partial: could not read bin range, using fallback: ${e.message}`);
+    }
+
+    const removeTx = await pool.removeLiquidity({
+      user: wallet.publicKey,
+      position: positionPubKey,
+      fromBinId,
+      toBinId,
+      bps: new BN(bps),
+      shouldClaimAndClose: false, // keep the position open
+    });
+    for (const tx of Array.isArray(removeTx) ? removeTx : [removeTx]) {
+      const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet]);
+      partialTxHashes.push(txHash);
+    }
+
+    await new Promise((r) => setTimeout(r, 5000));
+    _positionsCacheAt = 0;
+
+    // Estimate USD pulled out this round (fraction of pre-partial value).
+    const lockedUsd = beforeValueUsd != null ? beforeValueUsd * (clampedPct / 100) : 0;
+
+    // Record in state: accumulate, stamp peak, tighten remainder trailing stop.
+    markPartialExit(position_address, {
+      pct: clampedPct,
+      usd: lockedUsd,
+      peak_pnl_pct: peakAtExit,
+      tightenDropPct: cfg.stage2TrailingDropPct,
+    });
+
+    const baseMint = beforePos?.base_mint || pool.lbPair.tokenXMint.toString();
+
+    appendDecision({
+      type: "partial_exit",
+      actor: "MANAGER",
+      pool: poolAddress,
+      pool_name: tracked?.pool_name || beforePos?.pair || poolAddress.slice(0, 8),
+      position: position_address,
+      summary: `Partial scale-out ${clampedPct}% at peak ${peakAtExit != null ? peakAtExit.toFixed(1) : "?"}%`,
+      reason: reason || "partial take-profit",
+      metrics: { pct: clampedPct, locked_usd: Math.round(lockedUsd * 100) / 100, peak_pnl_pct: peakAtExit },
+    });
+
+    log("close", `Partial close OK: ${clampedPct}% removed, remainder still open. txs: ${partialTxHashes.join(", ")}`);
+    return {
+      success: true,
+      partial: true,
+      position: position_address,
+      pool: poolAddress,
+      pool_name: tracked?.pool_name || beforePos?.pair || null,
+      pct: clampedPct,
+      locked_usd: Math.round(lockedUsd * 100) / 100,
+      peak_pnl_pct: peakAtExit,
+      claim_txs: claimTxHashes,
+      partial_txs: partialTxHashes,
+      base_mint: baseMint,
+    };
+  } catch (error) {
+    log("close_error", `Partial close failed: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+}
+
 // ─── Close Position ────────────────────────────────────────────
 export async function closePosition({ position_address, reason }) {
   position_address = normalizeMint(position_address);
@@ -1710,6 +1842,10 @@ export async function closePosition({ position_address, reason }) {
             peak_pnl_at:      tracked.peak_pnl_at      ?? null,
             tp_veto_count:    tracked.tp_veto_count    ?? 0,
             ta_exit_triggered: tracked.ta_exit_triggered ?? false,
+            // Partial scale-out metadata (informational only — PnL is already blended via
+            // allTimeWithdrawals, which accumulates partial withdrawals; do NOT re-add).
+            partial_taken_count: tracked.partial_taken_count ?? 0,
+            partial_taken_pct:   tracked.partial_taken_pct   ?? 0,
           });
         } catch (e) {
           log("close_warn", `recordPerformance (relay) failed — close succeeded but not recorded: ${e.message}`);
@@ -2043,6 +2179,10 @@ export async function closePosition({ position_address, reason }) {
           peak_pnl_at:      tracked.peak_pnl_at      ?? null,
           tp_veto_count:    tracked.tp_veto_count    ?? 0,
           ta_exit_triggered: tracked.ta_exit_triggered ?? false,
+          // Partial scale-out metadata (informational only — PnL is already blended via
+          // allTimeWithdrawals, which accumulates partial withdrawals; do NOT re-add).
+          partial_taken_count: tracked.partial_taken_count ?? 0,
+          partial_taken_pct:   tracked.partial_taken_pct   ?? 0,
         });
       } catch (e) {
         log("close_warn", `recordPerformance (SDK) failed — close succeeded but not recorded: ${e.message}`);

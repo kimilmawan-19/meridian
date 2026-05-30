@@ -76,6 +76,15 @@
   "trailingDropPct": 1.5,
   "trailingStalePeakMinutes": 90,
   "trailingStalePeakDropMult": 1.75,
+  "partialExit": {
+    "enabled": false,
+    "minPeakPct": 4,
+    "defaultPct": 50,
+    "minPct": 25,
+    "maxPct": 75,
+    "stage2TrailingDropPct": 0.8,
+    "minRemainderUsd": 15
+  },
   "allowLlmRiskParams": true,
   "stopLossFloorPct": -50,
   "stopLossTightestPct": -10,

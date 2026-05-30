@@ -432,6 +432,16 @@ export async function notifyClose({ pair, pnlUsd, pnlPct, reason }) {
   );
 }
 
+export async function notifyPartialClose({ pair, pct, lockedUsd, peakPct }) {
+  if (hasActiveLiveMessage()) return;
+  const peakLine = peakPct != null ? ` at peak ${peakPct.toFixed(1)}%` : "";
+  await sendHTML(
+    `⚡ <b>Partial Close</b> ${pair}\n` +
+    `Took ${pct}%${peakLine} — locked $${(lockedUsd ?? 0).toFixed(2)} to SOL\n` +
+    `Runner held with tightened trailing stop`
+  );
+}
+
 export async function notifySwap({ inputSymbol, outputSymbol, amountIn, amountOut, tx }) {
   if (hasActiveLiveMessage()) return;
   await sendHTML(
