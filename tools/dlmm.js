@@ -1516,17 +1516,18 @@ export async function partialClosePosition({ position_address, pct, reason }) {
   position_address = normalizeMint(position_address);
   const cfg = config.management.partialExit;
 
-  if (process.env.DRY_RUN === "true") {
-    return { dry_run: true, would_partial_close: position_address, pct, message: "DRY RUN — no transaction sent" };
-  }
-
-  // Clamp the requested percentage to the configured bounds — always leave a runner.
+  // Validate + clamp the requested percentage BEFORE any short-circuit so bad input is
+  // rejected even in DRY_RUN. Always leave a runner (clamp to configured min/max).
   const requested = Number(pct);
   if (!Number.isFinite(requested) || requested <= 0) {
     return { success: false, error: `Invalid partial pct: ${pct}` };
   }
   const clampedPct = Math.max(cfg.minPct, Math.min(cfg.maxPct, Math.round(requested)));
   const bps = Math.round(clampedPct * 100); // 50% → 5000 bps
+
+  if (process.env.DRY_RUN === "true") {
+    return { dry_run: true, would_partial_close: position_address, pct: clampedPct, message: "DRY RUN — no transaction sent" };
+  }
 
   const tracked = getTrackedPosition(position_address);
 

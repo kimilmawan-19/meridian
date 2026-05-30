@@ -279,16 +279,14 @@ function derivLesson(perf) {
   let rule = "";
 
   if (outcome === "good" || outcome === "bad") {
+    // Strong OOR-avoid signal takes precedence over everything.
     if (perf.range_efficiency < 30 && outcome === "bad") {
       rule = `AVOID: ${perf.pool_name}-type pools (volatility=${perf.volatility}, bin_step=${perf.bin_step}) with strategy="${perf.strategy}" — went OOR ${100 - perf.range_efficiency}% of the time. Consider wider bin_range or bid_ask strategy.`;
       tags.push("oor", perf.strategy, `volatility_${Math.round(perf.volatility)}`);
-    } else if (perf.range_efficiency > 80 && outcome === "good") {
-      rule = `PREFER: ${perf.pool_name}-type pools (volatility=${perf.volatility}, bin_step=${perf.bin_step}) with strategy="${perf.strategy}" — ${perf.range_efficiency}% in-range efficiency, PnL +${perf.pnl_pct}%.`;
-      tags.push("efficient", perf.strategy);
-    } else if (outcome === "bad" && perf.close_reason?.includes("volume")) {
-      rule = `AVOID: Pools with fee_tvl_ratio=${perf.fee_tvl_ratio} that showed volume collapse — fees evaporated quickly. Minimum sustained volume check needed before deploying.`;
-      tags.push("volume_collapse");
-    // TP veto burned: LLM held the trailing TP — was it a good or bad call?
+    // Exit-mechanism lessons (veto / partial / TA) are more specific and actionable than
+    // generic pool-quality lessons, so they are evaluated before PREFER/volume branches —
+    // otherwise a high-efficiency winner would always be labelled PREFER and the exit
+    // signal would never be learned.
     } else if ((perf.tp_veto_count ?? 0) >= 2 && outcome === "bad") {
       rule = `AVOID: Holding trailing TP (${perf.tp_veto_count} vetos) on ${perf.pool_name}-type pools hurt — position closed at ${perf.pnl_pct}% after giving back from peak ${perf.peak_pnl_pct ?? "?"}%. When trailing TP fires, bias toward taking profit.`;
       tags.push("tp_veto_bad");
@@ -309,6 +307,13 @@ function derivLesson(perf) {
     } else if (perf.ta_exit_triggered && outcome === "bad") {
       rule = `AVOID: RSI overbought exit on ${perf.pool_name} fired too early — closed at ${perf.pnl_pct}%, peak was only ${perf.peak_pnl_pct ?? "?"}%. TA exit may have a false-positive issue on this type of pool.`;
       tags.push("ta_exit", "failed");
+    // Generic pool-quality lessons (lower priority than the exit-mechanism signals above).
+    } else if (perf.range_efficiency > 80 && outcome === "good") {
+      rule = `PREFER: ${perf.pool_name}-type pools (volatility=${perf.volatility}, bin_step=${perf.bin_step}) with strategy="${perf.strategy}" — ${perf.range_efficiency}% in-range efficiency, PnL +${perf.pnl_pct}%.`;
+      tags.push("efficient", perf.strategy);
+    } else if (outcome === "bad" && perf.close_reason?.includes("volume")) {
+      rule = `AVOID: Pools with fee_tvl_ratio=${perf.fee_tvl_ratio} that showed volume collapse — fees evaporated quickly. Minimum sustained volume check needed before deploying.`;
+      tags.push("volume_collapse");
     } else if (outcome === "good") {
       rule = `WORKED: ${context} → PnL +${perf.pnl_pct}%, range efficiency ${perf.range_efficiency}%.`;
       tags.push("worked");
