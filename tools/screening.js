@@ -649,6 +649,37 @@ export async function getTopCandidates({ limit = 10 } = {}) {
       return true;
     }));
 
+    // Bundle concentration filter — high bundler % = coordinated supply control, dump risk.
+    // Fail-open when OKX data unavailable (bundle_pct null) so API outages don't block all candidates.
+    const maxBundle = config.screening.maxBundlePct;
+    if (maxBundle != null) {
+      const beforeBundle = eligible.length;
+      eligible.splice(0, eligible.length, ...eligible.filter((p) => {
+        if (p.bundle_pct == null) return true;
+        if (p.bundle_pct > maxBundle) {
+          log("screening", `Bundle filter: dropped ${p.name} — bundle_pct ${p.bundle_pct}% > ${maxBundle}%`);
+          pushFilteredReason(filteredOut, p, `bundle ${p.bundle_pct}% > max ${maxBundle}%`);
+          return false;
+        }
+        return true;
+      }));
+      if (eligible.length < beforeBundle) log("screening", `Bundle filter removed ${beforeBundle - eligible.length} pool(s)`);
+    }
+
+    // Rugpull-without-smart-money filter — OKX rugpull flag with no smart wallet activity
+    // means no upside catalyst to offset the risk. Smart wallets present = override allowed.
+    // Fail-open when OKX data unavailable.
+    const beforeRugpull = eligible.length;
+    eligible.splice(0, eligible.length, ...eligible.filter((p) => {
+      if (p.is_rugpull && !p.smart_money_buy) {
+        log("screening", `Risk filter: dropped ${p.name} — rugpull flag with no smart wallet activity`);
+        pushFilteredReason(filteredOut, p, "rugpull flag, no smart money");
+        return false;
+      }
+      return true;
+    }));
+    if (eligible.length < beforeRugpull) log("screening", `Rugpull filter removed ${beforeRugpull - eligible.length} pool(s)`);
+
     // ATH filter — drop pools where price is too close to ATH
     const athFilter = config.screening.athFilterPct;
     if (athFilter != null) {
