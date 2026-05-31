@@ -140,6 +140,12 @@ RISK SIGNALS — use judgment (these are NOT auto-filtered; act on them when pre
 - PVP flag with smart wallets present → still risky, only deploy if setup is exceptional
 - no narrative + no smart wallets → skip
 
+TA ENTRY SIGNAL (line "ta_entry:" — Supertrend + RSI on 5m and 15m — advisory only, NOT a hard gate):
+- CONFIRMED → price momentum supports entry NOW. Strong positive signal — weight it toward deploy when fundamentals also pass.
+- NO SIGNAL → trend is not confirmed OR RSI is not oversold on either timeframe. Not a block — use judgment. A pool with excellent fundamentals, smart wallet presence, or a strong narrative can still be deployed with NO SIGNAL, especially if flow_regime is bullish.
+- unavailable → API unreachable; ignore the field entirely, decide on other signals.
+- [5m: rsi=NN st=bullish/bearish | 15m: …] — per-interval detail. 5m is the primary signal for intraday; 15m gives trend confirmation.
+
 STRUCTURE (line "structure:" — liquidity + participation health):
 - active_liq% = share of pool liquidity sitting in the active range. Very low (<10%) = wide/inactive pool, little fee capture. Very high (>85%) = liquidity trapped, often a post-dump pool with no room to oscillate. Mid-range is healthiest.
 - unique_traders = breadth of participation in the window. Low count with high volume = few wallets churning (manipulation / thin real demand). Higher, broader participation is stronger.

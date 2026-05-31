@@ -831,11 +831,19 @@ export async function runScreeningCycle({ silent = false } = {}) {
     const allCandidates = [];
     for (const pool of candidates) {
       const mint = pool.base?.mint;
-      const [smartWallets, narrative, tokenInfo, screenMd] = await Promise.allSettled([
+      const [smartWallets, narrative, tokenInfo, screenMd, taEntry] = await Promise.allSettled([
         checkSmartWalletsOnPool({ pool_address: pool.pool }),
         mint ? getTokenNarrative({ mint }) : Promise.resolve(null),
         mint ? getTokenInfo({ query: mint }) : Promise.resolve(null),
         fetchPoolMarketData(pool.pool),
+        mint ? confirmIndicatorPreset({
+          mint,
+          side: "entry",
+          preset: "supertrend_or_rsi",
+          intervals: ["5_MINUTE", "15_MINUTE"],
+          rsiLength: 2,
+          skipEnabledCheck: true,
+        }) : Promise.resolve(null),
       ]);
       allCandidates.push({
         pool,
@@ -843,6 +851,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
         n: narrative.status === "fulfilled" ? narrative.value : null,
         ti: tokenInfo.status === "fulfilled" ? tokenInfo.value?.results?.[0] : null,
         md: screenMd.status === "fulfilled" ? screenMd.value : null,
+        ta: taEntry.status === "fulfilled" ? taEntry.value : null,
         mem: recallForPool(pool.pool),
       });
       await new Promise(r => setTimeout(r, 150)); // avoid 429s
@@ -1004,7 +1013,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
     );
 
     // Build compact candidate blocks
-    const candidateBlocks = passing.map(({ pool, sw, n, ti, md, mem }, i) => {
+    const candidateBlocks = passing.map(({ pool, sw, n, ti, md, ta, mem }, i) => {
       const botPct = ti?.audit?.bot_holders_pct ?? "?";
       const top10Pct = ti?.audit?.top_holders_pct ?? "?";
       const feesSol = ti?.global_fees_sol ?? "?";
@@ -1088,6 +1097,23 @@ export async function runScreeningCycle({ silent = false } = {}) {
         ? `  flow_regime: ${flowParts.join(", ")} → ${regimeConsensus}`
         : null;
 
+      // TA entry signal — supertrend_or_rsi on 5m+15m, always fetched, always advisory
+      let taEntryLine = null;
+      if (ta && !ta.skipped) {
+        const perInterval = (ta.intervals ?? [])
+          .filter(r => r.ok && r.signal)
+          .map(r => {
+            const s = r.signal;
+            const rsiStr = s.rsi != null ? `rsi=${s.rsi.toFixed(0)}` : null;
+            const stStr = s.supertrendDirection ? `st=${s.supertrendDirection}` : null;
+            return `${r.interval.replace("_MINUTE", "m")}: ${[rsiStr, stStr].filter(Boolean).join(" ")}`;
+          }).join(" | ");
+        const verdict = ta.confirmed ? "CONFIRMED" : "NO SIGNAL";
+        taEntryLine = `  ta_entry: ${verdict} — ${ta.reason}${perInterval ? ` [${perInterval}]` : ""}`;
+      } else if (ta?.skipped) {
+        taEntryLine = `  ta_entry: unavailable (API unreachable)`;
+      }
+
       const block = [
         `POOL: ${pool.name} (${pool.pool})`,
         `  metrics: bin_step=${pool.bin_step}, fee_pct=${pool.fee_pct}%, fee_tvl=${pool.fee_active_tvl_ratio}, vol=$${pool.volume_window}, tvl=$${pool.tvl ?? pool.active_tvl}, volatility_${pool.volatility_timeframe || "30m"}=${pool.volatility}, mcap=$${pool.mcap}, organic=${pool.organic_score}${pool.token_age_hours != null ? `, age=${pool.token_age_hours}h` : ""}`,
@@ -1095,6 +1121,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
         (pool.active_pct != null || pool.unique_traders != null) ? `  structure:${pool.active_pct != null ? ` active_liq=${pool.active_pct}%` : ""}${pool.unique_traders != null ? ` unique_traders=${pool.unique_traders}` : ""}`.trimEnd() : null,
         pvpLine,
         flowRegimeLine,
+        taEntryLine,
         okxParts ? `  okx: ${okxParts}` : okxUnavailable ? `  okx: unavailable` : null,
         okxTags ? `  tags: ${okxTags}` : null,
         pool.price_vs_ath_pct != null ? `  ath: price_vs_ath=${pool.price_vs_ath_pct}%${pool.top_cluster_trend ? `, top_cluster=${pool.top_cluster_trend}` : ""}` : null,
