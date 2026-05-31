@@ -109,6 +109,7 @@ let _cronTasks = [];
 let _managementBusy = false; // prevents overlapping management cycles
 let _screeningBusy = false;  // prevents overlapping screening cycles
 let _screeningLastTriggered = 0; // epoch ms — prevents management from spamming screening
+let _noDeployStreak = 0; // consecutive screening cycles that ended without a deploy — drives backoff
 let _pollTriggeredAt = 0; // epoch ms — cooldown for poller-triggered management
 const _peakConfirmTimers = new Map();
 const _trailingDropConfirmTimers = new Map();
@@ -230,6 +231,19 @@ function stopCronJobs() {
   _cronTasks = [];
 }
 
+// Effective screening cadence (ms) while the wallet has free capacity (positions < maxPositions).
+// Normally the fast screeningIntervalNoPositionMin; after screeningNoDeployBackoffCount consecutive
+// no-deploy cycles it backs off to the slower screeningIntervalMin until the next successful deploy.
+function isScreeningBackedOff() {
+  return _noDeployStreak >= (config.schedule.screeningNoDeployBackoffCount ?? 2);
+}
+function effectiveScreeningIntervalMs() {
+  const mins = isScreeningBackedOff()
+    ? config.schedule.screeningIntervalMin
+    : config.schedule.screeningIntervalNoPositionMin;
+  return mins * 60 * 1000;
+}
+
 export async function runManagementCycle({ silent = false } = {}) {
   if (_managementBusy) return null;
   _managementBusy = true;
@@ -238,7 +252,6 @@ export async function runManagementCycle({ silent = false } = {}) {
   let mgmtReport = null;
   let positions = [];
   let liveMessage = null;
-  const screeningCooldownMs = 5 * 60 * 1000;
   const emergencyExits = [];
 
   try {
@@ -249,10 +262,11 @@ export async function runManagementCycle({ silent = false } = {}) {
     positions = livePositions?.positions || [];
 
     if (positions.length === 0) {
-      const noPosCooldownMs = config.schedule.screeningIntervalNoPositionMin * 60 * 1000;
+      const noPosCooldownMs = effectiveScreeningIntervalMs();
       const msSinceLastScreen = Date.now() - _screeningLastTriggered;
       if (msSinceLastScreen >= noPosCooldownMs) {
-        log("cron", "No open positions — triggering screening cycle");
+        const tag = isScreeningBackedOff() ? " (no-deploy backoff)" : "";
+        log("cron", `No open positions — triggering screening cycle${tag}`);
         mgmtReport = "No open positions. Triggering screening cycle.";
         runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
       } else {
@@ -688,8 +702,9 @@ After executing, write a brief one-line result per position.
         log("state", `Trailing TP held by LLM for ${addr.slice(0, 8)} — veto ${n}/${config.management.maxTpVetos ?? 3} (peak ${act.peak.toFixed(1)}%)`);
       }
     }
-    if (afterCount < config.risk.maxPositions && Date.now() - _screeningLastTriggered > screeningCooldownMs) {
-      log("cron", `Post-management: ${afterCount}/${config.risk.maxPositions} positions — triggering screening`);
+    if (afterCount < config.risk.maxPositions && Date.now() - _screeningLastTriggered > effectiveScreeningIntervalMs()) {
+      const tag = isScreeningBackedOff() ? " (no-deploy backoff)" : "";
+      log("cron", `Post-management: ${afterCount}/${config.risk.maxPositions} positions — triggering screening${tag}`);
       runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
     }
   } catch (error) {
@@ -1194,20 +1209,29 @@ IMPORTANT:
       },
     });
     screenReport = content;
-    if (/⛔\s*NO DEPLOY/i.test(content)) {
+    if (deploySucceeded) {
+      // A fresh deploy means opportunities exist again — restore the fast screening cadence.
+      _noDeployStreak = 0;
+    } else if (/⛔\s*NO DEPLOY/i.test(content)) {
+      _noDeployStreak++;
       appendDecision({
         type: "no_deploy",
         actor: "SCREENER",
         summary: "LLM chose no deploy",
         reason: stripThink(content).slice(0, 500),
       });
-    } else if (!deploySucceeded) {
+    } else {
+      _noDeployStreak++;
       appendDecision({
         type: "no_deploy",
         actor: "SCREENER",
         summary: deployAttempted ? "Deploy attempt did not succeed" : "No successful deploy in screening cycle",
         reason: stripThink(content).slice(0, 500),
       });
+    }
+    if (!deploySucceeded) {
+      const backoffCount = config.schedule.screeningNoDeployBackoffCount ?? 2;
+      log("cron", `Screener no-deploy streak: ${_noDeployStreak}/${backoffCount}${isScreeningBackedOff() ? " — backed off to screeningIntervalMin" : ""}`);
     }
   } catch (error) {
     log("cron_error", `Screening cycle failed: ${error.message}`);

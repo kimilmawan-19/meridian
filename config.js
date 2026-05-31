@@ -233,7 +233,8 @@ export const config = {
   schedule: {
     managementIntervalMin:            u.managementIntervalMin            ?? 10,
     screeningIntervalMin:             u.screeningIntervalMin             ?? 30,
-    screeningIntervalNoPositionMin:   u.screeningIntervalNoPositionMin   ?? 10, // faster screening when wallet is empty
+    screeningIntervalNoPositionMin:   u.screeningIntervalNoPositionMin   ?? 10, // faster screening cadence while below maxPositions (capacity free)
+    screeningNoDeployBackoffCount:    u.screeningNoDeployBackoffCount    ?? 2,  // consecutive no-deploy screens before backing off to screeningIntervalMin
     healthCheckIntervalMin:           u.healthCheckIntervalMin           ?? 60,
   },
 

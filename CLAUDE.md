@@ -95,6 +95,8 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 | maxAgeExtensions | management | 3 |
 | managementIntervalMin | schedule | 10 |
 | screeningIntervalMin | schedule | 30 |
+| screeningIntervalNoPositionMin | schedule | 10 |
+| screeningNoDeployBackoffCount | schedule | 2 |
 | managementModel / screeningModel / generalModel | llm | openrouter/healer-alpha |
 
 **`computeDeployAmount(walletSol)`** — scales position size with wallet balance (compounding). Formula: `clamp(deployable × positionSizePct, floor=deployAmountSol, ceil=maxDeployAmount)`.
@@ -158,6 +160,12 @@ Progress bar format: `[████████░░░░░░░░░░░
 ## Race Condition: Double Deploy
 
 `_screeningLastTriggered` in index.js prevents concurrent screener invocations. Management cycle sets this before triggering screener. Also, `deploy_position` safety check uses `force: true` on `getMyPositions()` for a fresh count.
+
+---
+
+## Capacity-Aware Screening Cadence (index.js)
+
+Screening runs faster while the wallet has **free capacity** (`positions < maxPositions`), not just when empty. `effectiveScreeningIntervalMs()` returns `screeningIntervalNoPositionMin` (fast, default 10m) normally. After `screeningNoDeployBackoffCount` (default 2) consecutive screening cycles end with **no deploy** (LLM "⛔ NO DEPLOY" or no successful `deploy_position`), it backs off to `screeningIntervalMin` (default 30m). `_noDeployStreak` increments on each no-deploy cycle and resets to 0 on a successful deploy (`isScreeningBackedOff()` gates the cadence). Applied in both the 0-position branch and the post-management trigger of `runManagementCycle`.
 
 ---
 
