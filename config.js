@@ -127,6 +127,16 @@ export const config = {
     minFeePerTvl24h:       u.minFeePerTvl24h       ?? 7,
     minAgeBeforeYieldCheck: u.minAgeBeforeYieldCheck ?? 60, // minutes before low yield can trigger close
     minAgeBeforeStopLoss:  u.minAgeBeforeStopLoss  ?? 15, // minutes before stop loss can fire
+    // Rule 6 max-age: soft cap rather than a hard close. Once a position is older than
+    // maxPositionAgeMinutes it is closed ONLY if it has stopped earning. While PnL is still
+    // drifting up (or unclaimed fees are still accruing >= feeGrowthMinSol over the lookback
+    // window) the close is deferred, up to maxAgeExtensions grace blocks of ageExtensionMinutes
+    // each (hard ceiling = maxPositionAgeMinutes + maxAgeExtensions * ageExtensionMinutes).
+    maxPositionAgeMinutes:    u.maxPositionAgeMinutes    ?? 2880, // soft cap (48h default)
+    feeGrowthLookbackMinutes: u.feeGrowthLookbackMinutes ?? 20,   // window to measure "still earning"
+    feeGrowthMinSol:          u.feeGrowthMinSol          ?? 0.01, // min fee accrual over window to count as earning
+    ageExtensionMinutes:      u.ageExtensionMinutes      ?? 45,   // length of one grace block
+    maxAgeExtensions:         u.maxAgeExtensions          ?? 3,    // max grace blocks before hard close
     // Entry-grace zone: Rule 9 is suppressed while price is still in the SOL-rich part of range.
     // curveEntryGraceDepthPct: grace while depth < 35% (curve SOL mostly near top, still buying)
     // bidAskEntryGraceDepthPct: grace while depth < 80% (bid_ask SOL heavy at bottom, accumulating)

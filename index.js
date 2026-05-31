@@ -30,7 +30,7 @@ import {
 import { generateBriefing } from "./briefing.js";
 import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop, batchUpdateMarketData, batchUpdateLiveVolatility, getOorDirection, wasRecentlyOorAbove, updateR9GraceZone, effectiveStopLossPct, recordTpVeto, resetTpVeto, markTaExitTriggered } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
-import { recordPositionSnapshot, recallForPool, addPoolNote, addVolumeSnapshot, getVolumeWindow } from "./pool-memory.js";
+import { recordPositionSnapshot, recallForPool, addPoolNote, addVolumeSnapshot, getVolumeWindow, getSnapshotWindow } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
 import { getTokenNarrative, getTokenInfo } from "./tools/token.js";
 import { confirmIndicatorPreset } from "./tools/chart-indicators.js";
@@ -263,6 +263,10 @@ export async function runManagementCycle({ silent = false } = {}) {
       return mgmtReport;
     }
 
+    // SOL price for SOL-denominated thresholds (Rule 6 fee-growth grace). Best-effort: a null
+    // price simply makes the fee-accrual signal fall back to "any positive accrual counts".
+    const solPriceUsd = (await getWalletBalances().catch(() => null))?.sol_price ?? null;
+
     // Snapshot + load pool memory
     const positionData = positions.map((p) => {
       recordPositionSnapshot(p.pool, p);
@@ -472,7 +476,7 @@ export async function runManagementCycle({ silent = false } = {}) {
 
       const streakWindowMin = config.emergencyExits.sellPressureStreak?.windowMin ?? 30;
       const volumeWindow = getVolumeWindow(p.pool, streakWindowMin);
-      const closeRule = getDeterministicCloseRule(p, config.management, p._marketData, volumeWindow);
+      const closeRule = getDeterministicCloseRule(p, config.management, p._marketData, volumeWindow, solPriceUsd);
       if (closeRule) {
         actionMap.set(p.position, closeRule);
         if (closeRule.rule === 7 || closeRule.rule === 8) {
@@ -1445,7 +1449,37 @@ function flowConsensus(regimes) {
   return "MIXED";
 }
 
-function getDeterministicCloseRule(position, managementConfig, marketData = null, volumeWindow = []) {
+/**
+ * Rule 6 grace check: is an over-age position still actively earning?
+ * Reads the last `lookbackMin` of position snapshots and treats the position as
+ * "earning" when PnL is still drifting up OR unclaimed fees are still accruing past
+ * a SOL-denominated floor. A claim resets unclaimed fees to ~0, so a negative fee
+ * delta is ignored and the PnL-drift signal carries the decision. Returns false when
+ * there is too little snapshot history to judge — an over-age position must PROVE it
+ * is still working to earn a grace extension, otherwise it closes.
+ */
+function isOverageStillEarning(position, lookbackMin, minGrowthSol, solPriceUsd) {
+  const snaps = getSnapshotWindow(position.pool, lookbackMin);
+  if (snaps.length < 2) return false;
+  const earliest = snaps[0];
+  const latest = snaps[snaps.length - 1];
+
+  if (latest.pnl_pct != null && earliest.pnl_pct != null && (latest.pnl_pct - earliest.pnl_pct) > 0) {
+    return true;
+  }
+
+  if (latest.unclaimed_fees_usd != null && earliest.unclaimed_fees_usd != null) {
+    const feeDeltaUsd = latest.unclaimed_fees_usd - earliest.unclaimed_fees_usd;
+    if (feeDeltaUsd > 0) {
+      const minGrowthUsd = solPriceUsd != null && solPriceUsd > 0 ? minGrowthSol * solPriceUsd : 0;
+      if (feeDeltaUsd >= minGrowthUsd) return true;
+    }
+  }
+
+  return false;
+}
+
+function getDeterministicCloseRule(position, managementConfig, marketData = null, volumeWindow = [], solPriceUsd = null) {
   const tracked = getTrackedPosition(position.position);
   const pnlSuspect = (() => {
     if (position.pnl_pct == null) return false;
@@ -1553,8 +1587,27 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
     }
   }
   if (!pnlSuspect && (position.age_minutes ?? 0) >= (managementConfig.maxPositionAgeMinutes ?? 2880)) {
-    const ageHours = Math.round((position.age_minutes ?? 0) / 60);
-    return { action: "CLOSE", rule: 6, reason: `max age reached (${ageHours}h)` };
+    const ageMin = position.age_minutes ?? 0;
+    const ageHours = Math.round(ageMin / 60);
+    const maxAge = managementConfig.maxPositionAgeMinutes ?? 2880;
+    const maxExt = managementConfig.maxAgeExtensions ?? 3;
+    const extMin = managementConfig.ageExtensionMinutes ?? 45;
+    const ceilingMin = maxAge + maxExt * extMin;
+    // Hard ceiling: once every grace block is spent, close unconditionally.
+    if (ageMin >= ceilingMin) {
+      return { action: "CLOSE", rule: 6, reason: `max age reached (${ageHours}h, grace exhausted)` };
+    }
+    // Soft cap: defer the close while the position is still actively earning. Re-checked every
+    // cycle, so it closes the moment earning stops rather than waiting out the full grace block.
+    const lookbackMin = managementConfig.feeGrowthLookbackMinutes ?? 20;
+    const minGrowthSol = managementConfig.feeGrowthMinSol ?? 0.01;
+    if (isOverageStillEarning(position, lookbackMin, minGrowthSol, solPriceUsd)) {
+      const extNum = Math.floor((ageMin - maxAge) / extMin) + 1;
+      log("market_data", `Rule 6 deferred for ${position.pair}: past max age (${ageHours}h) but still earning — grace ${extNum}/${maxExt}`);
+      // fall through: no close this cycle; emergency rules below still apply.
+    } else {
+      return { action: "CLOSE", rule: 6, reason: `max age reached (${ageHours}h, no longer earning)` };
+    }
   }
 
   // Rule 7: volume collapse — pool liquidity drying up with dominant sell pressure

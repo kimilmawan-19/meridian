@@ -411,6 +411,21 @@ export function getVolumeWindow(poolAddress, windowMin = 30) {
 }
 
 /**
+ * Get position snapshots within the last N minutes for a pool.
+ * Returns ordered array of { ts, pnl_pct, unclaimed_fees_usd, in_range, age_minutes, ... }.
+ * Used by the Rule 6 max-age grace check to judge whether an over-age position
+ * is still actively earning before closing it.
+ */
+export function getSnapshotWindow(poolAddress, windowMin = 30) {
+  if (!poolAddress) return [];
+  const db = load();
+  const entry = db[poolAddress];
+  if (!Array.isArray(entry?.snapshots)) return [];
+  const cutoff = Date.now() - windowMin * 60 * 1000;
+  return entry.snapshots.filter(s => new Date(s.ts).getTime() >= cutoff);
+}
+
+/**
  * Recall focused context for a specific pool — used before screening or management.
  * Returns a short formatted string ready for injection into the agent goal.
  */

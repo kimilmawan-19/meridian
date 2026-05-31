@@ -88,6 +88,11 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 | positionSizePct | management | 0.35 |
 | minSolToOpen | management | 0.55 |
 | outOfRangeWaitMinutes | management | 30 |
+| maxPositionAgeMinutes | management | 2880 |
+| feeGrowthLookbackMinutes | management | 20 |
+| feeGrowthMinSol | management | 0.01 |
+| ageExtensionMinutes | management | 45 |
+| maxAgeExtensions | management | 3 |
 | managementIntervalMin | schedule | 10 |
 | screeningIntervalMin | schedule | 30 |
 | managementModel / screeningModel / generalModel | llm | openrouter/healer-alpha |
@@ -227,3 +232,4 @@ Agent Meridian HiveMind sync is handled by `hivemind.js`. It uses built-in Agent
 
 - `lessons.js evolveThresholds()` evolves `minFeeActiveTvlRatio` and `minOrganic`. Fixed: `maxVolatility` block removed (key never existed), `minFeeTvlRatio` renamed to `minFeeActiveTvlRatio`.
 - `get_wallet_positions` tool (dlmm.js) is in definitions.js but not in MANAGER_TOOLS or SCREENER_TOOLS — only available in GENERAL role.
+- Rule 6 (max age, `index.js`) is a **soft cap with earning-grace**: past `maxPositionAgeMinutes` the position closes only if it has stopped earning. While PnL still drifts up (or unclaimed fees accrue ≥ `feeGrowthMinSol` over `feeGrowthLookbackMinutes`), the close is deferred up to `maxAgeExtensions` blocks of `ageExtensionMinutes` (hard ceiling = `maxPositionAgeMinutes + maxAgeExtensions * ageExtensionMinutes`). Earning is judged from pool-memory position snapshots via `getSnapshotWindow()`. Fixed: `maxPositionAgeMinutes` is now mapped in `config.js` management block (previously absent → writes to user-config.json silently had no effect; only the hardcoded `?? 2880` fallback applied).
