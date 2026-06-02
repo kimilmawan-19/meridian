@@ -111,6 +111,7 @@ let _screeningBusy = false;  // prevents overlapping screening cycles
 let _screeningLastTriggered = 0; // epoch ms — prevents management from spamming screening
 let _noDeployStreak = 0; // consecutive screening cycles that ended without a deploy — drives backoff
 let _pollTriggeredAt = 0; // epoch ms — cooldown for poller-triggered management
+let _cachedSolPrice = null; // updated each management cycle, reused by PnL poll for Rule 6 grace check
 const _peakConfirmTimers = new Map();
 const _trailingDropConfirmTimers = new Map();
 const TRAILING_PEAK_CONFIRM_DELAY_MS = 15_000;
@@ -280,6 +281,7 @@ export async function runManagementCycle({ silent = false } = {}) {
     // SOL price for SOL-denominated thresholds (Rule 6 fee-growth grace). Best-effort: a null
     // price simply makes the fee-accrual signal fall back to "any positive accrual counts".
     const solPriceUsd = (await getWalletBalances().catch(() => null))?.sol_price ?? null;
+    if (solPriceUsd != null) _cachedSolPrice = solPriceUsd;
 
     // Snapshot + load pool memory
     const positionData = positions.map((p) => {
@@ -1356,7 +1358,7 @@ Summarize the current portfolio health, total fees earned, and performance of al
           addVolumeSnapshot(p.pool, { vol_5m: pollMd.volume_5m, buys_5m: pollMd.txn_buys_5m ?? 0, sells_5m: pollMd.txn_sells_5m ?? 0 });
         }
         const pollVolumeWindow = getVolumeWindow(p.pool, config.emergencyExits.sellPressureStreak?.windowMin ?? 30);
-        const closeRule = getDeterministicCloseRule(p, config.management, pollMd, pollVolumeWindow);
+        const closeRule = getDeterministicCloseRule(p, config.management, pollMd, pollVolumeWindow, _cachedSolPrice);
         if (closeRule) {
           const isEmergency = closeRule.rule === 7 || closeRule.rule === 8;
           if (isEmergency) {
