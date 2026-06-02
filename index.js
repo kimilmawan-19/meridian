@@ -1509,16 +1509,34 @@ function flowConsensus(regimes) {
  * there is too little snapshot history to judge — an over-age position must PROVE it
  * is still working to earn a grace extension, otherwise it closes.
  */
-function isOverageStillEarning(position, lookbackMin, minGrowthSol, solPriceUsd) {
+function isOverageStillEarning(position, lookbackMin, minGrowthSol, solPriceUsd, managementConfig = {}) {
+  // Signal 1: current yield — the clearest indicator the pool is still actively earning fees.
+  // If fee_per_tvl_24h is above the same threshold used by Rule 5, the position is earning well.
+  const currentYield = position.fee_per_tvl_24h ?? null;
+  const yieldFloor = managementConfig.minFeePerTvl24h ?? 7;
+  if (currentYield != null && currentYield >= yieldFloor) {
+    return true;
+  }
+
+  // Signal 2: unclaimed fees absolute — if there is meaningful accrued value sitting in the
+  // position, close is premature regardless of the marginal rate this cycle.
+  const unclaimedUsd = position.unclaimed_fees_usd ?? null;
+  const minUnclaimedUsd = solPriceUsd != null && solPriceUsd > 0 ? (minGrowthSol * 3) * solPriceUsd : 0;
+  if (unclaimedUsd != null && minUnclaimedUsd > 0 && unclaimedUsd >= minUnclaimedUsd) {
+    return true;
+  }
+
   const snaps = getSnapshotWindow(position.pool, lookbackMin);
   if (snaps.length < 2) return false;
   const earliest = snaps[0];
   const latest = snaps[snaps.length - 1];
 
+  // Signal 3: PnL drift positive over the lookback window.
   if (latest.pnl_pct != null && earliest.pnl_pct != null && (latest.pnl_pct - earliest.pnl_pct) > 0) {
     return true;
   }
 
+  // Signal 4: unclaimed fees growing past the minimum threshold over the lookback window.
   if (latest.unclaimed_fees_usd != null && earliest.unclaimed_fees_usd != null) {
     const feeDeltaUsd = latest.unclaimed_fees_usd - earliest.unclaimed_fees_usd;
     if (feeDeltaUsd > 0) {
@@ -1652,7 +1670,7 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
     // cycle, so it closes the moment earning stops rather than waiting out the full grace block.
     const lookbackMin = managementConfig.feeGrowthLookbackMinutes ?? 20;
     const minGrowthSol = managementConfig.feeGrowthMinSol ?? 0.01;
-    if (isOverageStillEarning(position, lookbackMin, minGrowthSol, solPriceUsd)) {
+    if (isOverageStillEarning(position, lookbackMin, minGrowthSol, solPriceUsd, managementConfig)) {
       const extNum = Math.floor((ageMin - maxAge) / extMin) + 1;
       log("market_data", `Rule 6 deferred for ${position.pair}: past max age (${ageHours}h) but still earning — grace ${extNum}/${maxExt}`);
       // fall through: no close this cycle; emergency rules below still apply.
