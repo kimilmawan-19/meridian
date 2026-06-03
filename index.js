@@ -112,6 +112,8 @@ let _screeningLastTriggered = 0; // epoch ms — prevents management from spammi
 let _noDeployStreak = 0; // consecutive screening cycles that ended without a deploy — drives backoff
 let _pollTriggeredAt = 0; // epoch ms — cooldown for poller-triggered management
 let _cachedSolPrice = null; // updated each management cycle, reused by PnL poll for Rule 6 grace check
+let _cautionOrigFeeRatio = null; // saved before caution raise, restored in screening cycle finally
+let _cautionOrigOrganic  = null;
 const _peakConfirmTimers = new Map();
 const _trailingDropConfirmTimers = new Map();
 const TRAILING_PEAK_CONFIRM_DELAY_MS = 15_000;
@@ -823,9 +825,13 @@ export async function runScreeningCycle({ silent = false } = {}) {
         return "Screening skipped — market regime bearish.";
       }
       if (regime.regime === "caution") {
-        // Raise quality bar for this cycle only (in-memory, not persisted)
-        config.screening.minFeeActiveTvlRatio = +(config.screening.minFeeActiveTvlRatio * 1.4).toFixed(4);
-        config.screening.minOrganic = Math.min(85, config.screening.minOrganic + 10);
+        // Raise quality bar for this cycle only — save originals so they can be restored
+        // in the finally block. Without restore, repeated caution cycles compound the
+        // multiplier indefinitely (0.05 → 0.07 → 0.098 → ...) until no pool ever passes.
+        _cautionOrigFeeRatio = config.screening.minFeeActiveTvlRatio;
+        _cautionOrigOrganic  = config.screening.minOrganic;
+        config.screening.minFeeActiveTvlRatio = +(_cautionOrigFeeRatio * 1.4).toFixed(4);
+        config.screening.minOrganic = Math.min(85, _cautionOrigOrganic + 10);
         log("market_regime", `Caution regime — quality bar raised for this cycle (minFeeActiveTvlRatio=${config.screening.minFeeActiveTvlRatio} minOrganic=${config.screening.minOrganic})`);
       }
     }
@@ -1266,6 +1272,15 @@ IMPORTANT:
     log("cron_error", `Screening cycle failed: ${error.message}`);
     screenReport = `Screening cycle failed: ${error.message}`;
   } finally {
+    // Restore caution-raised thresholds so they don't compound across cycles
+    if (_cautionOrigFeeRatio != null) {
+      config.screening.minFeeActiveTvlRatio = _cautionOrigFeeRatio;
+      _cautionOrigFeeRatio = null;
+    }
+    if (_cautionOrigOrganic != null) {
+      config.screening.minOrganic = _cautionOrigOrganic;
+      _cautionOrigOrganic = null;
+    }
     _screeningBusy = false;
     if (!silent && telegramEnabled()) {
       if (screenReport) {
