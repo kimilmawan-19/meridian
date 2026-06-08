@@ -145,6 +145,7 @@ export const config = {
     bidAskEntryGraceDepthPct:  numericConfig(u.bidAskEntryGraceDepthPct)  ?? 80,
     entryGraceConfirmMinutes:  numericConfig(u.entryGraceConfirmMinutes)  ?? 15,
     breakEvenTriggerPct:   u.breakEvenTriggerPct   ?? 1,  // once peak PnL >= this, protect against going below 0%
+    breakEvenInRangeDeferMin: u.breakEvenInRangeDeferMin ?? 60, // max minutes to defer break-even while in-range (0 = no deferral)
     minSolToOpen:          u.minSolToOpen          ?? 0.55,
     deployAmountSol:       u.deployAmountSol       ?? 0.5,
     gasReserve:            u.gasReserve            ?? 0.2,
@@ -153,6 +154,7 @@ export const config = {
     trailingTakeProfit:    u.trailingTakeProfit    ?? true,
     trailingTriggerPct:    u.trailingTriggerPct    ?? 3,    // activate trailing at X% PnL
     trailingDropPct:       u.trailingDropPct       ?? 1.5,  // close when drops X% from peak
+    trailingGivebackDivisor: u.trailingGivebackDivisor ?? 3, // widened drop = peak / N; lower N = more tolerant
     // Stale-peak handling: a peak set long ago no longer reflects the current price regime.
     // Once the all-time peak is older than trailingStalePeakMinutes, widen the trailing drop
     // tolerance by trailingStalePeakDropMult so a settled position is not closed against a stale high.

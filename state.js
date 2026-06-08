@@ -684,17 +684,38 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
 
   // ── Break-even stop ───────────────────────────────────────────
   // Once peak was profitable enough, never let PnL fall back to 0% or below.
-  // Skip when in range: price oscillation while actively earning fees is expected —
-  // exiting on a temporary dip kills fee collection while the position is still healthy.
+  // While in-range, defer briefly — price oscillation during active fee earning is normal.
+  // Deferral is bounded: if PnL stays negative in-range for longer than breakEvenInRangeDeferMin
+  // (default 60m), break-even fires anyway. This prevents slow in-range bleeds (Magpie/SLAB pattern).
   if (!pnl_pct_suspicious && pos.break_even_active && currentPnlPct != null && currentPnlPct <= 0) {
     if (in_range === true) {
-      log("state", `Break-even deferred for ${position_address}: in-range, pnl=${currentPnlPct.toFixed(2)}% — fee collection active`);
+      if (!pos.break_even_in_range_since) {
+        pos.break_even_in_range_since = new Date().toISOString();
+        save(state);
+      }
+      const deferMin = mgmtConfig.breakEvenInRangeDeferMin ?? 60;
+      const elapsedMin = (Date.now() - new Date(pos.break_even_in_range_since).getTime()) / 60_000;
+      if (elapsedMin >= deferMin) {
+        return {
+          action: "BREAK_EVEN",
+          reason: `Break-even stop: peak was ${(pos.peak_pnl_pct ?? 0).toFixed(2)}%, now ${currentPnlPct.toFixed(2)}% (in-range grace expired: ${Math.round(elapsedMin)}m)`,
+        };
+      }
+      log("state", `Break-even deferred for ${position_address}: in-range, pnl=${currentPnlPct.toFixed(2)}%, deferral ${Math.round(elapsedMin)}/${deferMin}m`);
     } else {
+      if (pos.break_even_in_range_since) {
+        pos.break_even_in_range_since = null;
+        save(state);
+      }
       return {
         action: "BREAK_EVEN",
         reason: `Break-even stop: peak was ${(pos.peak_pnl_pct ?? 0).toFixed(2)}%, now ${currentPnlPct.toFixed(2)}%`,
       };
     }
+  } else if (pos.break_even_in_range_since && (currentPnlPct == null || currentPnlPct > 0)) {
+    // PnL recovered above 0 — reset the deferral timer
+    pos.break_even_in_range_since = null;
+    save(state);
   }
 
   // ── Stop loss ──────────────────────────────────────────────────
@@ -720,9 +741,10 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   // oscillation, not a signal to exit. Let the position continue accumulating fees.
   if (!pnl_pct_suspicious && pos.trailing_active && in_range !== true) {
     const dropFromPeak = pos.peak_pnl_pct - currentPnlPct;
-    // Widen drop tolerance proportionally at higher peaks: give back at most 1/3 of gains.
-    // trailingDropPct (or per-position override) acts as floor so low-peak positions keep their tight stop.
-    let effectiveDrop = Math.max(effTrailingDropFloor, pos.peak_pnl_pct / 3);
+    // Widen drop tolerance proportionally at higher peaks: give back at most 1/N of gains.
+    // trailingGivebackDivisor (default 3) controls N; trailingDropPct acts as floor.
+    const givebackDivisor = mgmtConfig.trailingGivebackDivisor ?? 3;
+    let effectiveDrop = Math.max(effTrailingDropFloor, pos.peak_pnl_pct / givebackDivisor);
     // Stale-peak widening: if the all-time peak was set long ago and price has since settled
     // lower, the trailing stop is measuring against a high that no longer reflects reality.
     // Widen tolerance so a stabilized position is not force-exited against an outdated peak.
