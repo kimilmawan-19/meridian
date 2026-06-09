@@ -163,7 +163,16 @@ export const config = {
     // ── Layer B: LLM-set per-position risk thresholds (clamped) ──
     allowLlmRiskParams:    u.allowLlmRiskParams     ?? true, // let SCREENER set per-position sl/trailing overrides
     stopLossFloorPct:      u.stopLossFloorPct       ?? -50,  // loosest (most negative) SL the LLM may set
-    stopLossTightestPct:   u.stopLossTightestPct    ?? -10,  // tightest (least negative) SL the LLM may set
+    stopLossTightestPct:   u.stopLossTightestPct    ?? -8,   // tightest (least negative) SL the LLM may set
+    // ── Auto-SL: code-injected volatility-adaptive stop-loss ──
+    // When the LLM doesn't set sl_pct, executor.js injects one based on pool volatility.
+    // Low-vol curve positions don't need -15% room; a -8% SL cuts losses before bleed.
+    autoSlEnabled:    u.autoSlEnabled    ?? true,
+    autoSlLowVolMax:  u.autoSlLowVolMax  ?? 2,   // vol <= this → low-vol tier
+    autoSlLowVolPct:  u.autoSlLowVolPct  ?? -8,  // SL for low-vol pools
+    autoSlMidVolMax:  u.autoSlMidVolMax  ?? 4,   // vol <= this → mid-vol tier
+    autoSlMidVolPct:  u.autoSlMidVolPct  ?? -12, // SL for mid-vol pools
+    // vol > autoSlMidVolMax → use global stopLossPct
     // ── Layer A: LLM veto on trailing take-profit (soft exit only) ──
     allowTpVeto:           u.allowTpVeto            ?? true, // let MANAGER hold a triggered trailing TP
     maxTpVetos:            u.maxTpVetos             ?? 3,    // max consecutive holds before force-close

@@ -622,6 +622,26 @@ export async function executeTool(name, args) {
     }
   }
 
+  // ─── Auto-inject volatility-adaptive SL ──────────────────────
+  // If the LLM didn't specify sl_pct for a deploy, compute one from volatility.
+  // Low-vol curve positions should never bleed to -15%; tighter stops catch slow in-range dumps.
+  if (name === "deploy_position" && args.sl_pct == null && config.management.autoSlEnabled !== false) {
+    const vol = Number(args.volatility ?? 0);
+    if (Number.isFinite(vol) && vol > 0) {
+      const mgmt = config.management;
+      const lowMax  = mgmt.autoSlLowVolMax  ?? 2;
+      const midMax  = mgmt.autoSlMidVolMax  ?? 4;
+      const floor   = mgmt.stopLossFloorPct   ?? -50;
+      const tightest = mgmt.stopLossTightestPct ?? -8;
+      let autoSl, tier;
+      if (vol <= lowMax)  { autoSl = mgmt.autoSlLowVolPct ?? -8;  tier = "low";  }
+      else if (vol <= midMax) { autoSl = mgmt.autoSlMidVolPct ?? -12; tier = "mid";  }
+      else                { autoSl = mgmt.stopLossPct ?? -15;       tier = "high"; }
+      args.sl_pct = Math.min(tightest, Math.max(floor, autoSl));
+      log("executor", `Auto-SL: vol=${vol} (${tier}-vol) → sl_pct=${args.sl_pct}%`);
+    }
+  }
+
   // ─── Execute ──────────────────────────────
   try {
     const result = await fn(args);
