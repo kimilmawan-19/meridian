@@ -737,9 +737,11 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   }
 
   // ── Trailing TP ────────────────────────────────────────────────
-  // Skip when in range: a PnL dip from peak while actively earning fees is normal price
-  // oscillation, not a signal to exit. Let the position continue accumulating fees.
-  if (!pnl_pct_suspicious && pos.trailing_active && in_range !== true) {
+  // While in-range, defer briefly — a temporary dip while actively earning fees is normal.
+  // Deferral is bounded: if the trailing trigger stays fired for longer than
+  // trailingInRangeDeferMin (default 90m), the TP fires anyway to lock in remaining gains.
+  // Timer resets when drop recovers or position goes OOR.
+  if (!pnl_pct_suspicious && pos.trailing_active) {
     const dropFromPeak = pos.peak_pnl_pct - currentPnlPct;
     // Widen drop tolerance proportionally at higher peaks: give back at most 1/N of gains.
     // trailingGivebackDivisor (default 3) controls N; trailingDropPct acts as floor.
@@ -758,15 +760,45 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
       }
     }
     if (dropFromPeak >= effectiveDrop) {
-      return {
-        action: "TRAILING_TP",
-        reason: `Trailing TP: peak ${pos.peak_pnl_pct.toFixed(2)}% → current ${currentPnlPct.toFixed(2)}% (dropped ${dropFromPeak.toFixed(2)}% >= ${effectiveDrop.toFixed(2)}%${stalePeak ? ", stale-peak widened" : ""})`,
-        needs_confirmation: true,
-        peak_pnl_pct: pos.peak_pnl_pct,
-        current_pnl_pct: currentPnlPct,
-        drop_from_peak_pct: dropFromPeak,
-        effective_drop_pct: effectiveDrop,
-      };
+      if (in_range === true) {
+        // Start deferral timer on first trigger while in-range
+        if (!pos.trailing_in_range_since) {
+          pos.trailing_in_range_since = new Date().toISOString();
+          save(state);
+        }
+        const deferMin = mgmtConfig.trailingInRangeDeferMin ?? 90;
+        const elapsedMin = (Date.now() - new Date(pos.trailing_in_range_since).getTime()) / 60_000;
+        if (elapsedMin >= deferMin) {
+          return {
+            action: "TRAILING_TP",
+            reason: `Trailing TP: peak ${pos.peak_pnl_pct.toFixed(2)}% → current ${currentPnlPct.toFixed(2)}% (dropped ${dropFromPeak.toFixed(2)}% >= ${effectiveDrop.toFixed(2)}%${stalePeak ? ", stale-peak widened" : ""}, in-range grace expired: ${Math.round(elapsedMin)}m)`,
+            needs_confirmation: true,
+            peak_pnl_pct: pos.peak_pnl_pct,
+            current_pnl_pct: currentPnlPct,
+            drop_from_peak_pct: dropFromPeak,
+            effective_drop_pct: effectiveDrop,
+          };
+        }
+        log("state", `Trailing TP deferred for ${position_address}: in-range, drop=${dropFromPeak.toFixed(2)}% >= ${effectiveDrop.toFixed(2)}%, deferral ${Math.round(elapsedMin)}/${deferMin}m`);
+      } else {
+        if (pos.trailing_in_range_since) {
+          pos.trailing_in_range_since = null;
+          save(state);
+        }
+        return {
+          action: "TRAILING_TP",
+          reason: `Trailing TP: peak ${pos.peak_pnl_pct.toFixed(2)}% → current ${currentPnlPct.toFixed(2)}% (dropped ${dropFromPeak.toFixed(2)}% >= ${effectiveDrop.toFixed(2)}%${stalePeak ? ", stale-peak widened" : ""})`,
+          needs_confirmation: true,
+          peak_pnl_pct: pos.peak_pnl_pct,
+          current_pnl_pct: currentPnlPct,
+          drop_from_peak_pct: dropFromPeak,
+          effective_drop_pct: effectiveDrop,
+        };
+      }
+    } else if (pos.trailing_in_range_since) {
+      // Drop recovered below threshold — reset deferral timer
+      pos.trailing_in_range_since = null;
+      save(state);
     }
   }
 

@@ -160,6 +160,7 @@ export const config = {
     // tolerance by trailingStalePeakDropMult so a settled position is not closed against a stale high.
     trailingStalePeakMinutes:  u.trailingStalePeakMinutes  ?? 90,
     trailingStalePeakDropMult: u.trailingStalePeakDropMult ?? 1.75,
+    trailingInRangeDeferMin:   u.trailingInRangeDeferMin   ?? 90, // max minutes to defer trailing TP while in-range
     // ── Layer B: LLM-set per-position risk thresholds (clamped) ──
     allowLlmRiskParams:    u.allowLlmRiskParams     ?? true, // let SCREENER set per-position sl/trailing overrides
     stopLossFloorPct:      u.stopLossFloorPct       ?? -50,  // loosest (most negative) SL the LLM may set
@@ -237,7 +238,7 @@ export const config = {
     maxBinsBelow: strategyMaxBinsBelow,
     defaultBinsBelow: strategyDefaultBinsBelow,
     bidAskMinVolatility: numericConfig(u.bidAskMinVolatility) ?? null, // deprecated: kept so old configs don't break
-    curveMaxVolatility: numericConfig(u.curveMaxVolatility) ?? numericConfig(u.bidAskMinVolatility) ?? 3, // vol <= this → curve (concentrated fee); above → bid_ask (dip accumulation)
+    curveMaxVolatility: numericConfig(u.curveMaxVolatility) ?? numericConfig(u.bidAskMinVolatility) ?? 3.5, // vol <= this → curve (concentrated fee); above → bid_ask (dip accumulation)
   },
 
   // ─── Scheduling ─────────────────────────
