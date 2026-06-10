@@ -308,6 +308,16 @@ function derivLesson(perf) {
       rule = `AVOID: RSI overbought exit on ${perf.pool_name} fired too early — closed at ${perf.pnl_pct}%, peak was only ${perf.peak_pnl_pct ?? "?"}%. TA exit may have a false-positive issue on this type of pool.`;
       tags.push("ta_exit", "failed");
     // Generic pool-quality lessons (lower priority than the exit-mechanism signals above).
+    // In-range dump: high range efficiency + bad outcome + SL/sell-pressure.
+    // This is a TOKEN quality signal, not a position design flaw. Label it explicitly
+    // so the LLM learns that high range-eff does NOT mean safe — token can dump within range.
+    } else if (
+      perf.range_efficiency > 70 &&
+      outcome === "bad" &&
+      /stop.?loss|sell.?pressure|break.?even/i.test(String(perf.close_reason || ""))
+    ) {
+      rule = `WARN: ${perf.pool_name} dumped IN-RANGE (${perf.range_efficiency}% range-eff) → PnL ${perf.pnl_pct}% due to ${perf.close_reason}. High in-range efficiency does NOT guarantee safety — token price fell within the bin range. strategy=${perf.strategy}, volatility=${perf.volatility}, bin_step=${perf.bin_step}.`;
+      tags.push("in_range_dump", "failed", perf.strategy);
     } else if (perf.range_efficiency > 80 && outcome === "good") {
       rule = `PREFER: ${perf.pool_name}-type pools (volatility=${perf.volatility}, bin_step=${perf.bin_step}) with strategy="${perf.strategy}" — ${perf.range_efficiency}% in-range efficiency, PnL +${perf.pnl_pct}%.`;
       tags.push("efficient", perf.strategy);
@@ -582,8 +592,11 @@ function loserEvidenceWeight(p) {
   if (/out of range|oor|volume|low yield/.test(reason)) w += 0.25;
   const eff = p.range_efficiency;
   if (isFiniteNum(eff)) {
-    if (eff <= 30) w += 0.20;
-    else if (eff <= 50) w += 0.10;
+    // High range-eff losers (token dumped IN range) are real, strong signals — not noise.
+    // Low range-eff losers are also real (OOR). Mid range-eff is ambiguous.
+    if (eff >= 70) w += 0.20;      // in-range dump: meaningful token-quality signal
+    else if (eff <= 30) w += 0.20; // OOR: position design signal
+    else if (eff <= 50) w += 0.10; // partial OOR: moderate signal
   }
   if (isFiniteNum(p.minutes_held) && p.minutes_held < 15) w -= 0.20; // wick/noise
   return clamp(w, 0, 1);

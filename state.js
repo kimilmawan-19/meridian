@@ -722,17 +722,26 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   const { age_minutes: slAgeMin } = positionData;
   const minAgeForStopLoss = mgmtConfig.minAgeBeforeStopLoss ?? 15;
   const effSL = effectiveStopLossPct(pos, mgmtConfig);
+  // Early-dump override: if loss already exceeds earlyDumpOverridePct (default -10%),
+  // bypass the age gate entirely. A fast or sustained dump in the first 15 minutes is
+  // real and should be cut — the age gate exists to avoid wick noise, not -10% bleeds.
+  const earlyDumpThreshold = mgmtConfig.earlyDumpOverridePct ?? -10;
+  const ageGatePassed = slAgeMin == null || slAgeMin >= minAgeForStopLoss;
+  const earlyDumpOverride = !ageGatePassed &&
+    currentPnlPct != null &&
+    currentPnlPct <= earlyDumpThreshold;
   if (
     !pnl_pct_suspicious &&
     currentPnlPct != null &&
     effSL != null &&
     currentPnlPct <= effSL &&
-    (slAgeMin == null || slAgeMin >= minAgeForStopLoss)
+    (ageGatePassed || earlyDumpOverride)
   ) {
     const slTag = pos.sl_pct_override != null && mgmtConfig.allowLlmRiskParams ? " [per-position]" : "";
+    const earlyTag = earlyDumpOverride ? " [early-dump override]" : "";
     return {
       action: "STOP_LOSS",
-      reason: `Stop loss: PnL ${currentPnlPct.toFixed(2)}% <= ${effSL}%${slTag} (age: ${slAgeMin ?? "?"}m)`,
+      reason: `Stop loss: PnL ${currentPnlPct.toFixed(2)}% <= ${effSL}%${slTag}${earlyTag} (age: ${slAgeMin ?? "?"}m)`,
     };
   }
 

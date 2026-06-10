@@ -127,6 +127,7 @@ export const config = {
     minFeePerTvl24h:       u.minFeePerTvl24h       ?? 7,
     minAgeBeforeYieldCheck: u.minAgeBeforeYieldCheck ?? 60, // minutes before low yield can trigger close
     minAgeBeforeStopLoss:  u.minAgeBeforeStopLoss  ?? 15, // minutes before stop loss can fire
+    earlyDumpOverridePct:  u.earlyDumpOverridePct  ?? -10, // bypass age gate when loss already this deep (early dump guard)
     // Rule 6 max-age: soft cap rather than a hard close. Once a position is older than
     // maxPositionAgeMinutes it is closed ONLY if it has stopped earning. While PnL is still
     // drifting up (or unclaimed fees are still accruing >= feeGrowthMinSol over the lookback
