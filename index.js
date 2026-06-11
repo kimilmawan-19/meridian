@@ -828,8 +828,10 @@ export async function runScreeningCycle({ silent = false } = {}) {
         log("market_regime", `Screening skipped — bearish regime (score=${regime.score})`);
         appendDecision({ type: "skip", actor: "SCREENER", summary: "Market bearish — screening paused", reason: msg });
         if (config.marketRegime.notifyOnSkip && telegramEnabled()) await sendHTML(msg).catch(() => {});
-        _screeningBusy = false;
-        return "Screening skipped — market regime bearish.";
+        // Set screenReport so the finally block finalizes the live message — otherwise
+        // hasActiveLiveMessage() stays true and suppresses all later close/deploy notifications.
+        screenReport = "Screening skipped — market regime bearish.";
+        return screenReport;
       }
       if (regime.regime === "caution") {
         // Deployment throttle: cap concurrent positions below maxPositions to limit
@@ -844,8 +846,10 @@ export async function runScreeningCycle({ silent = false } = {}) {
           log("market_regime", `Screening throttled — caution at capacity (${prePositions.total_positions}/${cautionCap}, score=${regime.score})`);
           appendDecision({ type: "skip", actor: "SCREENER", summary: "Caution regime — at capacity", reason: msg });
           if (config.marketRegime.notifyOnSkip && telegramEnabled()) await sendHTML(msg).catch(() => {});
-          _screeningBusy = false;
-          return "Screening throttled — caution regime at capacity.";
+          // Set screenReport so the finally block finalizes the live message — otherwise
+          // hasActiveLiveMessage() stays true and suppresses all later close/deploy notifications.
+          screenReport = "Screening throttled — caution regime at capacity.";
+          return screenReport;
         }
         // Below caution cap: still allowed to deploy, but raise quality bar for this cycle only.
         // Save originals so they can be restored in the finally block. Without restore, repeated
