@@ -230,6 +230,10 @@ export const config = {
     enabled:       u.marketRegime?.enabled       ?? true,
     skipOnBearish: u.marketRegime?.skipOnBearish ?? true,
     notifyOnSkip:  u.marketRegime?.notifyOnSkip  ?? true,
+    // Caution-regime deployment throttle: reduce correlated exposure on soft-market days.
+    // When caution, cap concurrent positions below maxPositions and slow screening cadence.
+    cautionMaxPositions:  u.marketRegime?.cautionMaxPositions  ?? 3,  // max concurrent positions while caution (vs risk.maxPositions)
+    cautionScreeningMult: u.marketRegime?.cautionScreeningMult ?? 2,  // multiply screening interval while caution (slower cadence)
   },
 
   // ─── Strategy Mapping ───────────────────

@@ -114,6 +114,7 @@ let _pollTriggeredAt = 0; // epoch ms — cooldown for poller-triggered manageme
 let _cachedSolPrice = null; // updated each management cycle, reused by PnL poll for Rule 6 grace check
 let _cautionOrigFeeRatio = null; // saved before caution raise, restored in screening cycle finally
 let _cautionOrigOrganic  = null;
+let _lastRegime = "healthy"; // most recent market regime assessment — drives caution screening slowdown
 const _peakConfirmTimers = new Map();
 const _trailingDropConfirmTimers = new Map();
 const TRAILING_PEAK_CONFIRM_DELAY_MS = 15_000;
@@ -244,7 +245,12 @@ function effectiveScreeningIntervalMs() {
   const mins = isScreeningBackedOff()
     ? config.schedule.screeningIntervalMin
     : config.schedule.screeningIntervalNoPositionMin;
-  return mins * 60 * 1000;
+  let ms = mins * 60 * 1000;
+  // Caution regime: slow the cadence to reduce exposure frequency on soft-market days.
+  if (_lastRegime === "caution" && config.marketRegime?.enabled) {
+    ms *= (config.marketRegime.cautionScreeningMult ?? 2);
+  }
+  return ms;
 }
 
 export async function runManagementCycle({ silent = false } = {}) {
@@ -810,6 +816,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
     // Skip screening if market is broadly bearish to avoid deploying into hostile conditions
     if (config.marketRegime?.enabled) {
       const regime = await assessMarketRegime(candidates);
+      _lastRegime = regime.regime; // drives caution screening slowdown on the next cycle
       if (regime.regime === "bearish" && config.marketRegime.skipOnBearish) {
         const s = regime.signals;
         const msg =
@@ -825,14 +832,29 @@ export async function runScreeningCycle({ silent = false } = {}) {
         return "Screening skipped — market regime bearish.";
       }
       if (regime.regime === "caution") {
-        // Raise quality bar for this cycle only — save originals so they can be restored
-        // in the finally block. Without restore, repeated caution cycles compound the
-        // multiplier indefinitely (0.05 → 0.07 → 0.098 → ...) until no pool ever passes.
+        // Deployment throttle: cap concurrent positions below maxPositions to limit
+        // correlated exposure on soft-market days (when tokens dump together in-range).
+        // Existing positions keep running with their own SL — we only stop NEW deploys.
+        const cautionCap = config.marketRegime.cautionMaxPositions ?? 3;
+        if (prePositions.total_positions >= cautionCap) {
+          const msg =
+            `⏸️ <b>Screening throttled — caution regime</b>\n` +
+            `Score: ${regime.score}/4.5 — at caution capacity (${prePositions.total_positions}/${cautionCap})\n` +
+            `New deploys paused to limit correlated exposure. Existing positions unaffected.`;
+          log("market_regime", `Screening throttled — caution at capacity (${prePositions.total_positions}/${cautionCap}, score=${regime.score})`);
+          appendDecision({ type: "skip", actor: "SCREENER", summary: "Caution regime — at capacity", reason: msg });
+          if (config.marketRegime.notifyOnSkip && telegramEnabled()) await sendHTML(msg).catch(() => {});
+          _screeningBusy = false;
+          return "Screening throttled — caution regime at capacity.";
+        }
+        // Below caution cap: still allowed to deploy, but raise quality bar for this cycle only.
+        // Save originals so they can be restored in the finally block. Without restore, repeated
+        // caution cycles compound the multiplier (0.05 → 0.07 → 0.098 → ...) until no pool passes.
         _cautionOrigFeeRatio = config.screening.minFeeActiveTvlRatio;
         _cautionOrigOrganic  = config.screening.minOrganic;
         config.screening.minFeeActiveTvlRatio = +(_cautionOrigFeeRatio * 1.4).toFixed(4);
         config.screening.minOrganic = Math.min(85, _cautionOrigOrganic + 10);
-        log("market_regime", `Caution regime — quality bar raised for this cycle (minFeeActiveTvlRatio=${config.screening.minFeeActiveTvlRatio} minOrganic=${config.screening.minOrganic})`);
+        log("market_regime", `Caution regime — quality bar raised for this cycle (minFeeActiveTvlRatio=${config.screening.minFeeActiveTvlRatio} minOrganic=${config.screening.minOrganic}), capacity ${prePositions.total_positions}/${cautionCap}`);
       }
     }
 
