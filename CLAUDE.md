@@ -103,6 +103,11 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 | autoSlLowVolPct | management | -8 |
 | autoSlMidVolMax | management | 4 |
 | autoSlMidVolPct | management | -12 |
+| inRangeDumpCooldownEnabled | management | true |
+| inRangeDumpCooldownHours | management | 12 |
+| inRangeDumpCooldownLossPct | management | -5 |
+| inRangeDumpCooldownRangeEff | management | 70 |
+| inRangeDumpCooldownBidAskMult | management | 2 |
 | managementIntervalMin | schedule | 10 |
 | screeningIntervalMin | schedule | 30 |
 | screeningIntervalNoPositionMin | schedule | 10 |
@@ -297,6 +302,19 @@ When `marketRegime.enabled=true`, the screener checks regime before each cycle. 
 Caution threshold elevation is stored in `_cautionOrigFeeRatio`/`_cautionOrigOrganic` before modification and restored in the `finally` block to prevent compounding across cycles.
 
 **Live message safety:** the screener wraps its execution in a `try/finally` that calls `liveMessage.finalize()`. All early-returns inside the `try` block must assign `screenReport` before returning — a bare `return "string"` bypasses `finalize()` and leaves `_liveMessageDepth > 0`, which permanently suppresses all Telegram notifications (`notifyClose`, `notifyDeploy`, etc.) until process restart.
+
+---
+
+## In-Range Dump Cooldown (pool-memory.js)
+
+`recordPoolDeploy()` already cools pools/tokens for low-yield, emergency-exit ("rapid dump"/"volume collapse"), repeated-OOR, and repeat-fee-generating closes. The **in-range dump** trigger covers the token-quality failure pattern those miss: a token that fell *within* our bin range and closed via stop-loss/sell-pressure.
+
+Trigger (all must hold, gated by `inRangeDumpCooldownEnabled`):
+- `range_efficiency > inRangeDumpCooldownRangeEff` (default 70) — token died in-range, not OOR
+- `pnl_pct <= inRangeDumpCooldownLossPct` (default -5%) — meaningful loss, not a small dip
+- `close_reason` matches `/stop.?loss|sell.?pressure/`
+
+On trigger, the **base mint** is cooled for `inRangeDumpCooldownHours` (default 12h); `bid_ask` closes get `× inRangeDumpCooldownBidAskMult` (default 2 → 24h) since they produce the worst left-tail dumps. Enforced via `isBaseMintOnCooldown()` in `screening.js` — cooled tokens are filtered out before the LLM sees candidates. Prevents repeat-deploying the same dying token (e.g. SPCX losing twice in two days).
 
 ---
 

@@ -121,6 +121,15 @@ export const config = {
     repeatDeployCooldownScope: u.repeatDeployCooldownScope ?? "token", // pool | token | both
     repeatDeployCooldownMinFeeEarnedPct: u.repeatDeployCooldownMinFeeEarnedPct ?? u.repeatDeployCooldownMinFeeYieldPct ?? 0,
     emergencyExitCooldownHours: u.emergencyExitCooldownHours ?? 4,
+    // In-range dump cooldown: token died WITHIN our bin range (high range-eff + meaningful
+    // loss + SL/sell-pressure close) — a token-quality failure, not position design. Cool the
+    // base mint so the screener does not immediately redeploy the same dying token. bid_ask
+    // losses get a longer cooldown (they produce the worst left-tail dumps).
+    inRangeDumpCooldownEnabled: u.inRangeDumpCooldownEnabled ?? true,
+    inRangeDumpCooldownHours: u.inRangeDumpCooldownHours ?? 12,
+    inRangeDumpCooldownLossPct: u.inRangeDumpCooldownLossPct ?? -5,
+    inRangeDumpCooldownRangeEff: u.inRangeDumpCooldownRangeEff ?? 70,
+    inRangeDumpCooldownBidAskMult: u.inRangeDumpCooldownBidAskMult ?? 2,
     minVolumeToRebalance:  u.minVolumeToRebalance  ?? 1000,
     stopLossPct:           u.stopLossPct           ?? u.emergencyPriceDropPct ?? -50,
     takeProfitPct:         u.takeProfitPct         ?? u.takeProfitFeePct ?? 5,

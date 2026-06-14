@@ -183,6 +183,31 @@ export function recordPoolDeploy(poolAddress, deployData) {
     }
   }
 
+  // In-range dump cooldown: token fell WITHIN our bin range (high range-eff) and closed at a
+  // meaningful loss via stop-loss/sell-pressure. This is a token-quality failure — cool the base
+  // mint so the screener does not redeploy the same dying token next cycle (e.g. SPCX losing
+  // twice in two days). bid_ask losses produce the worst dumps, so they get a longer cooldown.
+  if (config.management.inRangeDumpCooldownEnabled) {
+    const lossPct = Number(config.management.inRangeDumpCooldownLossPct ?? -5);
+    const minRangeEff = Number(config.management.inRangeDumpCooldownRangeEff ?? 70);
+    const baseHours = Math.max(0, Number(config.management.inRangeDumpCooldownHours ?? 12));
+    const bidAskMult = Math.max(1, Number(config.management.inRangeDumpCooldownBidAskMult ?? 2));
+    const rangeEff = Number(deploy.range_efficiency);
+    const isInRangeDump =
+      baseHours > 0 &&
+      Number.isFinite(rangeEff) && rangeEff > minRangeEff &&
+      deploy.pnl_pct != null && deploy.pnl_pct <= lossPct &&
+      /stop.?loss|sell.?pressure/i.test(deploy.close_reason || "");
+    if (isInRangeDump && entry.base_mint) {
+      const hours = deploy.strategy === "bid_ask" ? baseHours * bidAskMult : baseHours;
+      const reason = `in-range dump ${deploy.pnl_pct}% (${deploy.strategy || "?"}, ${rangeEff}% range-eff)`;
+      const mintCooldownUntil = setBaseMintCooldown(db, entry.base_mint, hours, reason);
+      if (mintCooldownUntil) {
+        log("pool-memory", `In-range dump cooldown for ${entry.base_mint.slice(0, 8)} until ${mintCooldownUntil} (${reason}, ${hours}h)`);
+      }
+    }
+  }
+
   const oorTriggerCount = config.management.oorCooldownTriggerCount ?? 3;
   const oorCooldownHours = config.management.oorCooldownHours ?? 12;
   const recentDeploys = entry.deploys.slice(-oorTriggerCount);
