@@ -103,6 +103,7 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 | autoSlLowVolPct | management | -8 |
 | autoSlMidVolMax | management | 4 |
 | autoSlMidVolPct | management | -12 |
+| autoSlHighVolPct | management | -15 |
 | inRangeDumpCooldownEnabled | management | true |
 | inRangeDumpCooldownHours | management | 12 |
 | inRangeDumpCooldownLossPct | management | -5 |
@@ -244,15 +245,20 @@ const actualBaseFee = baseFactor > 0
 
 ## Auto Stop-Loss (executor.js)
 
-Volatility-adaptive SL injected at deploy time when `sl_pct` is absent and `autoSlEnabled=true`:
+Volatility-adaptive SL enforced at deploy time when `autoSlEnabled=true`:
 
 ```
-vol <= autoSlLowVolMax (2)  → autoSlLowVolPct (-8%)   [tier: low]
-vol <= autoSlMidVolMax (4)  → autoSlMidVolPct (-12%)  [tier: mid]
-vol >  autoSlMidVolMax      → stopLossPct (-15%)      [tier: high]
+vol <= autoSlLowVolMax (2)  → autoSlLowVolPct  (-8%)   [tier: low]
+vol <= autoSlMidVolMax (4)  → autoSlMidVolPct  (-12%)  [tier: mid]
+vol >  autoSlMidVolMax      → autoSlHighVolPct (-15%)  [tier: high]
 ```
 
-Result is clamped to `[stopLossFloorPct, stopLossTightestPct]` = `[-50%, -8%]`. Logged as `Auto-SL: vol=X (tier) → sl_pct=Y%`.
+`autoSl` is clamped to `[stopLossFloorPct, stopLossTightestPct]` = `[-50%, -8%]`, then:
+- **`sl_pct` absent** → inject `autoSl`
+- **LLM `sl_pct` WIDER than `autoSl`** (more negative) → **cap to `autoSl`**. Prevents the WOC pattern (LLM self-set -25% stop bled to -22.9%; auto-SL -12% would have cut it).
+- **LLM `sl_pct` TIGHTER than `autoSl`** → kept (high-conviction override allowed).
+
+High tier uses dedicated `autoSlHighVolPct` (-15%), **not** `stopLossPct` (which is the -50% emergency floor — reusing it gave high-vol deploys a -50% auto-SL bug). Logged as `Auto-SL: ...` / `Auto-SL cap: ...`.
 
 ---
 
@@ -314,7 +320,15 @@ Trigger (all must hold, gated by `inRangeDumpCooldownEnabled`):
 - `pnl_pct <= inRangeDumpCooldownLossPct` (default -5%) — meaningful loss, not a small dip
 - `close_reason` matches `/stop.?loss|sell.?pressure/`
 
-On trigger, the **base mint** is cooled for `inRangeDumpCooldownHours` (default 12h); `bid_ask` closes get `× inRangeDumpCooldownBidAskMult` (default 2 → 24h) since they produce the worst left-tail dumps. Enforced via `isBaseMintOnCooldown()` in `screening.js` — cooled tokens are filtered out before the LLM sees candidates. Prevents repeat-deploying the same dying token (e.g. SPCX losing twice in two days).
+On trigger, the **base mint** is cooled for `inRangeDumpCooldownHours` (default 12h base), scaled by loss severity and strategy:
+
+```
+severityMult = |pnl_pct| >= 20 ? 4 : |pnl_pct| >= 12 ? 2 : 1   // rug-grade / large / normal
+strategyMult = bid_ask ? inRangeDumpCooldownBidAskMult (2) : 1
+hours        = min(72, baseHours * severityMult * strategyMult)  // capped at 72h
+```
+
+Examples: -7% curve → 12h; -14% bid_ask → 48h; -22.9% curve (WOC) → 48h; -22.9% bid_ask → 72h (cap). Enforced via `isBaseMintOnCooldown()` in `screening.js` — cooled tokens are filtered out before the LLM sees candidates. Prevents repeat-deploying the same dying token (e.g. SPCX losing twice, or WOC returning as a candidate after one night on a flat 12h cooldown).
 
 ---
 

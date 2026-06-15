@@ -199,7 +199,14 @@ export function recordPoolDeploy(poolAddress, deployData) {
       deploy.pnl_pct != null && deploy.pnl_pct <= lossPct &&
       /stop.?loss|sell.?pressure/i.test(deploy.close_reason || "");
     if (isInRangeDump && entry.base_mint) {
-      const hours = deploy.strategy === "bid_ask" ? baseHours * bidAskMult : baseHours;
+      // Scale cooldown by loss severity — a rug-grade -22.9% dump should cool far longer
+      // than a routine -7% dump. bid_ask multiplier stacks on top; total capped at 72h.
+      const severity = Math.abs(deploy.pnl_pct);
+      const severityMult = severity >= 20 ? 4   // rug-grade ≥20% → 48h base
+                         : severity >= 12 ? 2   // large loss  ≥12% → 24h base
+                         : 1;                   // normal -5% to -12% → 12h base
+      const strategyMult = deploy.strategy === "bid_ask" ? bidAskMult : 1;
+      const hours = Math.min(72, baseHours * severityMult * strategyMult);
       const reason = `in-range dump ${deploy.pnl_pct}% (${deploy.strategy || "?"}, ${rangeEff}% range-eff)`;
       const mintCooldownUntil = setBaseMintCooldown(db, entry.base_mint, hours, reason);
       if (mintCooldownUntil) {

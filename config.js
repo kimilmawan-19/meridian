@@ -183,7 +183,7 @@ export const config = {
     autoSlLowVolPct:  u.autoSlLowVolPct  ?? -8,  // SL for low-vol pools
     autoSlMidVolMax:  u.autoSlMidVolMax  ?? 4,   // vol <= this → mid-vol tier
     autoSlMidVolPct:  u.autoSlMidVolPct  ?? -12, // SL for mid-vol pools
-    // vol > autoSlMidVolMax → use global stopLossPct
+    autoSlHighVolPct: u.autoSlHighVolPct ?? -15, // SL for high-vol pools (vol > autoSlMidVolMax). Dedicated key — do NOT reuse stopLossPct (that is the -50 emergency floor).
     // ── Layer A: LLM veto on trailing take-profit (soft exit only) ──
     allowTpVeto:           u.allowTpVeto            ?? true, // let MANAGER hold a triggered trailing TP
     maxTpVetos:            u.maxTpVetos             ?? 3,    // max consecutive holds before force-close

@@ -622,10 +622,14 @@ export async function executeTool(name, args) {
     }
   }
 
-  // ─── Auto-inject volatility-adaptive SL ──────────────────────
-  // If the LLM didn't specify sl_pct for a deploy, compute one from volatility.
-  // Low-vol curve positions should never bleed to -15%; tighter stops catch slow in-range dumps.
-  if (name === "deploy_position" && args.sl_pct == null && config.management.autoSlEnabled !== false) {
+  // ─── Volatility-adaptive SL: inject when absent, cap when too wide ──────────────
+  // Auto-SL computes the loosest acceptable stop for the pool's volatility tier.
+  // - If the LLM omitted sl_pct → inject the auto-SL value.
+  // - If the LLM set a WIDER (more negative) stop than auto-SL → cap it. A token in
+  //   distribution should not be allowed to bleed past the tier limit (WOC -22.9% with a
+  //   self-set -25% stop is exactly the failure this prevents; auto-SL -12% would have cut it).
+  // - If the LLM set a TIGHTER stop → keep it (high-conviction override is allowed).
+  if (name === "deploy_position" && config.management.autoSlEnabled !== false) {
     const vol = Number(args.volatility ?? 0);
     if (Number.isFinite(vol) && vol > 0) {
       const mgmt = config.management;
@@ -634,11 +638,20 @@ export async function executeTool(name, args) {
       const floor   = mgmt.stopLossFloorPct   ?? -50;
       const tightest = mgmt.stopLossTightestPct ?? -8;
       let autoSl, tier;
-      if (vol <= lowMax)  { autoSl = mgmt.autoSlLowVolPct ?? -8;  tier = "low";  }
-      else if (vol <= midMax) { autoSl = mgmt.autoSlMidVolPct ?? -12; tier = "mid";  }
-      else                { autoSl = mgmt.stopLossPct ?? -15;       tier = "high"; }
-      args.sl_pct = Math.min(tightest, Math.max(floor, autoSl));
-      log("executor", `Auto-SL: vol=${vol} (${tier}-vol) → sl_pct=${args.sl_pct}%`);
+      if (vol <= lowMax)      { autoSl = mgmt.autoSlLowVolPct  ?? -8;  tier = "low";  }
+      else if (vol <= midMax) { autoSl = mgmt.autoSlMidVolPct  ?? -12; tier = "mid";  }
+      else                    { autoSl = mgmt.autoSlHighVolPct ?? -15; tier = "high"; }
+      autoSl = Math.min(tightest, Math.max(floor, autoSl));
+
+      if (args.sl_pct == null) {
+        args.sl_pct = autoSl;
+        log("executor", `Auto-SL: vol=${vol} (${tier}-vol) → sl_pct=${autoSl}%`);
+      } else if (Number(args.sl_pct) < autoSl) {
+        log("executor", `Auto-SL cap: LLM sl_pct=${args.sl_pct}% wider than auto-SL=${autoSl}% (vol=${vol}, ${tier}-vol) → capped to ${autoSl}%`);
+        args.sl_pct = autoSl;
+      } else {
+        log("executor", `Auto-SL: LLM sl_pct=${args.sl_pct}% tighter than auto-SL=${autoSl}% (vol=${vol}, ${tier}-vol) → kept`);
+      }
     }
   }
 
