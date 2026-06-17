@@ -119,9 +119,23 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 | marketRegime.enabled | marketRegime | false |
 | marketRegime.cautionMaxPositions | marketRegime | 3 |
 | marketRegime.cautionScreeningMult | marketRegime | 2 |
+| marketRegime.cautionPositionSizeMult | marketRegime | 0.75 |
 | managementModel / screeningModel / generalModel | llm | openrouter/healer-alpha |
 
-**`computeDeployAmount(walletSol)`** — scales position size with wallet balance (compounding). Formula: `clamp(deployable × positionSizePct, floor=deployAmountSol, ceil=maxDeployAmount)`.
+**`computeDeployAmount(walletSol, { openPositionsValueSol })`** — Equity Fair-Share + Regime Modulation. Each position targets an equal slice of **total equity** (wallet + open-position value), so size is independent of deploy order (no front-loading) and idle capital converges to ~0 as slots fill:
+
+```
+equitySol  = walletSol + openPositionsValueSol
+baseShare  = equitySol / risk.maxPositions          # fixed divisor, NOT cautionMaxPositions
+regimeMult = (_activeRegime === "caution") ? cautionPositionSizeMult (0.75) : 1.0
+deployable = max(0, walletSol - gasReserve)
+deploy     = clamp(baseShare × regimeMult, floor=deployAmountSol, ceil=min(maxDeployAmount, deployable))
+```
+
+- Pembagi **tetap** `maxPositions` (bukan `cautionMaxPositions`) — kalau caution memakai pembagi lebih kecil, posisi malah membesar (salah arah). `regimeMult` yang menangani pengecilan saat caution.
+- Regime dibaca dari runtime `config.marketRegime._activeRegime` (di-set di `index.js` screening cycle setelah `assessMarketRegime`). Guard di `executor.js` membaca nilai yang sama → konsisten dengan prompt.
+- Nilai posisi dikonversi via `position.total_value_true_usd ÷ sol_price` (hindari ambiguitas `solMode`). Pemanggil tanpa opts → equity degrade ke `walletSol` saja (konservatif).
+- `positionSizePct` (config lama) tidak lagi dipakai untuk sizing utama; tetap ada agar `user-config.json` lama tidak pecah.
 
 ---
 
@@ -325,10 +339,12 @@ If override fires, the STOP_LOSS reason is tagged `[early-dump override]`.
 When `marketRegime.enabled=true`, the screener checks regime before each cycle. Regime is scored 0–4.5 across three signals (price breadth 5m+1h, volume momentum, flow ratio):
 
 - **healthy** (score < 1.5): normal operation
-- **caution** (1.5 ≤ score < 3.0): position cap at `cautionMaxPositions` (default 3); screening interval multiplied by `cautionScreeningMult` (default 2×); quality thresholds raised for the cycle and restored after
+- **caution** (1.5 ≤ score < 3.0): position cap at `cautionMaxPositions` (default 3); screening interval multiplied by `cautionScreeningMult` (default 2×); quality thresholds raised for the cycle and restored after; **deploy size scaled by `cautionPositionSizeMult` (default 0.75)** via `computeDeployAmount`
 - **bearish** (score ≥ 3.0): screening skipped entirely
 
 Caution threshold elevation is stored in `_cautionOrigFeeRatio`/`_cautionOrigOrganic` before modification and restored in the `finally` block to prevent compounding across cycles.
+
+The assessed regime is also written to runtime `config.marketRegime._activeRegime` (set right after `assessMarketRegime`, or forced to `"healthy"` when `marketRegime.enabled=false`). This is the **only** channel `computeDeployAmount` (config.js) and the deploy guard (executor.js) use to apply caution size modulation — they don't import `_lastRegime`. `deployAmount` is computed **after** the regime block in `runScreeningCycle` so the current cycle's regime modulates size; the executor guard reads the same value, keeping prompt and guard consistent (15% tolerance absorbs position-value drift).
 
 **Live message safety:** the screener wraps its execution in a `try/finally` that calls `liveMessage.finalize()`. All early-returns inside the `try` block must assign `screenReport` before returning — a bare `return "string"` bypasses `finalize()` and leaves `_liveMessageDepth > 0`, which permanently suppresses all Telegram notifications (`notifyClose`, `notifyDeploy`, etc.) until process restart.
 

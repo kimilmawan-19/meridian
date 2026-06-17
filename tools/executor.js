@@ -425,6 +425,10 @@ const toolMap = {
       // risk
       maxPositions: ["risk", "maxPositions"],
       maxDeployAmount: ["risk", "maxDeployAmount"],
+      // market regime
+      cautionMaxPositions: ["marketRegime", "cautionMaxPositions"],
+      cautionScreeningMult: ["marketRegime", "cautionScreeningMult"],
+      cautionPositionSizeMult: ["marketRegime", "cautionPositionSizeMult"],
       // schedule
       managementIntervalMin: ["schedule", "managementIntervalMin"],
       screeningIntervalMin: ["schedule", "screeningIntervalMin"],
@@ -903,9 +907,14 @@ async function runSafetyChecks(name, args) {
           };
         }
         // Prevent LLM from deploying significantly less than computeDeployAmount recommends.
-        // Allows 10% rounding tolerance (e.g. 0.13 computed → 0.12 minimum accepted).
-        const expectedDeploy = computeDeployAmount(balance.sol);
-        const minAcceptable = parseFloat((expectedDeploy * 0.9).toFixed(2));
+        // Use the same equity fair-share inputs as the screener prompt (open-position value +
+        // shared regime via config.marketRegime._activeRegime) so this guard stays consistent.
+        // 15% tolerance absorbs position-value drift between prompt-time and guard-time.
+        const openPosUsd = (positions?.positions ?? []).reduce(
+          (sum, p) => sum + (Number(p?.total_value_true_usd ?? p?.total_value_usd) || 0), 0);
+        const openPositionsValueSol = balance.sol_price > 0 ? openPosUsd / balance.sol_price : 0;
+        const expectedDeploy = computeDeployAmount(balance.sol, { openPositionsValueSol });
+        const minAcceptable = parseFloat((expectedDeploy * 0.85).toFixed(2));
         if (amountY < minAcceptable) {
           return {
             pass: false,

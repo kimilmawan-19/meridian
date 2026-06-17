@@ -245,6 +245,8 @@ export const config = {
     // When caution, cap concurrent positions below maxPositions and slow screening cadence.
     cautionMaxPositions:  u.marketRegime?.cautionMaxPositions  ?? 3,  // max concurrent positions while caution (vs risk.maxPositions)
     cautionScreeningMult: u.marketRegime?.cautionScreeningMult ?? 2,  // multiply screening interval while caution (slower cadence)
+    cautionPositionSizeMult: u.marketRegime?.cautionPositionSizeMult ?? 0.75, // scale fair-share deploy size while caution (limits nominal exposure)
+    _activeRegime: "healthy",  // runtime-only: latest assessed regime, shared with computeDeployAmount (set by index.js screening cycle)
   },
 
   // ─── Strategy Mapping ───────────────────
@@ -342,31 +344,54 @@ export const config = {
 };
 
 /**
- * Compute the optimal deploy amount for a given wallet balance.
- * Scales position size with wallet growth (compounding).
+ * Compute the optimal deploy amount using Equity Fair-Share + Regime Modulation.
  *
- * Formula: clamp(deployable × positionSizePct, floor=deployAmountSol, ceil=maxDeployAmount)
+ * Each position targets an equal slice of TOTAL equity (wallet + open-position value),
+ * independent of deploy order — this removes the front-loading of the old
+ * `deployable × positionSizePct` formula (where the first deploy was always largest and
+ * idle capital piled up in the tail). When the market regime is "caution", the target is
+ * scaled down by `cautionPositionSizeMult` to limit nominal exposure on soft-market days.
  *
- * Examples (defaults: gasReserve=0.2, positionSizePct=0.35, floor=0.5):
- *   0.8 SOL wallet → 0.6 SOL deploy  (floor)
- *   2.0 SOL wallet → 0.63 SOL deploy
- *   3.0 SOL wallet → 0.98 SOL deploy
- *   4.0 SOL wallet → 1.33 SOL deploy
+ * Formula:
+ *   equitySol  = walletSol + openPositionsValueSol
+ *   baseShare  = equitySol / risk.maxPositions          (fixed divisor — NOT cautionMaxPositions)
+ *   regimeMult = (_activeRegime === "caution") ? cautionPositionSizeMult : 1.0
+ *   deployable = max(0, walletSol - gasReserve)
+ *   deploy     = clamp(baseShare × regimeMult, floor=deployAmountSol, ceil=min(maxDeployAmount, deployable))
+ *
+ * @param {number} walletSol            Native SOL balance available in wallet.
+ * @param {object} [opts]
+ * @param {number} [opts.openPositionsValueSol=0]  Total value of open positions, in SOL.
+ *                 When omitted (fallback callers), equity degrades to walletSol — conservative, never errors.
+ *
+ * Examples (defaults: gasReserve=0.2, maxPositions=5, floor=0.5; healthy regime):
+ *   wallet 3.41 SOL + positions 4.07 SOL → equity 7.48 / 5 = 1.50 SOL deploy
+ *   same, caution regime (×0.75)                              → 1.12 SOL deploy
  */
 export const configMeta = {
   lastEvolved:          u._lastEvolved          ?? null,
   positionsAtEvolution: u._positionsAtEvolution ?? null,
 };
 
-export function computeDeployAmount(walletSol) {
-  const reserve  = config.management.gasReserve      ?? 0.2;
-  const pct      = config.management.positionSizePct ?? 0.35;
-  const floor    = config.management.deployAmountSol;
-  const ceil     = config.risk.maxDeployAmount;
+export function computeDeployAmount(walletSol, { openPositionsValueSol = 0 } = {}) {
+  const reserve = config.management.gasReserve ?? 0.2;
+  const floor   = config.management.deployAmountSol;
+  const ceil    = config.risk.maxDeployAmount;
+  const maxPositions = config.risk.maxPositions || 1;
+
+  const posValueSol = Number.isFinite(openPositionsValueSol) ? Math.max(0, openPositionsValueSol) : 0;
+  const equitySol   = Math.max(0, walletSol) + posValueSol;
+  const baseShare   = equitySol / maxPositions;
+
+  const regime     = config.marketRegime?._activeRegime ?? "healthy";
+  const regimeMult = regime === "caution"
+    ? (config.marketRegime?.cautionPositionSizeMult ?? 0.75)
+    : 1.0;
+
   const deployable = Math.max(0, walletSol - reserve);
-  const dynamic    = deployable * pct;
-  const result     = Math.min(ceil, Math.max(floor, dynamic));
-  return parseFloat(result.toFixed(2));
+  const target     = baseShare * regimeMult;
+  const result     = Math.min(ceil, deployable, Math.max(floor, target));
+  return parseFloat(Math.max(0, result).toFixed(2));
 }
 
 /**

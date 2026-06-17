@@ -796,10 +796,10 @@ export async function runScreeningCycle({ silent = false } = {}) {
   timers.screeningLastRun = Date.now();
   log("cron", `Starting screening cycle [model: ${config.llm.screeningModel}]`);
   try {
-    // Reuse pre-fetched balance — no extra RPC call needed
+    // Reuse pre-fetched balance — no extra RPC call needed.
+    // NOTE: deployAmount is computed AFTER the market-regime block below, so equity fair-share
+    // sizing can read this cycle's regime (config.marketRegime._activeRegime).
     const currentBalance = preBalance;
-    const deployAmount = computeDeployAmount(currentBalance.sol);
-    log("cron", `Computed deploy amount: ${deployAmount} SOL (wallet: ${currentBalance.sol} SOL)`);
 
     // Load active strategy
     const activeStrategy = getActiveStrategy();
@@ -817,6 +817,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
     if (config.marketRegime?.enabled) {
       const regime = await assessMarketRegime(candidates);
       _lastRegime = regime.regime; // drives caution screening slowdown on the next cycle
+      config.marketRegime._activeRegime = regime.regime; // shared with computeDeployAmount (fair-share size modulation)
       if (regime.regime === "bearish" && config.marketRegime.skipOnBearish) {
         const s = regime.signals;
         const msg =
@@ -860,7 +861,15 @@ export async function runScreeningCycle({ silent = false } = {}) {
         config.screening.minOrganic = Math.min(85, _cautionOrigOrganic + 10);
         log("market_regime", `Caution regime — quality bar raised for this cycle (minFeeActiveTvlRatio=${config.screening.minFeeActiveTvlRatio} minOrganic=${config.screening.minOrganic}), capacity ${prePositions.total_positions}/${cautionCap}`);
       }
+    } else {
+      config.marketRegime._activeRegime = "healthy"; // regime detection off — never modulate deploy size
     }
+
+    // Equity Fair-Share sizing: each position targets equity/maxPositions, scaled by regime.
+    // Computed here (after regime assessment) so this cycle's regime modulates the size.
+    const openPositionsValueSol = sumOpenPositionsValueSol(prePositions, currentBalance.sol_price);
+    const deployAmount = computeDeployAmount(currentBalance.sol, { openPositionsValueSol });
+    log("cron", `Computed deploy amount: ${deployAmount} SOL (wallet: ${currentBalance.sol} SOL, open-pos: ${openPositionsValueSol.toFixed(3)} SOL, regime: ${config.marketRegime._activeRegime})`);
 
     const allCandidates = [];
     for (const pool of candidates) {
@@ -2058,7 +2067,8 @@ function describeLatestCandidates(limit = 5) {
 }
 
 function formatWalletStatus(wallet, positions) {
-  const deployAmount = computeDeployAmount(wallet.sol);
+  const openPositionsValueSol = sumOpenPositionsValueSol(positions, wallet.sol_price);
+  const deployAmount = computeDeployAmount(wallet.sol, { openPositionsValueSol });
   const hive = isHiveMindEnabled() ? "on" : "off";
   return [
     `Wallet: ${wallet.sol} SOL ($${wallet.sol_usd})`,
@@ -2424,7 +2434,9 @@ async function deployLatestCandidate(index) {
       throw new Error(`NO DEPLOY: only cached candidate ${candidate.name} is not worth deploying — ${skipReason}`);
     }
   }
-  const deployAmount = computeDeployAmount((await getWalletBalances()).sol);
+  const [balance, positions] = await Promise.all([getWalletBalances(), getMyPositions({ force: true })]);
+  const openPositionsValueSol = sumOpenPositionsValueSol(positions, balance.sol_price);
+  const deployAmount = computeDeployAmount(balance.sol, { openPositionsValueSol });
   const binsBelow = computeBinsBelow(candidate.volatility);
   const binsAbove = Math.ceil(binsBelow * 0.25);
   const result = await executeTool("deploy_position", {
@@ -2981,6 +2993,17 @@ function getLoneCandidateSkipReason({ pool, sw, n } = {}) {
   const hasNarrative = !!n?.narrative;
   if (!hasNarrative && smartWalletCount === 0) return "only candidate has no narrative and no smart-wallet confirmation";
   return null;
+}
+
+// Sum open-position value in SOL for equity fair-share sizing. Uses total_value_true_usd
+// (always USD, regardless of solMode) ÷ sol_price. Returns 0 if data is missing so the
+// caller's equity degrades conservatively to wallet-only.
+function sumOpenPositionsValueSol(positions, solPrice) {
+  const price = Number(solPrice);
+  if (!Number.isFinite(price) || price <= 0) return 0;
+  const list = positions?.positions ?? [];
+  const usd = list.reduce((sum, p) => sum + (Number(p?.total_value_true_usd ?? p?.total_value_usd) || 0), 0);
+  return usd > 0 ? usd / price : 0;
 }
 
 function computeBinsBelow(volatility) {
