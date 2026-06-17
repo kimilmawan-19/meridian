@@ -893,7 +893,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
 
     // Hard filters after token recon — block launchpads and excessive Jupiter bot holders
     const filteredOut = [];
-    const passing = allCandidates.filter(({ pool, ti, sw }) => {
+    const passing = allCandidates.filter(({ pool, ti, sw, md }) => {
       // RULE: minimum token age — null = disabled (default). Set to 1-2h for safety net
       // against very new tokens without blocking most trending pools.
       // Note: token_age_hours measures the base TOKEN creation time, not when the LP pool was created.
@@ -905,9 +905,9 @@ export async function runScreeningCycle({ silent = false } = {}) {
         return false;
       }
 
-      // RULE: anti-FOMO short-term pump — null = disabled (default). Use athFilterPct for
-      // position-based anti-uptrend; set maxPump1hPct only if you also want to cap 1h momentum.
-      const pump1h = ti?.stats_1h?.price_change ?? null;
+      // RULE: anti-FOMO short-term pump — blocks extreme 1h pumps before they reach the LLM.
+      // Primary: DexScreener price_change_1h (direct market data); fallback: Jupiter token stats.
+      const pump1h = md?.price_change_1h ?? ti?.stats_1h?.price_change ?? null;
       const maxPump = config.screening.maxPump1hPct ?? null;
       if (maxPump != null && pump1h != null && pump1h > maxPump) {
         log("screening", `FOMO filter: dropped ${pool.name} — 1h +${pump1h}% > ${maxPump}%`);
@@ -1036,6 +1036,59 @@ export async function runScreeningCycle({ silent = false } = {}) {
           reason: skipReason,
           pool: passing[0].pool?.pool,
           pool_name: candidateName,
+        });
+        return screenReport;
+      }
+    }
+
+    // Last Pool Standing guard: when the majority of candidates have CAPITULATION/DISTRIBUTION
+    // flow and only ONE has MARKUP, that lone token is likely the next to crash after a broad
+    // market selloff — deploying it is the anti-pattern that produced ANSEM -24.97%.
+    // Guard fires when: bearish-flow pools >= lastPoolStandingMinBearish AND exactly 1 MARKUP.
+    if (config.screening.lastPoolStandingGuard && passing.length > 1) {
+      const bearishFlowLabels = new Set(["CAPITULATION", "DISTRIBUTION"]);
+      const candidateFlows = passing.map(({ pool, md: pmd }) => {
+        const v5m  = pmd?.volume_5m;
+        const v1h  = pmd?.volume_1h;
+        const v6h  = pmd?.volume_6h;
+        const v24h = pmd?.volume_24h;
+        const vr5m = v5m != null && v1h  > 0 ? v5m / (v1h  / 12) : null;
+        const vr1h = v1h != null && v6h  > 0 ? v1h / (v6h  / 6)  : null;
+        const vr6h = v6h != null && v24h > 0 ? v6h / (v24h / 4)  : null;
+        const r5m  = pmd ? tfFlowRegime(pmd.price_change_5m, vr5m, 0.5) : null;
+        const r1h  = pmd ? tfFlowRegime(pmd.price_change_1h, vr1h, 1.5) : null;
+        const r6h  = pmd ? tfFlowRegime(pmd.price_change_6h, vr6h, 3.0) : null;
+        return { pool, consensus: flowConsensus([r5m, r1h, r6h]) };
+      });
+      const bearishCandidates = candidateFlows.filter(c => bearishFlowLabels.has(c.consensus));
+      const markupCandidates  = candidateFlows.filter(c => c.consensus === "MARKUP");
+      const minBearish = config.screening.lastPoolStandingMinBearish ?? 3;
+      if (bearishCandidates.length >= minBearish && markupCandidates.length === 1) {
+        const lone = markupCandidates[0];
+        const bearishNames = bearishCandidates.map(c => c.pool.name).join(", ");
+        const reason = `Last pool standing: ${lone.pool.name} is the only MARKUP candidate (${bearishCandidates.length} bearish-flow pools: ${bearishNames})`;
+        log("screening", reason);
+        screenReport = [
+          "⛔ NO DEPLOY",
+          "",
+          "Cycle finished with no valid entry.",
+          "",
+          "BEST LOOKING CANDIDATE",
+          lone.pool.name,
+          "",
+          "WHY SKIPPED",
+          `Last-pool-standing guard: ${lone.pool.name} is the sole MARKUP survivor among ${bearishCandidates.length} CAPITULATION/DISTRIBUTION pools. Deploying the only token still pumping during a market selloff is the pattern that preceded ANSEM -24.97%.`,
+          "",
+          "REJECTED",
+          `- ${lone.pool.name}: last pool standing (${bearishCandidates.length}/${candidateFlows.length} candidates bearish-flow)`,
+        ].join("\n");
+        appendDecision({
+          type: "no_deploy",
+          actor: "SCREENER",
+          summary: "Last pool standing — skipped",
+          reason,
+          pool: lone.pool.pool,
+          pool_name: lone.pool.name,
         });
         return screenReport;
       }

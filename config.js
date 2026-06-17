@@ -92,9 +92,11 @@ export const config = {
     minTokenAgeHours:   u.minTokenAgeHours   ?? null, // null = no minimum
     maxTokenAgeHours:   u.maxTokenAgeHours   ?? null, // null = no maximum
     athFilterPct:       u.athFilterPct       ?? null, // e.g. -20 = only deploy if price is >= 20% below ATH
-    maxPump1hPct:       u.maxPump1hPct       ?? null, // null = disabled. Use athFilterPct for position-based anti-uptrend. Set e.g. 80 to also block extreme short-term pumps.
+    maxPump1hPct:       u.maxPump1hPct       ?? 80,   // block extreme 1h pumps (anti-FOMO). Set null to disable.
     maxDump1hPct:       u.maxDump1hPct       ?? -35, // default -35. Drop candidates whose 1h price change is below this. Smart-money escape hatch. Set null to disable.
     minPoolAgeHours:    u.minPoolAgeHours    ?? null, // null = disabled. Measures token age (not LP pool age). Set to 1-2 to block very new tokens without conflicting with category="trending".
+    lastPoolStandingGuard:      u.lastPoolStandingGuard      ?? true, // skip cycle when 1 MARKUP candidate survives among ≥ minBearish CAPITULATION/DISTRIBUTION pools
+    lastPoolStandingMinBearish: u.lastPoolStandingMinBearish ?? 3,    // min bearish-flow pools required to trigger last-pool-standing guard
     // Volume TA entry signals (soft hints to LLM, not hard filters)
     volumeTrendDeclineThreshold: u.volumeTrendDeclineThreshold ?? 0.6,  // trend_ratio < 0.6 → DECLINING
     volumeTrendExpandThreshold:  u.volumeTrendExpandThreshold  ?? 1.4,  // trend_ratio > 1.4 → EXPANDING
@@ -404,6 +406,9 @@ export function reloadScreeningThresholds() {
     if (fresh.filterDecliningVolume        !== undefined) s.filterDecliningVolume        = fresh.filterDecliningVolume;
     if (fresh.volumeCollapseRejectThreshold != null)      s.volumeCollapseRejectThreshold = fresh.volumeCollapseRejectThreshold;
     if (fresh.maxDump1hPct               !== undefined) s.maxDump1hPct               = fresh.maxDump1hPct;
+    if (fresh.maxPump1hPct              !== undefined) s.maxPump1hPct              = fresh.maxPump1hPct;
+    if (fresh.lastPoolStandingGuard     !== undefined) s.lastPoolStandingGuard     = fresh.lastPoolStandingGuard;
+    if (fresh.lastPoolStandingMinBearish != null)      s.lastPoolStandingMinBearish = fresh.lastPoolStandingMinBearish;
     if (fresh.maxBundlePct      != null) s.maxBundlePct     = fresh.maxBundlePct;
     if (fresh.avoidPvpSymbols   !== undefined) s.avoidPvpSymbols = fresh.avoidPvpSymbols;
     if (fresh.blockPvpSymbols   !== undefined) s.blockPvpSymbols = fresh.blockPvpSymbols;

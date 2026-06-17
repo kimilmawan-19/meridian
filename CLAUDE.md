@@ -80,6 +80,9 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 | minTokenFeesSol | screening | 30 |
 | maxBundlersPct | screening | 30 |
 | maxTop10Pct | screening | 60 |
+| maxPump1hPct | screening | 80 |
+| lastPoolStandingGuard | screening | true |
+| lastPoolStandingMinBearish | screening | 3 |
 | blockedLaunchpads | screening | [] |
 | deployAmountSol | management | 0.5 |
 | maxDeployAmount | risk | 50 |
@@ -145,6 +148,26 @@ Before `deploy_position` executes:
 - SOL balance must cover `amount_y + gasReserve`
 - `blockedLaunchpads` enforced in `getTopCandidates()` before LLM sees candidates
 - **Auto-SL injection**: if `sl_pct` is not provided by LLM and `autoSlEnabled=true`, executor auto-injects based on volatility tier (see Auto Stop-Loss section)
+
+## Screener Hard Filters (index.js — before LLM sees candidates)
+
+Applied in order during `passing = allCandidates.filter(...)`:
+- **`maxPump1hPct`** (default 80%): drops any pool whose 1h price change exceeds threshold. Primary source: DexScreener `price_change_1h`; fallback: Jupiter `stats_1h.price_change`. Directly prevents FOMO deploys into parabolic pumps (ANSEM +172% 1h would have been blocked). Set `null` to disable.
+- **`maxDump1hPct`** (default -35%): drops falling-knife tokens unless smart wallets are present.
+- `minPoolAgeHours`, `maxTop10Pct`, `minTokenFeesSol`, `maxBundlersPct`, `maxBotHoldersPct`, `blockedLaunchpads`, rugpull/PVP flags — all applied before LLM prompt is built.
+
+## Last Pool Standing Guard (index.js — after hard filters, before LLM)
+
+Runs after `passing` is finalized (and after single-candidate `getLoneCandidateSkipReason` check).
+
+Trigger (all must hold, gated by `lastPoolStandingGuard=true`):
+- `passing.length > 1` — multiple pools survived hard filters
+- Exactly **1** pool has MARKUP flow consensus
+- At least `lastPoolStandingMinBearish` (default 3) pools have CAPITULATION or DISTRIBUTION flow consensus
+
+On trigger: cycle is skipped with `⛔ NO DEPLOY`, logging which pool was the lone MARKUP and which pools were bearish-flow. Prevents the "last pool standing" anti-pattern — deploying the only token still pumping while the market broadly sells off (the pattern that produced ANSEM -24.97%).
+
+Flow consensus uses the same `tfFlowRegime`/`flowConsensus` functions as the screener prompt, computed from DexScreener `price_change_*` and volume ratios for each pool in `passing`.
 
 ---
 
