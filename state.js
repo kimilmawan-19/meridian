@@ -815,7 +815,7 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   // Note: OOR timeout decision is handled in getDeterministicCloseRule (index.js Rule 4)
   // where market data (buy/sell pressure) is available for the recovery-signal guard.
   const minAgeForYieldCheck = mgmtConfig.minAgeBeforeYieldCheck ?? 60;
-  const minAgeForPositionMetric = 30; // minutes before position-level rate is reliable
+  const minAgeForPositionMetric = minAgeForYieldCheck; // switch to position-actual at the same age Rule 5 can fire
   if (mgmtConfig.minFeePerTvl24h != null && (slAgeMin == null || slAgeMin >= minAgeForYieldCheck)) {
     // Position-level fee rate: actual fees earned (claimed + unclaimed) extrapolated to 24h.
     // More accurate than the pool's 24h rolling average which is dominated by pre-deploy history.
