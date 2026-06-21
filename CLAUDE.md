@@ -69,6 +69,7 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 | Key | Section | Default |
 |-----|---------|---------|
 | minFeeActiveTvlRatio | screening | 0.05 |
+| minFeePerBinStep | screening | 0.0007 |
 | minTvl / maxTvl | screening | 10k / 150k |
 | minVolume | screening | 500 |
 | minOrganic | screening | 60 |
@@ -163,11 +164,12 @@ Before `deploy_position` executes:
 - `blockedLaunchpads` enforced in `getTopCandidates()` before LLM sees candidates
 - **Auto-SL injection**: if `sl_pct` is not provided by LLM and `autoSlEnabled=true`, executor auto-injects based on volatility tier (see Auto Stop-Loss section)
 
-## Screener Hard Filters (index.js — before LLM sees candidates)
+## Screener Hard Filters (index.js + screening.js — before LLM sees candidates)
 
-Applied in order during `passing = allCandidates.filter(...)`:
+Applied in order during `passing = allCandidates.filter(...)` (index.js) and `getRawPoolScreeningRejectReason()` (screening.js):
 - **`maxPump1hPct`** (default 80%): drops any pool whose 1h price change exceeds threshold. Primary source: DexScreener `price_change_1h`; fallback: Jupiter `stats_1h.price_change`. Directly prevents FOMO deploys into parabolic pumps (ANSEM +172% 1h would have been blocked). Set `null` to disable.
 - **`maxDump1hPct`** (default -35%): drops falling-knife tokens unless smart wallets are present.
+- **`minFeePerBinStep`** (default 0.0007): `fee_active_tvl_ratio / bin_step` — normalises fee productivity against range width. A pool with bin_step=125 barely clearing the fee_tvl gate (0.05%) scores 0.0004 and is rejected; a pool with bin_step=80 and fee_tvl=0.08% scores 0.001 and passes. Prevents low-fee-density wide-bin pools that empirically produce poor bid_ask results (17-day data: bid_ask+bin_step≥100 averaged -0.7% PnL, 0.8% fee-yield). Applied in `screening.js:getRawPoolScreeningRejectReason` after the `minFeeActiveTvlRatio` check.
 - `minPoolAgeHours`, `maxTop10Pct`, `minTokenFeesSol`, `maxBundlersPct`, `maxBotHoldersPct`, `blockedLaunchpads`, rugpull/PVP flags — all applied before LLM prompt is built.
 
 ## Last Pool Standing Guard (index.js — after hard filters, before LLM)

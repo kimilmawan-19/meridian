@@ -197,6 +197,23 @@ async function validateDeployPoolThresholds(args) {
     };
   }
 
+  // fee_per_bin_step guard: bid_ask at wide bins (≥100) with low fee density strands capital
+  // in deep accumulation bins that price rarely reaches. 17 days of data: bid_ask+bin_step≥100
+  // averaged -0.7% to -0.9% PnL over 4 consecutive days (n=46). Force curve in those cases.
+  const feePerBinStep = (feeActiveTvlRatio != null && actualBinStep != null && actualBinStep > 0)
+    ? feeActiveTvlRatio / actualBinStep
+    : null;
+  if (
+    chosenStrategy === "bid_ask" &&
+    actualBinStep != null && actualBinStep >= 100 &&
+    feePerBinStep != null && feePerBinStep < 0.001
+  ) {
+    return {
+      pass: false,
+      reason: `strategy="bid_ask" with bin_step=${actualBinStep} and fee_per_bin_step=${feePerBinStep.toFixed(6)} < 0.001. Fee density too low for bid_ask deep-bin accumulation — use strategy="curve".`,
+    };
+  }
+
   return { pass: true };
 }
 
@@ -368,6 +385,7 @@ const toolMap = {
     const CONFIG_MAP = {
       // screening
       minFeeActiveTvlRatio: ["screening", "minFeeActiveTvlRatio"],
+      minFeePerBinStep: ["screening", "minFeePerBinStep"],
       excludeHighSupplyConcentration: ["screening", "excludeHighSupplyConcentration"],
       minTvl: ["screening", "minTvl"],
       maxTvl: ["screening", "maxTvl"],

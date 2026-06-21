@@ -113,6 +113,12 @@ function getRawPoolScreeningRejectReason(pool, s) {
   if (feeActiveTvlRatio == null || feeActiveTvlRatio < s.minFeeActiveTvlRatio) {
     return `fee/active-TVL ${feeActiveTvlRatio ?? "unknown"} below minFeeActiveTvlRatio ${s.minFeeActiveTvlRatio}`;
   }
+  if (s.minFeePerBinStep != null && feeActiveTvlRatio != null && binStep != null && binStep > 0) {
+    const feePerBinStep = feeActiveTvlRatio / binStep;
+    if (feePerBinStep < s.minFeePerBinStep) {
+      return `fee/bin_step ${feePerBinStep.toFixed(6)} below minFeePerBinStep ${s.minFeePerBinStep} (fee_tvl=${feeActiveTvlRatio}, bin_step=${binStep})`;
+    }
+  }
   if (!isUsableVolatility(volatility)) {
     return `volatility ${volatility ?? "unknown"} is unusable`;
   }

@@ -173,10 +173,14 @@ ${config.strategy.strategy === "bid_ask" ? `BID_ASK CHARACTERISTICS — read car
 `}
 DEPLOY RULES:
 - COMPOUNDING: Use the deploy amount from the goal EXACTLY. Do NOT default to a smaller number.
-- STRATEGY SELECTION: set the deploy_position "strategy" param using BOTH volatility AND top_cluster_trend (when available):
-  - volatility > ${config.strategy.curveMaxVolatility} → strategy="bid_ask". Extreme oscillation — price genuinely reaches the deep accumulation bins.
-  - volatility <= ${config.strategy.curveMaxVolatility} AND top_cluster_trend="bullish" → strategy="bid_ask". Smart money is accumulating; price is trending up. Curve would go OOR above quickly (as in the TOLYBOT case). bid_ask covers both directions and survives the upward move.
-  - volatility <= ${config.strategy.curveMaxVolatility} AND (top_cluster_trend="bearish", "neutral", absent, or OKX data unavailable) → strategy="curve". Concentrates SOL near active bin where price spends most time — highest fee efficiency, lowest bag-holding risk. Default for most candidates.
+- STRATEGY SELECTION: set the deploy_position "strategy" param using volatility, top_cluster_trend, AND bin_step + fee_per_bin_step (fee_tvl / bin_step):
+  - bin_step >= 100 AND fee_per_bin_step < 0.001 → PAKSA strategy="curve". Fee density terlalu rendah untuk bid_ask range lebar: deep bins tidak akan diaktifkan, modal idle menumpuk. (Data 17 hari: bid_ask+bin_step≥100 rata-rata -0.7% PnL, 0.8% fee-yield.)
+  - bin_step >= 100 AND fee_per_bin_step >= 0.001 AND volatility > ${config.strategy.curveMaxVolatility} → strategy="bid_ask" diizinkan. Pool cukup aktif dan volatil untuk mengisi deep bins.
+  - bin_step >= 100 (selain kondisi di atas) → strategy="curve".
+  - bin_step < 100 → gunakan rules volatility + top_cluster_trend di bawah (tidak berubah):
+    - volatility > ${config.strategy.curveMaxVolatility} → strategy="bid_ask". Extreme oscillation — price genuinely reaches the deep accumulation bins.
+    - volatility <= ${config.strategy.curveMaxVolatility} AND top_cluster_trend="bullish" → strategy="bid_ask". Smart money is accumulating; price is trending up. Curve would go OOR above quickly (as in the TOLYBOT case). bid_ask covers both directions and survives the upward move.
+    - volatility <= ${config.strategy.curveMaxVolatility} AND (top_cluster_trend="bearish", "neutral", absent, or OKX data unavailable) → strategy="curve". Concentrates SOL near active bin where price spends most time — highest fee efficiency, lowest bag-holding risk. Default for most candidates.
   - Always pass top_cluster_trend to deploy_position when it appears in the candidate's okx/ath line.
   - Never use strategy="spot" here — curve is strictly better than spot at every volatility level.
 - bins_below = round(${config.strategy.minBinsBelow} + (candidate volatility / 5) × ${config.strategy.maxBinsBelow - config.strategy.minBinsBelow}) clamped to [${config.strategy.minBinsBelow}, ${config.strategy.maxBinsBelow}]. Volatility must be a positive number; 0/unknown means skip.

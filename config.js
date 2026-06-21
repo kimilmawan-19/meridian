@@ -63,6 +63,7 @@ export const config = {
   screening: {
     excludeHighSupplyConcentration: u.excludeHighSupplyConcentration ?? true,
     minFeeActiveTvlRatio: u.minFeeActiveTvlRatio ?? 0.05,
+    minFeePerBinStep: u.minFeePerBinStep ?? 0.0007, // fee_active_tvl_ratio / bin_step — normalises fee density against range width. Prevents low-fee-density wide-bin pools from passing screening.
     // Adaptive evolution (lessons.js evolveThresholds)
     evolveWindowDays:          numericConfig(u.evolveWindowDays)          ?? 14,   // only evaluate closed positions within this window (0/null = all history)
     minFeeActiveTvlRatioFloor: numericConfig(u.minFeeActiveTvlRatioFloor) ?? 0.04, // relax can never lower minFeeActiveTvlRatio below this
@@ -405,6 +406,7 @@ export function reloadScreeningThresholds() {
     const fresh = JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"));
     const s = config.screening;
     if (fresh.minFeeActiveTvlRatio != null) s.minFeeActiveTvlRatio = fresh.minFeeActiveTvlRatio;
+    if (fresh.minFeePerBinStep     != null) s.minFeePerBinStep     = fresh.minFeePerBinStep;
     if (fresh.evolveWindowDays          != null) s.evolveWindowDays          = numericConfig(fresh.evolveWindowDays);
     if (fresh.minFeeActiveTvlRatioFloor != null) s.minFeeActiveTvlRatioFloor = numericConfig(fresh.minFeeActiveTvlRatioFloor);
     if (fresh.minOrganicFloor           != null) s.minOrganicFloor           = numericConfig(fresh.minOrganicFloor);
