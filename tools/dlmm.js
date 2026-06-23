@@ -11,7 +11,7 @@ import {
 } from "@solana/web3.js";
 import BN from "bn.js";
 import bs58 from "bs58";
-import { config, computeDeployAmount, MIN_SAFE_BINS_BELOW } from "../config.js";
+import { config, computeDeployAmount, getQuoteMeta, MIN_SAFE_BINS_BELOW } from "../config.js";
 import { log } from "../logger.js";
 import {
   trackPosition,
@@ -468,6 +468,7 @@ export async function deployPosition({
   organic_score,
   initial_value_usd,
   top_cluster_trend,
+  quote_mint, // optional hint from caller; the pool's tokenY is authoritative
   // Layer B: optional per-position risk overrides set by the SCREENER LLM
   sl_pct,
   trailing_trigger_pct,
@@ -492,6 +493,15 @@ export async function deployPosition({
   const { StrategyType, getBinIdFromPrice, getPriceOfBinByBinId } = await getDLMM();
   const pool = await getPool(pool_address);
   const baseMint = pool.lbPair.tokenXMint.toString();
+  // Quote (token_y) is the single-side deposit asset. Decimals drive lamport conversion — SOL=9,
+  // USDC=6. Derived authoritatively from the pool; unknown quotes fall back to an on-chain read.
+  const quoteMint = pool.lbPair.tokenYMint.toString();
+  const quoteMeta = getQuoteMeta(quoteMint);
+  const isSolQuote = quoteMint === config.tokens.SOL;
+  let quoteDecimals = quoteMeta?.decimals ?? null;
+  if (quote_mint && quoteMeta && quote_mint !== quoteMint) {
+    log("deploy_warn", `quote_mint hint ${String(quote_mint).slice(0, 8)} != pool token_y ${quoteMint.slice(0, 8)} — using pool token_y`);
+  }
   if (isBaseMintOnCooldown(baseMint)) {
     log("deploy", `Base mint ${baseMint.slice(0, 8)} is on cooldown — skipping deploy for pool ${pool_address.slice(0, 8)}`);
     return { success: false, error: "Token on cooldown — recently closed out-of-range too many times. Try a different token." };
@@ -610,7 +620,13 @@ export async function deployPosition({
   const baseFactor = pool.lbPair.parameters?.baseFactor ?? 0;
   const actualBaseFee = base_fee ?? (baseFactor > 0 ? parseFloat((baseFactor * actualBinStep / 1e6 * 100).toFixed(4)) : null);
 
-  const totalYLamports = new BN(Math.floor(finalAmountY * 1e9));
+  // Token Y (quote) amount → lamports using the quote's decimals (SOL=9, USDC=6). Unknown quote
+  // → read decimals on-chain so the conversion is never silently wrong.
+  if (quoteDecimals == null) {
+    const yInfo = await getConnection().getParsedAccountInfo(new PublicKey(pool.lbPair.tokenYMint));
+    quoteDecimals = yInfo.value?.data?.parsed?.info?.decimals ?? 9;
+  }
+  const totalYLamports = new BN(Math.floor(finalAmountY * Math.pow(10, quoteDecimals)));
   // Token X amount uses mint decimals when available, falling back to 9.
   let totalXLamports = new BN(0);
   if (finalAmountX > 0) {
@@ -619,7 +635,7 @@ export async function deployPosition({
     totalXLamports = new BN(Math.floor(finalAmountX * Math.pow(10, decimals)));
   }
 
-  if (shouldUseLpAgentRelayForDeploy()) {
+  if (shouldUseLpAgentRelayForDeploy() && isSolQuote) {
     try {
       const wallet = getWallet();
       log(
@@ -695,6 +711,10 @@ export async function deployPosition({
           fee_tvl_ratio,
           organic_score,
           amount_sol: finalAmountY,
+          amount_quote: finalAmountY,
+          quote_mint: quoteMint,
+          quote_symbol: quoteMeta?.symbol ?? null,
+          quote_decimals: quoteDecimals,
           amount_x: finalAmountX,
           active_bin: activeBin.binId,
           initial_value_usd,
@@ -750,6 +770,8 @@ export async function deployPosition({
         wide_range: isWideRange,
         amount_x: finalAmountX,
         amount_y: finalAmountY,
+        quote_mint: quoteMint,
+        quote_symbol: quoteMeta?.symbol ?? null,
         txs: normalizeExecutionSignatures(submit),
       };
     } catch (error) {
@@ -837,6 +859,10 @@ export async function deployPosition({
       fee_tvl_ratio,
       organic_score,
       amount_sol: finalAmountY,
+      amount_quote: finalAmountY,
+      quote_mint: quoteMint,
+      quote_symbol: quoteMeta?.symbol ?? null,
+      quote_decimals: quoteDecimals,
       amount_x: finalAmountX,
       active_bin: activeBin.binId,
       initial_value_usd,
@@ -853,7 +879,7 @@ export async function deployPosition({
       pool: pool_address,
       pool_name,
       position: newPosition.publicKey.toString(),
-      summary: `Deployed ${finalAmountY} SOL with ${activeStrategy}`,
+      summary: `Deployed ${finalAmountY} ${quoteMeta?.symbol ?? "SOL"} with ${activeStrategy}`,
       reason: `Chosen range ${minBinId}→${maxBinId} around active bin ${activeBin.binId}`,
       risks: [
         normalizedVolatility != null ? `volatility ${normalizedVolatility}` : null,
@@ -889,6 +915,8 @@ export async function deployPosition({
       wide_range: isWideRange,
       amount_x: finalAmountX,
       amount_y: finalAmountY,
+      quote_mint: quoteMint,
+      quote_symbol: quoteMeta?.symbol ?? null,
       txs: txHashes,
     };
   } catch (error) {
@@ -1257,6 +1285,7 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
           pool:               pool.poolAddress,
           pair:               tracked?.pool_name || `${pool.tokenX}/${pool.tokenY}`,
           base_mint:          pool.tokenXMint,
+          quote_mint:         tracked?.quote_mint ?? pool.tokenYMint ?? null,
           lower_bin:          lowerBin,
           upper_bin:          upperBin,
           active_bin:         activeBin,
@@ -1498,7 +1527,7 @@ export async function claimFees({ position_address }) {
     _positionsCacheAt = 0; // invalidate cache after claim
     recordClaim(position_address);
 
-    return { success: true, position: position_address, txs: txHashes, base_mint: pool.lbPair.tokenXMint.toString() };
+    return { success: true, position: position_address, txs: txHashes, base_mint: pool.lbPair.tokenXMint.toString(), quote_mint: pool.lbPair.tokenYMint.toString() };
   } catch (error) {
     log("claim_error", error.message);
     return { success: false, error: error.message };
@@ -1630,6 +1659,7 @@ export async function partialClosePosition({ position_address, pct, reason }) {
       claim_txs: claimTxHashes,
       partial_txs: partialTxHashes,
       base_mint: baseMint,
+      quote_mint: pool.lbPair.tokenYMint.toString(),
     };
   } catch (error) {
     log("close_error", `Partial close failed: ${error.message}`);
@@ -1885,6 +1915,7 @@ export async function closePosition({ position_address, reason }) {
           pnl_usd: pnlUsd,
           pnl_pct: pnlPct,
           base_mint: closeBaseMint,
+          quote_mint: pool.lbPair.tokenYMint.toString(),
         };
       }
 
@@ -2220,6 +2251,7 @@ export async function closePosition({ position_address, reason }) {
         pnl_usd: pnlUsd,
         pnl_pct: pnlPct,
         base_mint: closeBaseMint,
+        quote_mint: pool.lbPair.tokenYMint.toString(),
       };
     }
 
@@ -2259,6 +2291,7 @@ export async function closePosition({ position_address, reason }) {
       close_txs: closeTxHashes,
       txs: txHashes,
       base_mint: pool.lbPair.tokenXMint.toString(),
+      quote_mint: pool.lbPair.tokenYMint.toString(),
     };
   } catch (error) {
     log("close_error", error.message);

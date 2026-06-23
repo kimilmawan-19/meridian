@@ -76,6 +76,7 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 | minHolders | screening | 500 |
 | minMcap / maxMcap | screening | 150k / 10M |
 | minBinStep / maxBinStep | screening | 80 / 125 |
+| quoteTokens | screening | ["SOL","USDC"] |
 | timeframe | screening | "5m" |
 | category | screening | "trending" |
 | minTokenFeesSol | screening | 30 |
@@ -86,7 +87,10 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 | lastPoolStandingMinBearish | screening | 3 |
 | blockedLaunchpads | screening | [] |
 | deployAmountSol | management | 0.5 |
+| deployAmountUsd | management | null (→ deployAmountSol × solPrice) |
+| minUsdcToOpen | management | null (→ deployAmountUsd) |
 | maxDeployAmount | risk | 50 |
+| maxDeployAmountUsd | risk | null (→ maxDeployAmount × solPrice) |
 | maxPositions | risk | 3 |
 | gasReserve | management | 0.2 |
 | positionSizePct | management | 0.35 |
@@ -137,6 +141,25 @@ deploy     = clamp(baseShare × regimeMult, floor=deployAmountSol, ceil=min(maxD
 - Regime dibaca dari runtime `config.marketRegime._activeRegime` (di-set di `index.js` screening cycle setelah `assessMarketRegime`). Guard di `executor.js` membaca nilai yang sama → konsisten dengan prompt.
 - Nilai posisi dikonversi via `position.total_value_true_usd ÷ sol_price` (hindari ambiguitas `solMode`). Pemanggil tanpa opts → equity degrade ke `walletSol` saja (konservatif).
 - `positionSizePct` (config lama) tidak lagi dipakai untuk sizing utama; tetap ada agar `user-config.json` lama tidak pecah.
+
+`computeDeployAmount(walletSol, opts)` sekarang **quote-aware**. `opts.quote` (`"SOL"`|`"USDC"`) memilih jalur. Jalur SOL **byte-identical** dengan formula lama (tanpa regresi). Jalur USDC memakai fair-share yang sama dalam USD lalu kembalikan jumlah USDC: `equityUsd = usdcBalance + openPositionsValueUsd(USDC-only)`, `deployableUsd = usdcBalance` (gas = SOL, dicek terpisah), floor/ceil dari `deployAmountUsd`/`maxDeployAmountUsd` (bila null → `deployAmountSol`/`maxDeployAmount × solPrice`).
+
+---
+
+## Multi-Quote Support (SOL + USDC)
+
+Bot bisa screening + deploy ke pool ber-quote **SOL atau USDC** (single-side `amount_y` = quote/`token_y`). Modal SOL mendanai pool SOL, modal USDC mendanai pool USDC. Diatur `config.screening.quoteTokens` (default `["SOL","USDC"]`; set `["SOL"]` untuk kembali SOL-only). USDT dikenal `getQuoteMeta` tapi off by default.
+
+- **Pemilihan quote per-cycle** (`index.js selectTargetQuote`): tiap screening cycle memilih **satu** target quote — yang idle-deployable-nya terbesar (USD) di antara quote enabled yang punya slot (cap **gabungan** `maxPositions`, dicek di `758`) dan saldo ≥ min-to-open. Tidak ada quote memenuhi → cycle skip. Target di-set ke side-channel `config.screening._activeQuoteMint` (mirror `_activeRegime`), dibersihkan di `finally`.
+- **`getQuoteMeta(symbolOrMint)`** (`config.js`): `symbol → { symbol, mint, decimals }`. Desimal: SOL=9, USDC=6, USDT=6 — **sumber kebenaran konversi lamport**.
+- **Desimal deploy** (`dlmm.js`): `totalYLamports = finalAmountY × 10^quoteDecimals` (dulu hardcoded `1e9`). Quote diturunkan **otoritatif** dari `pool.lbPair.tokenYMint`; unknown quote → baca desimal on-chain.
+- **Screening filter** (`screening.js`): pool disaring ke `quoteTokens` (atau ke `quote` target bila diberikan), bukan SOL-only. `condensePool` membawa `quote.{symbol,mint,decimals}`.
+- **Validasi deploy** (`executor.js`): baca `args.quote_mint` → `_activeQuoteMint` → SOL. SOL: `sol ≥ amount_y + gasReserve`. USDC: `usdc ≥ amount_y` **dan** `sol ≥ gasReserve`. Ambang min/max & guard 15% pakai threshold per-quote.
+- **Auto-swap close/partial/claim** (`executor.js`): sisa base token di-swap ke **quote pool** (`result.quote_mint`, di-return semua jalur close `dlmm.js`) — pool SOL→SOL, pool USDC→USDC.
+- **Equity per-quote** (`index.js`): `sumOpenPositionsValueUsd(positions, quoteMint)` (posisi tanpa `quote_mint` legacy → SOL). `sumOpenPositionsValueSol` kini hanya menghitung posisi SOL.
+- **State** (`state.js trackPosition`): simpan `quote_mint`/`quote_symbol`/`quote_decimals`/`amount_quote`. Posisi lama tanpa quote → diperlakukan SOL.
+- **Relay** Agent Meridian (off by default) diguard ke `quote===SOL` (`inputSOL`/`allToken1` hardcoded SOL).
+- Prompt SCREENER netral-quote; goal per-cycle menyatakan `QUOTE THIS CYCLE: <SOL|USDC>` dan menyuruh LLM pass `quote_mint`.
 
 ---
 

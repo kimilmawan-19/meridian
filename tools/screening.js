@@ -1,4 +1,4 @@
-import { config } from "../config.js";
+import { config, getQuoteMeta } from "../config.js";
 import { isBlacklisted } from "../token-blacklist.js";
 import { isDevBlocked, getBlockedDevs } from "../dev-blocklist.js";
 import { log } from "../logger.js";
@@ -358,6 +358,7 @@ async function enrichPvpRisk(pools) {
  */
 export async function discoverPools({
   page_size = 50,
+  quote = null,
 } = {}) {
   const s = config.screening;
   const filters = [
@@ -436,18 +437,22 @@ export async function discoverPools({
     }
   }
 
-  // Enforce SOL-only quote token. The executor only supports single-side SOL deploys
-  // (amount_x=0, amount_y>0), so USDC/USDT/other-quote pools will always fail on-chain.
-  // Filter here so the LLM never sees non-SOL candidates.
-  const SOL_MINT = "So11111111111111111111111111111111111111112";
-  const beforeSolFilter = rawPools.length;
+  // Enforce allowed quote tokens (pool token_y). Single-side deploys put liquidity in the quote,
+  // so only pools whose token_y is a supported quote (SOL/USDC) can be funded on-chain. When
+  // `quote` is provided the cycle targets that ONE quote; otherwise any enabled quoteTokens pass.
+  const enabledQuotes = Array.isArray(s.quoteTokens) && s.quoteTokens.length > 0 ? s.quoteTokens : ["SOL"];
+  const targetQuoteMeta = quote ? getQuoteMeta(quote) : null;
+  const allowedQuoteMetas = targetQuoteMeta ? [targetQuoteMeta] : enabledQuotes.map(getQuoteMeta).filter(Boolean);
+  const allowedSymbols = new Set(allowedQuoteMetas.map((q) => q.symbol));
+  const allowedMints   = new Set(allowedQuoteMetas.map((q) => q.mint));
+  const beforeQuoteFilter = rawPools.length;
   rawPools = rawPools.filter((p) => {
-    const sym = p.token_y?.symbol ?? p.quote?.symbol ?? "";
+    const sym  = p.token_y?.symbol ?? p.quote?.symbol ?? "";
     const mint = p.token_y?.address ?? p.quote?.mint ?? "";
-    return sym === "SOL" || mint === SOL_MINT;
+    return allowedSymbols.has(sym) || allowedMints.has(mint);
   });
-  if (rawPools.length < beforeSolFilter) {
-    log("screening", `SOL-only filter: removed ${beforeSolFilter - rawPools.length} non-SOL-quote pools (${rawPools.length} remain)`);
+  if (rawPools.length < beforeQuoteFilter) {
+    log("screening", `Quote filter [${[...allowedSymbols].join(",")}]: removed ${beforeQuoteFilter - rawPools.length} non-matching-quote pools (${rawPools.length} remain)`);
   }
 
   rawPools = await applyVolatilityTimeframe(rawPools, s.timeframe);
@@ -538,9 +543,9 @@ export async function fetchTrendingBreadth({ timeframe = "5m" } = {}) {
  * Returns eligible pools for the agent to evaluate and pick from.
  * Hard filters applied in code, agent decides which to deploy into.
  */
-export async function getTopCandidates({ limit = 10 } = {}) {
+export async function getTopCandidates({ limit = 10, quote = null } = {}) {
   const { config } = await import("../config.js");
-  const discovery = await discoverPools({ page_size: 50 });
+  const discovery = await discoverPools({ page_size: 50, quote });
   const { pools } = discovery;
   const filteredOut = Array.isArray(discovery.filtered_examples) ? [...discovery.filtered_examples] : [];
 
@@ -837,6 +842,7 @@ function condensePool(p) {
     quote: {
       symbol: p.token_y?.symbol,
       mint: p.token_y?.address,
+      decimals: getQuoteMeta(p.token_y?.address ?? p.token_y?.symbol)?.decimals ?? null,
     },
     pool_type: p.pool_type,
     bin_step: p.dlmm_params?.bin_step || null,

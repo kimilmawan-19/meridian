@@ -155,11 +155,15 @@ WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
           },
           amount_y: {
             type: "number",
-            description: "Amount of quote token (usually SOL) to deposit."
+            description: "Amount of the pool's QUOTE token (token_y) to deposit — SOL or USDC depending on the pool. In a screening cycle this is the 'Deploy: N <QUOTE>' amount from the goal."
+          },
+          quote_mint: {
+            type: "string",
+            description: "Mint address of the pool's quote token (token_y) — the candidate's quote.mint. Tells the agent whether amount_y is SOL or USDC so it validates the right balance and swaps back to the right asset on close. SOL pools may omit it (defaults to SOL)."
           },
           amount_x: {
             type: "number",
-            description: "Unsupported for this agent. Keep at 0; deploys are single-side SOL via amount_y."
+            description: "Unsupported for this agent. Keep at 0; deploys are single-side (quote token only) via amount_y."
           },
           amount_sol: {
             type: "number",
@@ -423,9 +427,9 @@ WARNING: This executes a real on-chain transaction.`,
 Changes persist to user-config.json and take effect immediately — no restart needed.
 
 VALID KEYS (use EXACTLY these key names, nothing else):
-Screening: minFeeActiveTvlRatio, minTvl, maxTvl, minVolume, minOrganic, minQuoteOrganic, minHolders, minMcap, maxMcap, minBinStep, maxBinStep, timeframe, category, minTokenFeesSol, excludeHighSupplyConcentration, allowedLaunchpads, blockedLaunchpads
-Management: minClaimAmount, outOfRangeBinsToClose, outOfRangeWaitMinutes, oorCooldownTriggerCount, oorCooldownHours, repeatDeployCooldownEnabled, repeatDeployCooldownTriggerCount, repeatDeployCooldownHours, repeatDeployCooldownScope, repeatDeployCooldownMinFeeEarnedPct, minVolumeToRebalance, stopLossPct, takeProfitPct, minSolToOpen, deployAmountSol, gasReserve, positionSizePct
-Risk: maxPositions, maxDeployAmount
+Screening: minFeeActiveTvlRatio, minTvl, maxTvl, minVolume, minOrganic, minQuoteOrganic, minHolders, minMcap, maxMcap, minBinStep, maxBinStep, timeframe, category, minTokenFeesSol, excludeHighSupplyConcentration, allowedLaunchpads, blockedLaunchpads, quoteTokens
+Management: minClaimAmount, outOfRangeBinsToClose, outOfRangeWaitMinutes, oorCooldownTriggerCount, oorCooldownHours, repeatDeployCooldownEnabled, repeatDeployCooldownTriggerCount, repeatDeployCooldownHours, repeatDeployCooldownScope, repeatDeployCooldownMinFeeEarnedPct, minVolumeToRebalance, stopLossPct, takeProfitPct, minSolToOpen, deployAmountSol, deployAmountUsd, minUsdcToOpen, gasReserve, positionSizePct
+Risk: maxPositions, maxDeployAmount, maxDeployAmountUsd
 Schedule: managementIntervalMin, screeningIntervalMin
 Models: managementModel, screeningModel, generalModel
 Strategy: minBinsBelow, maxBinsBelow, defaultBinsBelow (legacy binsBelow maps to maxBinsBelow)

@@ -57,6 +57,9 @@ export const config = {
   risk: {
     maxPositions:    u.maxPositions    ?? 3,
     maxDeployAmount: u.maxDeployAmount ?? 50,
+    // Ceiling for USDC-quoted deploys (USD). null → derived from maxDeployAmount × live SOL price,
+    // so USDC sizing works out-of-the-box but can be set explicitly to decouple it from SOL price.
+    maxDeployAmountUsd: u.maxDeployAmountUsd ?? null,
   },
 
   // ─── Pool Screening Thresholds ───────────
@@ -73,6 +76,11 @@ export const config = {
     minVolume:         u.minVolume         ?? 500,
     minOrganic:        u.minOrganic        ?? 60,
     minQuoteOrganic:   u.minQuoteOrganic   ?? 60,
+    // Allowed quote tokens (pool token_y) the bot may screen + deploy into. SOL pools are funded
+    // by the wallet's SOL balance, USDC pools by the USDC balance. Each cycle picks ONE target
+    // quote (the one with the largest idle-deployable balance in USD). Set to ["SOL"] to revert
+    // to SOL-only behaviour. USDT is recognised by the quote registry but off by default.
+    quoteTokens:       u.quoteTokens        ?? ["SOL", "USDC"],
     minHolders:        u.minHolders        ?? 500,
     minMcap:           u.minMcap           ?? 150_000,
     maxMcap:           u.maxMcap           ?? 10_000_000,
@@ -163,6 +171,12 @@ export const config = {
     deployAmountSol:       u.deployAmountSol       ?? 0.5,
     gasReserve:            u.gasReserve            ?? 0.2,
     positionSizePct:       u.positionSizePct       ?? 0.35,
+    // ── USDC-quote sizing (used when a cycle targets a USDC pool) ──
+    // All null by default → derived from the SOL-denominated keys × live SOL price, so USDC
+    // deploys work without extra config. Set explicitly (in USDC/USD) to size USDC positions
+    // independently of the SOL price.
+    deployAmountUsd:       u.deployAmountUsd       ?? null,  // floor per USDC deploy (USD)
+    minUsdcToOpen:         u.minUsdcToOpen         ?? null,  // min idle USDC to start a USDC cycle (USD)
     // Trailing take-profit
     trailingTakeProfit:    u.trailingTakeProfit    ?? true,
     trailingTriggerPct:    u.trailingTriggerPct    ?? 3,    // activate trailing at X% PnL
@@ -374,20 +388,77 @@ export const configMeta = {
   positionsAtEvolution: u._positionsAtEvolution ?? null,
 };
 
-export function computeDeployAmount(walletSol, { openPositionsValueSol = 0 } = {}) {
-  const reserve = config.management.gasReserve ?? 0.2;
-  const floor   = config.management.deployAmountSol;
-  const ceil    = config.risk.maxDeployAmount;
+// Decimals for supported quote tokens (single source of truth for lamport conversion + sizing).
+const QUOTE_DECIMALS = { SOL: 9, USDC: 6, USDT: 6 };
+
+/**
+ * Resolve a quote token (given as a symbol like "SOL"/"USDC" OR a mint address) to its
+ * canonical { symbol, mint, decimals }. Returns null for unknown/unsupported quotes so callers
+ * can fall back to SOL or reject. Used by screening, deploy validation, sizing, and auto-swap.
+ */
+export function getQuoteMeta(quote) {
+  if (!quote) return null;
+  const t = config.tokens;
+  let symbol = null;
+  if (quote === "SOL" || quote === "native" || quote === t.SOL) symbol = "SOL";
+  else if (quote === "USDC" || quote === t.USDC) symbol = "USDC";
+  else if (quote === "USDT" || quote === t.USDT) symbol = "USDT";
+  if (!symbol) return null;
+  return { symbol, mint: t[symbol], decimals: QUOTE_DECIMALS[symbol] };
+}
+
+/**
+ * Compute the optimal deploy amount in the units of the target quote, using Equity Fair-Share
+ * + Regime Modulation. The SOL path is byte-identical to the original (regression-safe); the
+ * USDC path mirrors the same fair-share math in USD and returns a USDC amount.
+ *
+ * @param {number} walletSol  Native SOL balance (used for the SOL path + SOL deployable).
+ * @param {object} [opts]
+ * @param {number}  [opts.openPositionsValueSol=0]  SOL-path equity contribution from open positions (SOL).
+ * @param {string}  [opts.quote="SOL"]              Target quote: "SOL" or "USDC".
+ * @param {number}  [opts.usdcBalance=0]            Idle USDC balance (USDC path).
+ * @param {number}  [opts.solPrice=0]               Live SOL/USD price (to derive USDC floor/ceil when not set explicitly).
+ * @param {number}  [opts.openPositionsValueUsd=0]  USDC-path equity contribution from open USDC positions (USD).
+ * @returns {number} Deploy amount in the quote's own units (SOL or USDC).
+ */
+export function computeDeployAmount(walletSol, opts = {}) {
+  const {
+    openPositionsValueSol = 0,
+    quote = "SOL",
+    usdcBalance = 0,
+    solPrice = 0,
+    openPositionsValueUsd = 0,
+  } = opts;
+
   const maxPositions = config.risk.maxPositions || 1;
-
-  const posValueSol = Number.isFinite(openPositionsValueSol) ? Math.max(0, openPositionsValueSol) : 0;
-  const equitySol   = Math.max(0, walletSol) + posValueSol;
-  const baseShare   = equitySol / maxPositions;
-
   const regime     = config.marketRegime?._activeRegime ?? "healthy";
   const regimeMult = regime === "caution"
     ? (config.marketRegime?.cautionPositionSizeMult ?? 0.75)
     : 1.0;
+
+  // ── USDC path: equity fair-share in USD, returned as a USDC amount ──
+  if ((quote || "SOL").toUpperCase() === "USDC") {
+    const price    = Number(solPrice) > 0 ? Number(solPrice) : 0;
+    const floorUsd = config.management.deployAmountUsd ?? (price > 0 ? config.management.deployAmountSol * price : 0);
+    const ceilUsd  = config.risk.maxDeployAmountUsd   ?? (price > 0 ? config.risk.maxDeployAmount   * price : Infinity);
+    const usdc     = Math.max(0, Number(usdcBalance) || 0);
+    const posUsd   = Number.isFinite(openPositionsValueUsd) ? Math.max(0, openPositionsValueUsd) : 0;
+    const equityUsd    = usdc + posUsd;
+    const baseShareUsd = equityUsd / maxPositions;
+    const targetUsd    = baseShareUsd * regimeMult;
+    // deployable = idle USDC (gas reserve is SOL, validated separately in the executor)
+    const result = Math.min(ceilUsd, usdc, Math.max(floorUsd, targetUsd));
+    return parseFloat(Math.max(0, result).toFixed(2));
+  }
+
+  // ── SOL path (unchanged) ──
+  const reserve = config.management.gasReserve ?? 0.2;
+  const floor   = config.management.deployAmountSol;
+  const ceil    = config.risk.maxDeployAmount;
+
+  const posValueSol = Number.isFinite(openPositionsValueSol) ? Math.max(0, openPositionsValueSol) : 0;
+  const equitySol   = Math.max(0, walletSol) + posValueSol;
+  const baseShare   = equitySol / maxPositions;
 
   const deployable = Math.max(0, walletSol - reserve);
   const target     = baseShare * regimeMult;

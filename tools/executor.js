@@ -22,7 +22,7 @@ import { blockDev, unblockDev, listBlockedDevs } from "../dev-blocklist.js";
 import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsOnPool } from "../smart-wallets.js";
 import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
 import { fetchPoolMarketData } from "./market-data.js";
-import { config, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW, computeDeployAmount } from "../config.js";
+import { config, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW, computeDeployAmount, getQuoteMeta } from "../config.js";
 import { getRecentDecisions } from "../decision-log.js";
 import fs from "fs";
 import path from "path";
@@ -259,7 +259,7 @@ function normalizeConfigValue(key, value) {
     "darwinEnabled",
     "lpAgentRelayEnabled",
   ]);
-  const arrayKeys = new Set(["allowedLaunchpads", "blockedLaunchpads"]);
+  const arrayKeys = new Set(["allowedLaunchpads", "blockedLaunchpads", "quoteTokens"]);
   const stringKeys = new Set([
     "timeframe",
     "category",
@@ -437,12 +437,17 @@ const toolMap = {
       solMode: ["management", "solMode"],
       minSolToOpen: ["management", "minSolToOpen"],
       deployAmountSol: ["management", "deployAmountSol"],
+      deployAmountUsd: ["management", "deployAmountUsd"],
+      minUsdcToOpen: ["management", "minUsdcToOpen"],
       gasReserve: ["management", "gasReserve"],
       positionSizePct: ["management", "positionSizePct"],
       minAgeBeforeYieldCheck: ["management", "minAgeBeforeYieldCheck"],
       // risk
       maxPositions: ["risk", "maxPositions"],
       maxDeployAmount: ["risk", "maxDeployAmount"],
+      maxDeployAmountUsd: ["risk", "maxDeployAmountUsd"],
+      // screening quote tokens
+      quoteTokens: ["screening", "quoteTokens"],
       // market regime
       cautionMaxPositions: ["marketRegime", "cautionMaxPositions"],
       cautionScreeningMult: ["marketRegime", "cautionScreeningMult"],
@@ -705,55 +710,62 @@ export async function executeTool(name, args) {
           const poolAddr = result.pool || args.pool_address;
           if (poolAddr) addPoolNote({ pool_address: poolAddr, note: `Closed: low yield (fee/TVL below threshold) at ${new Date().toISOString().slice(0,10)}` }).catch?.(() => {});
         }
-        // Auto-swap base token back to SOL unless user said to hold
+        // Auto-swap the leftover base token back to the position's QUOTE (SOL pools → SOL,
+        // USDC pools → USDC) unless the user said to hold. Keeps freed capital in the same asset.
         if (!args.skip_swap && result.base_mint) {
+          const outMint = result.quote_mint || "SOL";
+          const outSym = getQuoteMeta(outMint)?.symbol || "SOL";
           try {
             const balances = await getWalletBalances({});
             const token = balances.tokens?.find(t => t.mint === result.base_mint);
             if (token && token.usd >= 0.10) {
-              log("executor", `Auto-swapping ${token.symbol || result.base_mint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to SOL`);
-              const swapResult = await swapToken({ input_mint: result.base_mint, output_mint: "SOL", amount: token.balance });
+              log("executor", `Auto-swapping ${token.symbol || result.base_mint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to ${outSym}`);
+              const swapResult = await swapToken({ input_mint: result.base_mint, output_mint: outMint, amount: token.balance });
               // Tell the model the swap already happened so it doesn't call swap_token again
               result.auto_swapped = true;
-              result.auto_swap_note = `Base token already auto-swapped back to SOL (${token.symbol || result.base_mint.slice(0, 8)} → SOL). Do NOT call swap_token again.`;
-              if (swapResult?.amount_out) result.sol_received = swapResult.amount_out;
+              result.auto_swap_note = `Base token already auto-swapped back to ${outSym} (${token.symbol || result.base_mint.slice(0, 8)} → ${outSym}). Do NOT call swap_token again.`;
+              if (swapResult?.amount_out) result.quote_received = swapResult.amount_out;
             }
           } catch (e) {
             // Surface the failure to the model: the base token is still sitting in the wallet,
-            // so the next deploy would see an understated SOL balance and size down (or fail
-            // minSolToOpen). Tell the agent to recover the SOL with a manual swap.
+            // so the next deploy would see an understated balance and size down (or fail the
+            // min-to-open gate). Tell the agent to recover the quote with a manual swap.
             log("executor_warn", `Auto-swap after close failed: ${e.message}`);
             result.auto_swapped = false;
             result.auto_swap_failed = true;
-            result.auto_swap_note = `Auto-swap of base token (${result.base_mint.slice(0, 8)}) back to SOL FAILED: ${e.message}. The base token is still in the wallet — call swap_token (input_mint=base_mint, output_mint=SOL) to recover SOL before deploying again.`;
+            result.auto_swap_note = `Auto-swap of base token (${result.base_mint.slice(0, 8)}) back to ${outSym} FAILED: ${e.message}. The base token is still in the wallet — call swap_token (input_mint=base_mint, output_mint=${outMint}) to recover ${outSym} before deploying again.`;
           }
         }
       } else if (name === "partial_close_position" && result.success) {
         notifyPartialClose({ pair: result.pool_name || args.position_address?.slice(0, 8), pct: result.pct, lockedUsd: result.locked_usd ?? 0, peakPct: result.peak_pnl_pct ?? null }).catch(() => {});
-        // Auto-swap the scaled-out base token back to SOL so it is immediately redeployable.
+        // Auto-swap the scaled-out base token back to the position's QUOTE so it is redeployable.
         if (!args.skip_swap && result.base_mint) {
+          const outMint = result.quote_mint || "SOL";
+          const outSym = getQuoteMeta(outMint)?.symbol || "SOL";
           try {
             const balances = await getWalletBalances({});
             const token = balances.tokens?.find(t => t.mint === result.base_mint);
             if (token && token.usd >= 0.10) {
-              log("executor", `Auto-swapping partial scale-out ${token.symbol || result.base_mint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to SOL`);
-              await swapToken({ input_mint: result.base_mint, output_mint: "SOL", amount: token.balance });
+              log("executor", `Auto-swapping partial scale-out ${token.symbol || result.base_mint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to ${outSym}`);
+              await swapToken({ input_mint: result.base_mint, output_mint: outMint, amount: token.balance });
               result.auto_swapped = true;
-              result.auto_swap_note = `Scaled-out base token already auto-swapped back to SOL. Do NOT call swap_token again. The runner (remaining position) is still open with a tightened trailing stop.`;
+              result.auto_swap_note = `Scaled-out base token already auto-swapped back to ${outSym}. Do NOT call swap_token again. The runner (remaining position) is still open with a tightened trailing stop.`;
             }
           } catch (e) {
             log("executor_warn", `Auto-swap after partial close failed: ${e.message}`);
             result.auto_swap_failed = true;
-            result.auto_swap_note = `Auto-swap of scaled-out base token FAILED: ${e.message}. Call swap_token (input_mint=base_mint, output_mint=SOL) to recover SOL.`;
+            result.auto_swap_note = `Auto-swap of scaled-out base token FAILED: ${e.message}. Call swap_token (input_mint=base_mint, output_mint=${outMint}) to recover ${outSym}.`;
           }
         }
       } else if (name === "claim_fees" && config.management.autoSwapAfterClaim && result.base_mint) {
+        const outMint = result.quote_mint || "SOL";
+        const outSym = getQuoteMeta(outMint)?.symbol || "SOL";
         try {
           const balances = await getWalletBalances({});
           const token = balances.tokens?.find(t => t.mint === result.base_mint);
           if (token && token.usd >= 0.10) {
-            log("executor", `Auto-swapping claimed ${token.symbol || result.base_mint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to SOL`);
-            await swapToken({ input_mint: result.base_mint, output_mint: "SOL", amount: token.balance });
+            log("executor", `Auto-swapping claimed ${token.symbol || result.base_mint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to ${outSym}`);
+            await swapToken({ input_mint: result.base_mint, output_mint: outMint, amount: token.balance });
           }
         } catch (e) {
           log("executor_warn", `Auto-swap after claim failed: ${e.message}`);
@@ -805,9 +817,15 @@ async function runSafetyChecks(name, args) {
       if (Number.isFinite(deployAmountX) && deployAmountX > 0) {
         return {
           pass: false,
-          reason: "This agent only supports single-side SOL deploys. Use amount_y/amount_sol and keep amount_x=0.",
+          reason: "This agent only supports single-side deploys. Use amount_y/amount_sol and keep amount_x=0.",
         };
       }
+      // Resolve the deploy quote (token_y): explicit arg → this cycle's target (side-channel set in
+      // runScreeningCycle) → SOL. amount_y is denominated in this quote (SOL or USDC).
+      const quoteMeta = getQuoteMeta(args.quote_mint)
+        || getQuoteMeta(config.screening._activeQuoteMint)
+        || getQuoteMeta("SOL");
+      const isSolQuote = quoteMeta.symbol === "SOL";
       const requestedBinsBelow = Number(args.bins_below ?? config.strategy.defaultBinsBelow ?? config.strategy.minBinsBelow);
       const requestedBinsAbove = Number(args.bins_above ?? 0);
       const minBinsBelow = Math.max(MIN_SAFE_BINS_BELOW, Number(config.strategy.minBinsBelow ?? MIN_SAFE_BINS_BELOW));
@@ -890,53 +908,69 @@ async function runSafetyChecks(name, args) {
         }
       }
 
-      // Check amount limits
+      // Check amount limits (amount_y is denominated in the quote: SOL or USDC)
       const amountY = deployAmountY;
+      const qSym = quoteMeta.symbol;
       if (!Number.isFinite(amountY) || amountY <= 0) {
         return {
           pass: false,
-          reason: `Must provide a positive SOL amount (amount_y).`,
+          reason: `Must provide a positive ${qSym} amount (amount_y).`,
         };
       }
 
-      const minDeploy = Math.max(0.1, config.management.deployAmountSol);
-      if (amountY < minDeploy) {
-        return {
-          pass: false,
-          reason: `Amount ${amountY} SOL is below the minimum deploy amount (${minDeploy} SOL). Use at least ${minDeploy} SOL.`,
-        };
-      }
-      if (amountY > config.risk.maxDeployAmount) {
-        return {
-          pass: false,
-          reason: `SOL amount ${amountY} exceeds maximum allowed per position (${config.risk.maxDeployAmount}).`,
-        };
-      }
-
-      // Check SOL balance and enforce minimum computed deploy amount
+      // Balance + bound checks need live balances (USDC sizing also needs the SOL price), so the
+      // strict gating runs outside DRY_RUN — same as before.
       if (process.env.DRY_RUN !== "true") {
         const balance = await getWalletBalances();
         const gasReserve = config.management.gasReserve;
-        const minRequired = amountY + gasReserve;
-        if (balance.sol < minRequired) {
-          return {
-            pass: false,
-            reason: `Insufficient SOL: have ${balance.sol} SOL, need ${minRequired} SOL (${amountY} deploy + ${gasReserve} gas reserve).`,
-          };
+        const solPrice = balance.sol_price || 0;
+
+        // Per-quote min/max deploy bounds. USDC bounds use explicit USD config when set, else
+        // derive from the SOL-denominated config × live SOL price.
+        const minDeploy = isSolQuote
+          ? Math.max(0.1, config.management.deployAmountSol)
+          : (config.management.deployAmountUsd ?? (solPrice > 0 ? config.management.deployAmountSol * solPrice : 0));
+        const maxDeploy = isSolQuote
+          ? config.risk.maxDeployAmount
+          : (config.risk.maxDeployAmountUsd ?? (solPrice > 0 ? config.risk.maxDeployAmount * solPrice : Infinity));
+        if (amountY < minDeploy) {
+          return { pass: false, reason: `Amount ${amountY} ${qSym} is below the minimum deploy amount (${minDeploy} ${qSym}). Use at least ${minDeploy} ${qSym}.` };
         }
-        // Prevent LLM from deploying significantly less than computeDeployAmount recommends.
-        // Use the same equity fair-share inputs as the screener prompt (open-position value +
-        // shared regime via config.marketRegime._activeRegime) so this guard stays consistent.
+        if (amountY > maxDeploy) {
+          return { pass: false, reason: `${qSym} amount ${amountY} exceeds maximum allowed per position (${maxDeploy} ${qSym}).` };
+        }
+
+        // Balance sufficiency. SOL deploys spend SOL (amount + gas). USDC deploys spend USDC for
+        // the position and SOL only for the gas reserve.
+        if (isSolQuote) {
+          const minRequired = amountY + gasReserve;
+          if (balance.sol < minRequired) {
+            return { pass: false, reason: `Insufficient SOL: have ${balance.sol} SOL, need ${minRequired} SOL (${amountY} deploy + ${gasReserve} gas reserve).` };
+          }
+        } else {
+          if ((balance.usdc ?? 0) < amountY) {
+            return { pass: false, reason: `Insufficient ${qSym}: have ${(balance.usdc ?? 0).toFixed(2)} ${qSym}, need ${amountY} ${qSym} for this deploy.` };
+          }
+          if (balance.sol < gasReserve) {
+            return { pass: false, reason: `Insufficient SOL for gas: have ${balance.sol} SOL, need ${gasReserve} SOL reserved for transaction fees.` };
+          }
+        }
+
+        // Prevent the LLM from deploying significantly less than the equity fair-share target.
+        // Equity is computed per-quote (only same-quote positions count) to mirror runScreeningCycle.
         // 15% tolerance absorbs position-value drift between prompt-time and guard-time.
-        const openPosUsd = (positions?.positions ?? []).reduce(
-          (sum, p) => sum + (Number(p?.total_value_true_usd ?? p?.total_value_usd) || 0), 0);
-        const openPositionsValueSol = balance.sol_price > 0 ? openPosUsd / balance.sol_price : 0;
-        const expectedDeploy = computeDeployAmount(balance.sol, { openPositionsValueSol });
+        const openPosUsdForQuote = (positions?.positions ?? []).reduce((sum, p) => {
+          const pq = p?.quote_mint || config.tokens.SOL;
+          return pq === quoteMeta.mint ? sum + (Number(p?.total_value_true_usd ?? p?.total_value_usd) || 0) : sum;
+        }, 0);
+        const expectedDeploy = isSolQuote
+          ? computeDeployAmount(balance.sol, { openPositionsValueSol: solPrice > 0 ? openPosUsdForQuote / solPrice : 0 })
+          : computeDeployAmount(balance.sol, { quote: qSym, usdcBalance: balance.usdc, solPrice, openPositionsValueUsd: openPosUsdForQuote });
         const minAcceptable = parseFloat((expectedDeploy * 0.85).toFixed(2));
         if (amountY < minAcceptable) {
           return {
             pass: false,
-            reason: `Deploy amount ${amountY} SOL is too low. Wallet balance suggests deploying ${expectedDeploy} SOL (minimum acceptable: ${minAcceptable} SOL). Use at least ${minAcceptable} SOL.`,
+            reason: `Deploy amount ${amountY} ${qSym} is too low. Wallet balance suggests deploying ${expectedDeploy} ${qSym} (minimum acceptable: ${minAcceptable} ${qSym}). Use at least ${minAcceptable} ${qSym}.`,
           };
         }
       }

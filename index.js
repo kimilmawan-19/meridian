@@ -10,7 +10,7 @@ import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates, fetchPoolVolatility } from "./tools/screening.js";
 import { assessMarketRegime } from "./market-regime.js";
 import { fetchPoolMarketData, getMarketDataStats } from "./tools/market-data.js";
-import { config, configMeta, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
+import { config, configMeta, reloadScreeningThresholds, computeDeployAmount, getQuoteMeta } from "./config.js";
 import { evolveThresholds, getPerformanceSummary, getDetailedPerformanceAnalysis } from "./lessons.js";
 import { executeTool, registerCronRestarter } from "./tools/executor.js";
 import {
@@ -753,6 +753,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
   let prePositions, preBalance;
   let liveMessage = null;
   let screenReport = null;
+  let targetQuoteMeta = null;
   try {
     [prePositions, preBalance] = await Promise.all([getMyPositions({ force: true }), getWalletBalances()]);
     if (prePositions.total_positions >= config.risk.maxPositions) {
@@ -767,23 +768,25 @@ export async function runScreeningCycle({ silent = false } = {}) {
       _screeningBusy = false;
       return screenReport;
     }
-    const minRequired = Math.max(
-      config.management.minSolToOpen ?? 0.55,
-      config.management.deployAmountSol + config.management.gasReserve
-    );
+    // Pick which quote (SOL or USDC) this cycle deploys into — the one with the most idle
+    // deployable capital. SOL pools are funded by the SOL balance, USDC pools by the USDC balance.
     const isDryRun = process.env.DRY_RUN === "true";
-    if (!isDryRun && preBalance.sol < minRequired) {
-      log("cron", `Screening skipped — insufficient SOL (${preBalance.sol.toFixed(3)} < ${minRequired} needed for deploy + gas)`);
-      screenReport = `Screening skipped — insufficient SOL (${preBalance.sol.toFixed(3)} < ${minRequired} needed for deploy + gas).`;
+    const picked = selectTargetQuote(preBalance, prePositions);
+    targetQuoteMeta = picked?.meta ?? getQuoteMeta("SOL"); // dry-run / no-balance → default SOL
+    if (!isDryRun && !picked) {
+      const usdcStr = (preBalance.usdc ?? 0).toFixed(2);
+      log("cron", `Screening skipped — no quote has enough idle capital (SOL ${preBalance.sol.toFixed(3)}, USDC ${usdcStr})`);
+      screenReport = `Screening skipped — insufficient idle capital in any enabled quote (SOL ${preBalance.sol.toFixed(3)}, USDC ${usdcStr}).`;
       appendDecision({
         type: "skip",
         actor: "SCREENER",
         summary: "Screening skipped",
-        reason: `Insufficient SOL (${preBalance.sol.toFixed(3)} < ${minRequired})`,
+        reason: `Insufficient idle capital (SOL ${preBalance.sol.toFixed(3)}, USDC ${usdcStr})`,
       });
       _screeningBusy = false;
       return screenReport;
     }
+    log("cron", `Target quote this cycle: ${targetQuoteMeta.symbol} (idle-deployable ≈ $${(picked?.deployableUsd ?? 0).toFixed(2)})`);
   } catch (e) {
     log("cron_error", `Screening pre-check failed: ${e.message}`);
     screenReport = `Screening pre-check failed: ${e.message}`;
@@ -800,15 +803,19 @@ export async function runScreeningCycle({ silent = false } = {}) {
     // NOTE: deployAmount is computed AFTER the market-regime block below, so equity fair-share
     // sizing can read this cycle's regime (config.marketRegime._activeRegime).
     const currentBalance = preBalance;
+    const quoteSym = targetQuoteMeta.symbol;
+    // Side-channel for the executor's deploy guard (mirrors marketRegime._activeRegime). The
+    // executor reads args.quote_mint first, then falls back to this cycle's target quote, then SOL.
+    config.screening._activeQuoteMint = targetQuoteMeta.mint;
 
     // Load active strategy
     const activeStrategy = getActiveStrategy();
     const strategyBlock = activeStrategy
-      ? `ACTIVE STRATEGY: ${activeStrategy.name} — LP: ${activeStrategy.lp_strategy} | bins_above: ${activeStrategy.range?.bins_above ?? 0} (FIXED — never change) | deposit: ${activeStrategy.entry?.single_side === "sol" ? "SOL only (amount_y, amount_x=0)" : "dual-sided"} | best for: ${activeStrategy.best_for}`
-      : `No active strategy — use default bid_ask, bins_above: 0, SOL only.`;
+      ? `ACTIVE STRATEGY: ${activeStrategy.name} — LP: ${activeStrategy.lp_strategy} | bins_above: ${activeStrategy.range?.bins_above ?? 0} (FIXED — never change) | deposit: ${activeStrategy.entry?.single_side ? `${quoteSym} only (amount_y, amount_x=0)` : "dual-sided"} | best for: ${activeStrategy.best_for}`
+      : `No active strategy — use default bid_ask, bins_above: 0, ${quoteSym} only.`;
 
-    // Fetch top candidates, then recon each sequentially with a small delay to avoid 429s
-    const topCandidates = await getTopCandidates({ limit: 10 }).catch(() => null);
+    // Fetch top candidates (filtered to this cycle's target quote), then recon sequentially.
+    const topCandidates = await getTopCandidates({ limit: 10, quote: quoteSym }).catch(() => null);
     const candidates = (topCandidates?.candidates || topCandidates?.pools || []).slice(0, 10);
     const earlyFilteredExamples = topCandidates?.filtered_examples || [];
 
@@ -868,8 +875,15 @@ export async function runScreeningCycle({ silent = false } = {}) {
     // Equity Fair-Share sizing: each position targets equity/maxPositions, scaled by regime.
     // Computed here (after regime assessment) so this cycle's regime modulates the size.
     const openPositionsValueSol = sumOpenPositionsValueSol(prePositions, currentBalance.sol_price);
-    const deployAmount = computeDeployAmount(currentBalance.sol, { openPositionsValueSol });
-    log("cron", `Computed deploy amount: ${deployAmount} SOL (wallet: ${currentBalance.sol} SOL, open-pos: ${openPositionsValueSol.toFixed(3)} SOL, regime: ${config.marketRegime._activeRegime})`);
+    const openPositionsValueUsd = sumOpenPositionsValueUsd(prePositions, targetQuoteMeta.mint);
+    const deployAmount = computeDeployAmount(currentBalance.sol, {
+      openPositionsValueSol,
+      quote: quoteSym,
+      usdcBalance: currentBalance.usdc,
+      solPrice: currentBalance.sol_price,
+      openPositionsValueUsd,
+    });
+    log("cron", `Computed deploy amount: ${deployAmount} ${quoteSym} (wallet: ${currentBalance.sol} SOL / ${(currentBalance.usdc ?? 0).toFixed(2)} USDC, open-pos[${quoteSym}]: ${(quoteSym === "SOL" ? openPositionsValueSol : openPositionsValueUsd).toFixed(3)}, regime: ${config.marketRegime._activeRegime})`);
 
     const allCandidates = [];
     for (const pool of candidates) {
@@ -1253,7 +1267,8 @@ export async function runScreeningCycle({ silent = false } = {}) {
     const { content } = await agentLoop(`
 SCREENING CYCLE
 ${strategyBlock}
-Positions: ${prePositions.total_positions}/${config.risk.maxPositions} | SOL: ${currentBalance.sol.toFixed(3)} | Deploy: ${deployAmount} SOL
+Positions: ${prePositions.total_positions}/${config.risk.maxPositions} | Wallet: ${currentBalance.sol.toFixed(3)} SOL / ${(currentBalance.usdc ?? 0).toFixed(2)} USDC
+QUOTE THIS CYCLE: ${quoteSym} — all candidates below are ${quoteSym}-quoted. Deploy: ${deployAmount} ${quoteSym}. When calling deploy_position, pass amount_y=${deployAmount} AND quote_mint="${targetQuoteMeta.mint}" (the candidate's quote.mint). Single-sided ${quoteSym} only — amount_x=0.
 
 PRE-LOADED CANDIDATES (${passing.length} pools):
 ${candidateBlocks.join("\n\n")}
@@ -1262,14 +1277,14 @@ STEPS:
 1. Decide if any candidate is actually worth deploying. One surviving candidate is not automatically good enough.
 2. Pick the best candidate based on narrative quality, smart wallets, and pool metrics.
 3. Call deploy_position (active_bin is pre-fetched above — no need to call get_active_bin).
-   Compute bins_below and bins_above using the strategy-specific guidance in your system prompt (DEPLOY RULES section). Pass deploy_position.volatility = the candidate volatility value.
+   Compute bins_below and bins_above using the strategy-specific guidance in your system prompt (DEPLOY RULES section). Pass deploy_position.volatility = the candidate volatility value. Pass quote_mint="${targetQuoteMeta.mint}" and amount_y=${deployAmount} (${quoteSym}).
 4. Report in this exact format (no tables, no extra sections):
    🚀 DEPLOYED
 
    <pool name>
    <pool address>
 
-   ◎ <deploy amount> SOL | <strategy> | bin <active_bin>
+   <deploy amount> ${quoteSym} | <strategy> | bin <active_bin>
    Range: <minPrice> → <maxPrice>
    Range cover: <downside %> downside | <upside %> upside | <total width %> total
 
@@ -1369,6 +1384,9 @@ IMPORTANT:
       config.screening.minOrganic = _cautionOrigOrganic;
       _cautionOrigOrganic = null;
     }
+    // Clear the cycle's target-quote side-channel so it can't leak into an unrelated manual
+    // deploy (which would pass its own quote_mint, or default to SOL — the safe baseline).
+    config.screening._activeQuoteMint = null;
     _screeningBusy = false;
     if (!silent && telegramEnabled()) {
       if (screenReport) {
@@ -2435,13 +2453,22 @@ async function deployLatestCandidate(index) {
     }
   }
   const [balance, positions] = await Promise.all([getWalletBalances(), getMyPositions({ force: true })]);
+  const quoteMeta = getQuoteMeta(candidate.quote?.mint ?? candidate.quote?.symbol) ?? getQuoteMeta("SOL");
   const openPositionsValueSol = sumOpenPositionsValueSol(positions, balance.sol_price);
-  const deployAmount = computeDeployAmount(balance.sol, { openPositionsValueSol });
+  const openPositionsValueUsd = sumOpenPositionsValueUsd(positions, quoteMeta.mint);
+  const deployAmount = computeDeployAmount(balance.sol, {
+    openPositionsValueSol,
+    quote: quoteMeta.symbol,
+    usdcBalance: balance.usdc,
+    solPrice: balance.sol_price,
+    openPositionsValueUsd,
+  });
   const binsBelow = computeBinsBelow(candidate.volatility);
   const binsAbove = Math.ceil(binsBelow * 0.25);
   const result = await executeTool("deploy_position", {
     pool_address: candidate.pool,
     amount_y: deployAmount,
+    quote_mint: quoteMeta.mint,
     strategy: config.strategy.strategy,
     bins_below: binsBelow,
     bins_above: binsAbove,
@@ -2457,7 +2484,7 @@ async function deployLatestCandidate(index) {
   if (result?.success === false || result?.error) {
     throw new Error(result.error || "Deploy failed");
   }
-  return { result, candidate, deployAmount, binsBelow };
+  return { result, candidate, deployAmount, binsBelow, quoteSymbol: quoteMeta.symbol };
 }
 
 function appendHistory(userMsg, assistantMsg) {
@@ -2758,14 +2785,14 @@ async function telegramHandler(msg) {
   if (deployMatch) {
     try {
       const idx = parseInt(deployMatch[1]) - 1;
-      const { candidate, result, deployAmount, binsBelow } = await deployLatestCandidate(idx);
+      const { candidate, result, deployAmount, binsBelow, quoteSymbol } = await deployLatestCandidate(idx);
       const coverage = result.range_coverage
         ? `Range: ${fmtPct(result.range_coverage.downside_pct)} downside | ${fmtPct(result.range_coverage.upside_pct)} upside`
         : `Strategy: ${config.strategy.strategy} | binsBelow: ${binsBelow}`;
       await sendMessage([
         `✅ Deployed ${candidate.name}`,
         `Pool: ${candidate.pool}`,
-        `Amount: ${deployAmount} SOL`,
+        `Amount: ${deployAmount} ${quoteSymbol || "SOL"}`,
         coverage,
         `Position: ${result.position || "n/a"}`,
         result.txs?.length ? `Tx: ${result.txs[0]}` : null,
@@ -2995,15 +3022,63 @@ function getLoneCandidateSkipReason({ pool, sw, n } = {}) {
   return null;
 }
 
-// Sum open-position value in SOL for equity fair-share sizing. Uses total_value_true_usd
-// (always USD, regardless of solMode) ÷ sol_price. Returns 0 if data is missing so the
-// caller's equity degrades conservatively to wallet-only.
+// Sum open-position value (USD) for positions matching a given quote mint. Uses
+// total_value_true_usd (always USD, regardless of solMode). Positions tracked before multi-quote
+// support have no quote_mint → treated as SOL (back-compat). Pass quoteMint=null to sum all.
+function sumOpenPositionsValueUsd(positions, quoteMint) {
+  const list = positions?.positions ?? [];
+  const SOL = config.tokens.SOL;
+  return list.reduce((sum, p) => {
+    const pq = p?.quote_mint || SOL; // untagged legacy positions → SOL
+    if (quoteMint && pq !== quoteMint) return sum;
+    return sum + (Number(p?.total_value_true_usd ?? p?.total_value_usd) || 0);
+  }, 0);
+}
+
+// Sum open SOL-quoted position value in SOL for equity fair-share sizing (SOL path).
+// Only counts SOL-quoted positions (USDC positions belong to the USDC capital pool). With a
+// SOL-only wallet this is identical to the original all-positions sum. Returns 0 if price is
+// missing so the caller's equity degrades conservatively to wallet-only.
 function sumOpenPositionsValueSol(positions, solPrice) {
   const price = Number(solPrice);
   if (!Number.isFinite(price) || price <= 0) return 0;
-  const list = positions?.positions ?? [];
-  const usd = list.reduce((sum, p) => sum + (Number(p?.total_value_true_usd ?? p?.total_value_usd) || 0), 0);
+  const usd = sumOpenPositionsValueUsd(positions, config.tokens.SOL);
   return usd > 0 ? usd / price : 0;
+}
+
+// Pick the quote token to screen this cycle: the eligible quote with the largest idle-deployable
+// balance (measured in USD). A quote is eligible if its idle deployable >= its min-to-open floor
+// (and, for USDC, a SOL gas buffer exists). Returns { meta, deployableUsd } or null when no quote
+// has enough idle capital. The shared position cap is enforced separately by the caller.
+function selectTargetQuote(balance, positions) {
+  const enabled = Array.isArray(config.screening.quoteTokens) && config.screening.quoteTokens.length
+    ? config.screening.quoteTokens : ["SOL"];
+  const solPrice = Number(balance.sol_price) || 0;
+  const reserve  = config.management.gasReserve ?? 0.2;
+  let best = null;
+  for (const q of enabled) {
+    const meta = getQuoteMeta(q);
+    if (!meta) continue;
+    let deployableUsd, minToOpenUsd;
+    if (meta.symbol === "SOL") {
+      const deployableSol = Math.max(0, (balance.sol || 0) - reserve);
+      const minSol = Math.max(config.management.minSolToOpen ?? 0.55, config.management.deployAmountSol + reserve);
+      deployableUsd = solPrice > 0 ? deployableSol * solPrice : deployableSol;
+      minToOpenUsd  = solPrice > 0 ? minSol * solPrice : minSol;
+    } else if (meta.symbol === "USDC") {
+      if ((balance.sol || 0) < reserve) continue; // need SOL to pay gas
+      deployableUsd = Math.max(0, balance.usdc || 0);
+      minToOpenUsd  = config.management.minUsdcToOpen
+        ?? config.management.deployAmountUsd
+        ?? (solPrice > 0 ? config.management.deployAmountSol * solPrice : 0);
+    } else {
+      continue; // unsupported as a fundable quote
+    }
+    if (deployableUsd > 0 && deployableUsd >= minToOpenUsd && (best == null || deployableUsd > best.deployableUsd)) {
+      best = { meta, deployableUsd };
+    }
+  }
+  return best;
 }
 
 function computeBinsBelow(volatility) {

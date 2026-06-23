@@ -157,17 +157,17 @@ NARRATIVE QUALITY (your main judgment call):
 
 POOL MEMORY: Past losses or problems → strong skip signal.
 
-ACTIVE STRATEGY: ${config.strategy.strategy} (single-sided SOL only — amount_y only, amount_x=0)
+ACTIVE STRATEGY: ${config.strategy.strategy} (single-sided quote-only — amount_y only, amount_x=0). The active quote token for THIS cycle (SOL or USDC) is stated in the goal as "QUOTE THIS CYCLE"; deploy only into pools of that quote and pass its quote_mint to deploy_position.
 ${config.strategy.strategy === "bid_ask" ? `BID_ASK CHARACTERISTICS — read carefully, this shapes your candidate selection:
-- Liquidity is concentrated in bins BELOW current price. As price drops into the range, SOL converts to token and fees accrue from oscillation.
+- Liquidity is concentrated in bins BELOW current price. As price drops into the range, the quote token (SOL or USDC) converts to the base token and fees accrue from oscillation.
 - IDEAL setup: token with strong narrative + active community where price is currently elevated but expected to consolidate/dip back through your range with oscillation. Fees are earned when price ping-pongs through the active bins.
 - AVOID: tokens in unilateral pump (price will run away from your range upward — no oscillation, no fees) or in unilateral dump (you catch a falling knife and end up holding bag).
 - PREFER: tokens with high volatility (volatility >= 3) AND signs of oscillation (not pure trend). Smart wallet presence is a strong signal of accumulation zone.
 - ATH context matters: deploying near ATH is risky for bid_ask — price has more room to drop through your range, but also more risk of dump-and-stay. Mid-range entries (20-40% below ATH) are often the sweet spot.
 ` : `CURVE CHARACTERISTICS — read carefully, this shapes your candidate selection:
-- Liquidity is concentrated AROUND the active bin (bell-curve shape centred at current price). As price moves slightly below entry, SOL converts to token gradually — designed to accumulate on mild dips and earn fees from oscillation near the centre.
+- Liquidity is concentrated AROUND the active bin (bell-curve shape centred at current price). As price moves slightly below entry, the quote token (SOL or USDC) converts to the base token gradually — designed to accumulate on mild dips and earn fees from oscillation near the centre.
 - IDEAL setup: token with stable-to-moderate volatility that oscillates around a support zone. Mild pullbacks are expected and healthy — curve earns fees on both directions of small swings.
-- AVOID: tokens in confirmed freefall / unilateral dump with no reversal signal. Curve WILL convert SOL to tokens as price drops, turning you into a bag-holder if the dump continues well below your range. A 1h price drop beyond -30% with no smart wallet presence is a falling-knife — skip it.
+- AVOID: tokens in confirmed freefall / unilateral dump with no reversal signal. Curve WILL convert the quote token to the base token as price drops, turning you into a bag-holder if the dump continues well below your range. A 1h price drop beyond -30% with no smart wallet presence is a falling-knife — skip it.
 - PREFER: tokens where price is pulling back from a moderate local high with volume support (not collapsing). Entry near an oscillation support zone with bullish smart wallet activity is the sweet spot.
 - ATH context: deploying a curve when price is far below ATH is fine — curve is designed for mid-range, not ATH chasing. Deploying a curve into a token that just dumped -40% in 1h is not fine.
 `}
@@ -180,7 +180,7 @@ DEPLOY RULES:
   - bin_step < 100 → gunakan rules volatility + top_cluster_trend di bawah (tidak berubah):
     - volatility > ${config.strategy.curveMaxVolatility} → strategy="bid_ask". Extreme oscillation — price genuinely reaches the deep accumulation bins.
     - volatility <= ${config.strategy.curveMaxVolatility} AND top_cluster_trend="bullish" → strategy="bid_ask". Smart money is accumulating; price is trending up. Curve would go OOR above quickly (as in the TOLYBOT case). bid_ask covers both directions and survives the upward move.
-    - volatility <= ${config.strategy.curveMaxVolatility} AND (top_cluster_trend="bearish", "neutral", absent, or OKX data unavailable) → strategy="curve". Concentrates SOL near active bin where price spends most time — highest fee efficiency, lowest bag-holding risk. Default for most candidates.
+    - volatility <= ${config.strategy.curveMaxVolatility} AND (top_cluster_trend="bearish", "neutral", absent, or OKX data unavailable) → strategy="curve". Concentrates the quote token near active bin where price spends most time — highest fee efficiency, lowest bag-holding risk. Default for most candidates.
   - Always pass top_cluster_trend to deploy_position when it appears in the candidate's okx/ath line.
   - Never use strategy="spot" here — curve is strictly better than spot at every volatility level.
 - bins_below = round(${config.strategy.minBinsBelow} + (candidate volatility / 5) × ${config.strategy.maxBinsBelow - config.strategy.minBinsBelow}) clamped to [${config.strategy.minBinsBelow}, ${config.strategy.maxBinsBelow}]. Volatility must be a positive number; 0/unknown means skip.
