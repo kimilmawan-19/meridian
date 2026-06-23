@@ -60,6 +60,10 @@ export const config = {
     // Ceiling for USDC-quoted deploys (USD). null → derived from maxDeployAmount × live SOL price,
     // so USDC sizing works out-of-the-box but can be set explicitly to decouple it from SOL price.
     maxDeployAmountUsd: u.maxDeployAmountUsd ?? null,
+    // Share of the maxPositions slots allocated to SOL-quoted positions (percent). The remainder
+    // goes to non-SOL quotes (USDC). Drives getQuoteSlotAllocation() → with maxPositions=3 and 60,
+    // SOL gets 2 slots and USDC 1. Per-quote caps are strict (no spillover).
+    solSlotAllocationPct: u.solSlotAllocationPct ?? 60,
   },
 
   // ─── Pool Screening Thresholds ───────────
@@ -408,9 +412,60 @@ export function getQuoteMeta(quote) {
 }
 
 /**
+ * Partition the maxPositions slots across the enabled quote tokens by ratio, returning an integer
+ * slot count per quote whose sum is exactly maxPositions. SOL receives risk.solSlotAllocationPct%
+ * of the slots; the remainder is split evenly across non-SOL quotes (USDC). Largest-remainder
+ * rounding keeps the totals exact. Per-quote caps are strict — callers do NOT spill an unfilled
+ * quote's slots onto another quote.
+ *
+ * Examples (solSlotAllocationPct=60): (3,["SOL","USDC"])→{SOL:2,USDC:1}; (2,…)→{SOL:1,USDC:1};
+ * (5,…)→{SOL:3,USDC:2}; (1,…)→{SOL:1,USDC:0}. A single enabled quote gets all slots
+ * ({SOL:maxPositions} or {USDC:maxPositions}) → SOL-only / USDC-only modes are unchanged.
+ *
+ * @param {number} maxPositions  Total concurrent-position cap (config.risk.maxPositions).
+ * @param {string[]} enabledQuotes  Quote symbols/mints (config.screening.quoteTokens).
+ * @returns {Object<string, number>} symbol → slot count (sums to maxPositions).
+ */
+export function getQuoteSlotAllocation(maxPositions, enabledQuotes) {
+  const cap = Math.max(0, Math.floor(Number(maxPositions) || 0));
+  const known = [];
+  for (const q of enabledQuotes || []) {
+    const sym = getQuoteMeta(q)?.symbol;
+    if (sym && !known.includes(sym)) known.push(sym);
+  }
+  if (known.length === 0) return {};
+  if (known.length === 1) return { [known[0]]: cap };
+
+  const solPct = Math.min(100, Math.max(0, Number(config.risk.solSlotAllocationPct ?? 60))) / 100;
+  const hasSol = known.includes("SOL");
+  const nonSolCount = known.length - (hasSol ? 1 : 0);
+  const weights = {};
+  for (const sym of known) {
+    weights[sym] = sym === "SOL" ? solPct : (nonSolCount > 0 ? (1 - solPct) / nonSolCount : 0);
+  }
+  const totalW = known.reduce((s, sym) => s + weights[sym], 0) || 1;
+
+  // Largest-remainder apportionment: floor each share, then hand out the leftover slots to the
+  // quotes with the biggest fractional parts so the integer totals sum to exactly `cap`.
+  const rows = known.map((sym) => {
+    const raw = cap * (weights[sym] / totalW);
+    return { sym, floor: Math.floor(raw), frac: raw - Math.floor(raw) };
+  });
+  const slots = {};
+  let used = 0;
+  for (const r of rows) { slots[r.sym] = r.floor; used += r.floor; }
+  let leftover = cap - used;
+  rows.sort((a, b) => b.frac - a.frac);
+  for (let i = 0; i < rows.length && leftover > 0; i++, leftover--) slots[rows[i].sym]++;
+  return slots;
+}
+
+/**
  * Compute the optimal deploy amount in the units of the target quote, using Equity Fair-Share
- * + Regime Modulation. The SOL path is byte-identical to the original (regression-safe); the
- * USDC path mirrors the same fair-share math in USD and returns a USDC amount.
+ * + Regime Modulation. The fair-share divisor is opts.quoteSlots (this quote's allocated slots);
+ * when omitted it falls back to maxPositions, which keeps the SOL path identical to the original in
+ * SOL-only mode (SOL then owns all slots). The USDC path mirrors the same fair-share math in USD
+ * and returns a USDC amount.
  *
  * @param {number} walletSol  Native SOL balance (used for the SOL path + SOL deployable).
  * @param {object} [opts]
@@ -419,6 +474,7 @@ export function getQuoteMeta(quote) {
  * @param {number}  [opts.usdcBalance=0]            Idle USDC balance (USDC path).
  * @param {number}  [opts.solPrice=0]               Live SOL/USD price (to derive USDC floor/ceil when not set explicitly).
  * @param {number}  [opts.openPositionsValueUsd=0]  USDC-path equity contribution from open USDC positions (USD).
+ * @param {number}  [opts.quoteSlots]               Slots allocated to this quote (getQuoteSlotAllocation). Divisor for the fair-share; omitted → maxPositions.
  * @returns {number} Deploy amount in the quote's own units (SOL or USDC).
  */
 export function computeDeployAmount(walletSol, opts = {}) {
@@ -428,9 +484,15 @@ export function computeDeployAmount(walletSol, opts = {}) {
     usdcBalance = 0,
     solPrice = 0,
     openPositionsValueUsd = 0,
+    quoteSlots,
   } = opts;
 
   const maxPositions = config.risk.maxPositions || 1;
+  // Divisor for the equity fair-share. When the caller supplies this quote's allocated slot count
+  // (getQuoteSlotAllocation), each position targets equity ÷ that quote's slots — so SOL and USDC
+  // size independently of one another. Callers that omit it fall back to maxPositions (back-compat;
+  // also keeps SOL-only mode identical, since SOL then owns all maxPositions slots).
+  const slots = (Number.isFinite(quoteSlots) && quoteSlots > 0) ? quoteSlots : maxPositions;
   const regime     = config.marketRegime?._activeRegime ?? "healthy";
   const regimeMult = regime === "caution"
     ? (config.marketRegime?.cautionPositionSizeMult ?? 0.75)
@@ -444,7 +506,7 @@ export function computeDeployAmount(walletSol, opts = {}) {
     const usdc     = Math.max(0, Number(usdcBalance) || 0);
     const posUsd   = Number.isFinite(openPositionsValueUsd) ? Math.max(0, openPositionsValueUsd) : 0;
     const equityUsd    = usdc + posUsd;
-    const baseShareUsd = equityUsd / maxPositions;
+    const baseShareUsd = equityUsd / slots;
     const targetUsd    = baseShareUsd * regimeMult;
     // deployable = idle USDC (gas reserve is SOL, validated separately in the executor)
     const result = Math.min(ceilUsd, usdc, Math.max(floorUsd, targetUsd));
@@ -458,7 +520,7 @@ export function computeDeployAmount(walletSol, opts = {}) {
 
   const posValueSol = Number.isFinite(openPositionsValueSol) ? Math.max(0, openPositionsValueSol) : 0;
   const equitySol   = Math.max(0, walletSol) + posValueSol;
-  const baseShare   = equitySol / maxPositions;
+  const baseShare   = equitySol / slots;
 
   const deployable = Math.max(0, walletSol - reserve);
   const target     = baseShare * regimeMult;

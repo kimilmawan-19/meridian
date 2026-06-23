@@ -10,7 +10,7 @@ import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates, fetchPoolVolatility } from "./tools/screening.js";
 import { assessMarketRegime } from "./market-regime.js";
 import { fetchPoolMarketData, getMarketDataStats } from "./tools/market-data.js";
-import { config, configMeta, reloadScreeningThresholds, computeDeployAmount, getQuoteMeta } from "./config.js";
+import { config, configMeta, reloadScreeningThresholds, computeDeployAmount, getQuoteMeta, getQuoteSlotAllocation } from "./config.js";
 import { evolveThresholds, getPerformanceSummary, getDetailedPerformanceAnalysis } from "./lessons.js";
 import { executeTool, registerCronRestarter } from "./tools/executor.js";
 import {
@@ -754,6 +754,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
   let liveMessage = null;
   let screenReport = null;
   let targetQuoteMeta = null;
+  let targetQuoteSlots = null;
   try {
     [prePositions, preBalance] = await Promise.all([getMyPositions({ force: true }), getWalletBalances()]);
     if (prePositions.total_positions >= config.risk.maxPositions) {
@@ -773,15 +774,24 @@ export async function runScreeningCycle({ silent = false } = {}) {
     const isDryRun = process.env.DRY_RUN === "true";
     const picked = selectTargetQuote(preBalance, prePositions);
     targetQuoteMeta = picked?.meta ?? getQuoteMeta("SOL"); // dry-run / no-balance → default SOL
+    // Slots allocated to the target quote — the per-quote divisor for equity fair-share sizing.
+    // No pick (dry-run default SOL) → derive from the allocation table.
+    targetQuoteSlots = picked?.slots
+      ?? getQuoteSlotAllocation(config.risk.maxPositions, config.screening.quoteTokens ?? ["SOL"])[targetQuoteMeta.symbol]
+      ?? config.risk.maxPositions;
     if (!isDryRun && !picked) {
       const usdcStr = (preBalance.usdc ?? 0).toFixed(2);
-      log("cron", `Screening skipped — no quote has enough idle capital (SOL ${preBalance.sol.toFixed(3)}, USDC ${usdcStr})`);
-      screenReport = `Screening skipped — insufficient idle capital in any enabled quote (SOL ${preBalance.sol.toFixed(3)}, USDC ${usdcStr}).`;
+      // No pick means no enabled quote both has a free allocation slot (60:40 strict) AND enough
+      // idle capital — e.g. SOL's 2 slots are full while USDC sits empty (slots stay idle, no spillover).
+      const allocStr = Object.entries(getQuoteSlotAllocation(config.risk.maxPositions, config.screening.quoteTokens ?? ["SOL"]))
+        .map(([s, n]) => `${s} ${countOpenPositionsByQuote(prePositions, getQuoteMeta(s).mint)}/${n}`).join(", ");
+      log("cron", `Screening skipped — no quote eligible (idle capital + free allocation slot). SOL ${preBalance.sol.toFixed(3)}, USDC ${usdcStr} | slots used: ${allocStr}`);
+      screenReport = `Screening skipped — no enabled quote has both a free allocation slot and enough idle capital (SOL ${preBalance.sol.toFixed(3)}, USDC ${usdcStr}; slots ${allocStr}).`;
       appendDecision({
         type: "skip",
         actor: "SCREENER",
         summary: "Screening skipped",
-        reason: `Insufficient idle capital (SOL ${preBalance.sol.toFixed(3)}, USDC ${usdcStr})`,
+        reason: `No eligible quote (SOL ${preBalance.sol.toFixed(3)}, USDC ${usdcStr}; slots ${allocStr})`,
       });
       _screeningBusy = false;
       return screenReport;
@@ -882,8 +892,9 @@ export async function runScreeningCycle({ silent = false } = {}) {
       usdcBalance: currentBalance.usdc,
       solPrice: currentBalance.sol_price,
       openPositionsValueUsd,
+      quoteSlots: targetQuoteSlots,
     });
-    log("cron", `Computed deploy amount: ${deployAmount} ${quoteSym} (wallet: ${currentBalance.sol} SOL / ${(currentBalance.usdc ?? 0).toFixed(2)} USDC, open-pos[${quoteSym}]: ${(quoteSym === "SOL" ? openPositionsValueSol : openPositionsValueUsd).toFixed(3)}, regime: ${config.marketRegime._activeRegime})`);
+    log("cron", `Computed deploy amount: ${deployAmount} ${quoteSym} (wallet: ${currentBalance.sol} SOL / ${(currentBalance.usdc ?? 0).toFixed(2)} USDC, open-pos[${quoteSym}]: ${(quoteSym === "SOL" ? openPositionsValueSol : openPositionsValueUsd).toFixed(3)}, slots[${quoteSym}]: ${targetQuoteSlots}, regime: ${config.marketRegime._activeRegime})`);
 
     const allCandidates = [];
     for (const pool of candidates) {
@@ -2086,7 +2097,8 @@ function describeLatestCandidates(limit = 5) {
 
 function formatWalletStatus(wallet, positions) {
   const openPositionsValueSol = sumOpenPositionsValueSol(positions, wallet.sol_price);
-  const deployAmount = computeDeployAmount(wallet.sol, { openPositionsValueSol });
+  const solSlots = getQuoteSlotAllocation(config.risk.maxPositions, config.screening.quoteTokens ?? ["SOL"]).SOL;
+  const deployAmount = computeDeployAmount(wallet.sol, { openPositionsValueSol, quoteSlots: solSlots });
   const hive = isHiveMindEnabled() ? "on" : "off";
   return [
     `Wallet: ${wallet.sol} SOL ($${wallet.sol_usd})`,
@@ -2456,12 +2468,14 @@ async function deployLatestCandidate(index) {
   const quoteMeta = getQuoteMeta(candidate.quote?.mint ?? candidate.quote?.symbol) ?? getQuoteMeta("SOL");
   const openPositionsValueSol = sumOpenPositionsValueSol(positions, balance.sol_price);
   const openPositionsValueUsd = sumOpenPositionsValueUsd(positions, quoteMeta.mint);
+  const quoteSlots = getQuoteSlotAllocation(config.risk.maxPositions, config.screening.quoteTokens ?? ["SOL"])[quoteMeta.symbol] ?? config.risk.maxPositions;
   const deployAmount = computeDeployAmount(balance.sol, {
     openPositionsValueSol,
     quote: quoteMeta.symbol,
     usdcBalance: balance.usdc,
     solPrice: balance.sol_price,
     openPositionsValueUsd,
+    quoteSlots,
   });
   const binsBelow = computeBinsBelow(candidate.volatility);
   const binsAbove = Math.ceil(binsBelow * 0.25);
@@ -3035,6 +3049,14 @@ function sumOpenPositionsValueUsd(positions, quoteMint) {
   }, 0);
 }
 
+// Count open positions matching a given quote mint, for per-quote slot-allocation caps. Positions
+// tracked before multi-quote support have no quote_mint → treated as SOL (same back-compat rule as
+// sumOpenPositionsValueUsd).
+function countOpenPositionsByQuote(positions, quoteMint) {
+  const SOL = config.tokens.SOL;
+  return (positions?.positions ?? []).filter((p) => (p?.quote_mint || SOL) === quoteMint).length;
+}
+
 // Sum open SOL-quoted position value in SOL for equity fair-share sizing (SOL path).
 // Only counts SOL-quoted positions (USDC positions belong to the USDC capital pool). With a
 // SOL-only wallet this is identical to the original all-positions sum. Returns 0 if price is
@@ -3047,18 +3069,24 @@ function sumOpenPositionsValueSol(positions, solPrice) {
 }
 
 // Pick the quote token to screen this cycle: the eligible quote with the largest idle-deployable
-// balance (measured in USD). A quote is eligible if its idle deployable >= its min-to-open floor
-// (and, for USDC, a SOL gas buffer exists). Returns { meta, deployableUsd } or null when no quote
-// has enough idle capital. The shared position cap is enforced separately by the caller.
+// balance (measured in USD). A quote is eligible if (a) it still has a free slot in its 60:40
+// allocation (strict — no spillover), (b) its idle deployable >= its min-to-open floor, and (c) for
+// USDC, a SOL gas buffer exists. Returns { meta, deployableUsd, slots } or null when no quote
+// qualifies. The shared maxPositions cap is enforced separately by the caller.
 function selectTargetQuote(balance, positions) {
   const enabled = Array.isArray(config.screening.quoteTokens) && config.screening.quoteTokens.length
     ? config.screening.quoteTokens : ["SOL"];
   const solPrice = Number(balance.sol_price) || 0;
   const reserve  = config.management.gasReserve ?? 0.2;
+  const slots    = getQuoteSlotAllocation(config.risk.maxPositions, enabled);
   let best = null;
   for (const q of enabled) {
     const meta = getQuoteMeta(q);
     if (!meta) continue;
+    // Strict per-quote cap: skip a quote that has already filled its allocated slots. Its idle slots
+    // are NOT handed to the other quote (no spillover) — exposure stays faithful to the 60:40 split.
+    const quoteSlots = slots[meta.symbol] ?? 0;
+    if (countOpenPositionsByQuote(positions, meta.mint) >= quoteSlots) continue;
     let deployableUsd, minToOpenUsd;
     if (meta.symbol === "SOL") {
       const deployableSol = Math.max(0, (balance.sol || 0) - reserve);
@@ -3075,7 +3103,7 @@ function selectTargetQuote(balance, positions) {
       continue; // unsupported as a fundable quote
     }
     if (deployableUsd > 0 && deployableUsd >= minToOpenUsd && (best == null || deployableUsd > best.deployableUsd)) {
-      best = { meta, deployableUsd };
+      best = { meta, deployableUsd, slots: quoteSlots };
     }
   }
   return best;

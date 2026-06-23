@@ -92,6 +92,7 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 | maxDeployAmount | risk | 50 |
 | maxDeployAmountUsd | risk | null (→ maxDeployAmount × solPrice) |
 | maxPositions | risk | 3 |
+| solSlotAllocationPct | risk | 60 |
 | gasReserve | management | 0.2 |
 | positionSizePct | management | 0.35 |
 | minSolToOpen | management | 0.55 |
@@ -131,18 +132,18 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 
 ```
 equitySol  = walletSol + openPositionsValueSol
-baseShare  = equitySol / risk.maxPositions          # fixed divisor, NOT cautionMaxPositions
+baseShare  = equitySol / quoteSlots                 # slot jatah quote ini (default = maxPositions); NOT cautionMaxPositions
 regimeMult = (_activeRegime === "caution") ? cautionPositionSizeMult (0.75) : 1.0
 deployable = max(0, walletSol - gasReserve)
 deploy     = clamp(baseShare × regimeMult, floor=deployAmountSol, ceil=min(maxDeployAmount, deployable))
 ```
 
-- Pembagi **tetap** `maxPositions` (bukan `cautionMaxPositions`) — kalau caution memakai pembagi lebih kecil, posisi malah membesar (salah arah). `regimeMult` yang menangani pengecilan saat caution.
+- Pembagi = **slot jatah quote** (`opts.quoteSlots`, dari *Per-Quote Slot Allocation*); tanpa `quoteSlots` → fallback `maxPositions`. **Bukan** `cautionMaxPositions` — kalau caution memakai pembagi lebih kecil, posisi malah membesar (salah arah). `regimeMult` yang menangani pengecilan saat caution.
 - Regime dibaca dari runtime `config.marketRegime._activeRegime` (di-set di `index.js` screening cycle setelah `assessMarketRegime`). Guard di `executor.js` membaca nilai yang sama → konsisten dengan prompt.
 - Nilai posisi dikonversi via `position.total_value_true_usd ÷ sol_price` (hindari ambiguitas `solMode`). Pemanggil tanpa opts → equity degrade ke `walletSol` saja (konservatif).
 - `positionSizePct` (config lama) tidak lagi dipakai untuk sizing utama; tetap ada agar `user-config.json` lama tidak pecah.
 
-`computeDeployAmount(walletSol, opts)` sekarang **quote-aware**. `opts.quote` (`"SOL"`|`"USDC"`) memilih jalur. Jalur SOL **byte-identical** dengan formula lama (tanpa regresi). Jalur USDC memakai fair-share yang sama dalam USD lalu kembalikan jumlah USDC: `equityUsd = usdcBalance + openPositionsValueUsd(USDC-only)`, `deployableUsd = usdcBalance` (gas = SOL, dicek terpisah), floor/ceil dari `deployAmountUsd`/`maxDeployAmountUsd` (bila null → `deployAmountSol`/`maxDeployAmount × solPrice`).
+`computeDeployAmount(walletSol, opts)` sekarang **quote-aware** + **slot-aware**. `opts.quote` (`"SOL"`|`"USDC"`) memilih jalur; `opts.quoteSlots` jadi pembagi fair-share. Jalur SOL tetap **identik** dengan formula lama di mode SOL-only (slot SOL = `maxPositions`); di multi-quote pembagi = slot SOL (mis. 2 dari 3). Jalur USDC memakai fair-share yang sama dalam USD lalu kembalikan jumlah USDC: `equityUsd = usdcBalance + openPositionsValueUsd(USDC-only)`, `baseShareUsd = equityUsd / quoteSlots`, `deployableUsd = usdcBalance` (gas = SOL, dicek terpisah), floor/ceil dari `deployAmountUsd`/`maxDeployAmountUsd` (bila null → `deployAmountSol`/`maxDeployAmount × solPrice`).
 
 ---
 
@@ -150,7 +151,7 @@ deploy     = clamp(baseShare × regimeMult, floor=deployAmountSol, ceil=min(maxD
 
 Bot bisa screening + deploy ke pool ber-quote **SOL atau USDC** (single-side `amount_y` = quote/`token_y`). Modal SOL mendanai pool SOL, modal USDC mendanai pool USDC. Diatur `config.screening.quoteTokens` (default `["SOL","USDC"]`; set `["SOL"]` untuk kembali SOL-only). USDT dikenal `getQuoteMeta` tapi off by default.
 
-- **Pemilihan quote per-cycle** (`index.js selectTargetQuote`): tiap screening cycle memilih **satu** target quote — yang idle-deployable-nya terbesar (USD) di antara quote enabled yang punya slot (cap **gabungan** `maxPositions`, dicek di `758`) dan saldo ≥ min-to-open. Tidak ada quote memenuhi → cycle skip. Target di-set ke side-channel `config.screening._activeQuoteMint` (mirror `_activeRegime`), dibersihkan di `finally`.
+- **Pemilihan quote per-cycle** (`index.js selectTargetQuote`): tiap screening cycle memilih **satu** target quote — yang idle-deployable-nya terbesar (USD) di antara quote enabled yang (a) masih punya **slot jatah** di alokasi 60:40 (lihat *Per-Quote Slot Allocation*) dan (b) saldo ≥ min-to-open. Cap **gabungan** `maxPositions` tetap dicek terpisah (`758`). Tidak ada quote memenuhi → cycle skip. Target di-set ke side-channel `config.screening._activeQuoteMint` (mirror `_activeRegime`), dibersihkan di `finally`.
 - **`getQuoteMeta(symbolOrMint)`** (`config.js`): `symbol → { symbol, mint, decimals }`. Desimal: SOL=9, USDC=6, USDT=6 — **sumber kebenaran konversi lamport**.
 - **Desimal deploy** (`dlmm.js`): `totalYLamports = finalAmountY × 10^quoteDecimals` (dulu hardcoded `1e9`). Quote diturunkan **otoritatif** dari `pool.lbPair.tokenYMint`; unknown quote → baca desimal on-chain.
 - **Screening filter** (`screening.js`): pool disaring ke `quoteTokens` (atau ke `quote` target bila diberikan), bukan SOL-only. `condensePool` membawa `quote.{symbol,mint,decimals}`.
@@ -160,6 +161,23 @@ Bot bisa screening + deploy ke pool ber-quote **SOL atau USDC** (single-side `am
 - **State** (`state.js trackPosition`): simpan `quote_mint`/`quote_symbol`/`quote_decimals`/`amount_quote`. Posisi lama tanpa quote → diperlakukan SOL.
 - **Relay** Agent Meridian (off by default) diguard ke `quote===SOL` (`inputSOL`/`allToken1` hardcoded SOL).
 - Prompt SCREENER netral-quote; goal per-cycle menyatakan `QUOTE THIS CYCLE: <SOL|USDC>` dan menyuruh LLM pass `quote_mint`.
+
+### Per-Quote Slot Allocation (60:40 SOL:USDC)
+
+Slot `maxPositions` dipartisi per-quote alih-alih dipakai greedy first-come. SOL mendapat `risk.solSlotAllocationPct`% (default **60**) dari slot, sisanya ke USDC. Sizing tiap quote membagi equity-nya dengan **jumlah slot quote itu**, bukan `maxPositions` → SOL dan USDC menentukan ukuran secara independen.
+
+```
+getQuoteSlotAllocation(maxPositions, enabledQuotes) → { SOL: n, USDC: m }   # config.js
+  - 1 quote enabled → { [sym]: maxPositions }   (SOL-only / USDC-only: tanpa regresi)
+  - ≥2: bobot SOL = solSlotAllocationPct/100, sisanya dibagi rata ke quote non-SOL;
+        largest-remainder rounding → integer, Σ = maxPositions
+  contoh (60): (3,[SOL,USDC])→{SOL:2,USDC:1}; (2,…)→{SOL:1,USDC:1}; (5,…)→{SOL:3,USDC:2}; (1,…)→{SOL:1,USDC:0}
+```
+
+- **Sizing** (`config.js computeDeployAmount`): `opts.quoteSlots` jadi pembagi fair-share (`baseShare = equity / quoteSlots`). Tanpa `quoteSlots` → fallback `maxPositions` (back-compat; mode SOL-only tetap **identik** karena SOL memiliki semua slot). Pemanggil yang men-target satu quote (screening cycle, executor guard, `/wallet`, manual deploy) meneruskan slot quote terkait.
+- **Strict caps — NO spillover** (dikonfirmasi user): `selectTargetQuote` (`index.js`) men-skip quote yang jatah slotnya penuh (`countOpenPositionsByQuote(positions, mint) >= slots[sym]`); slot idle satu quote **tidak** dialihkan ke quote lain. Eksposur selalu setia ke 60:40 — konsekuensinya modal bisa nganggur saat satu sisi kering.
+- **Guard executor** (`executor.js`): setelah cek total `maxPositions`, tolak deploy bila jatah quote-nya sudah penuh (`<quote> allocation full (n/m slots)`); guard 15% memakai `quoteSlots` yang sama → ambang konsisten dengan cycle.
+- Rasio bisa di-tune runtime via `update_config` (`solSlotAllocationPct`).
 
 ---
 

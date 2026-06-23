@@ -22,7 +22,7 @@ import { blockDev, unblockDev, listBlockedDevs } from "../dev-blocklist.js";
 import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsOnPool } from "../smart-wallets.js";
 import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
 import { fetchPoolMarketData } from "./market-data.js";
-import { config, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW, computeDeployAmount, getQuoteMeta } from "../config.js";
+import { config, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW, computeDeployAmount, getQuoteMeta, getQuoteSlotAllocation } from "../config.js";
 import { getRecentDecisions } from "../decision-log.js";
 import fs from "fs";
 import path from "path";
@@ -446,6 +446,7 @@ const toolMap = {
       maxPositions: ["risk", "maxPositions"],
       maxDeployAmount: ["risk", "maxDeployAmount"],
       maxDeployAmountUsd: ["risk", "maxDeployAmountUsd"],
+      solSlotAllocationPct: ["risk", "solSlotAllocationPct"],
       // screening quote tokens
       quoteTokens: ["screening", "quoteTokens"],
       // market regime
@@ -885,6 +886,18 @@ async function runSafetyChecks(name, args) {
           reason: `Max positions (${config.risk.maxPositions}) reached. Close a position first.`,
         };
       }
+      // Per-quote slot cap (60:40 SOL:USDC, strict — no spillover). Reject deploys into a quote that
+      // has already filled its allocated slots even when total positions are below maxPositions, so
+      // the LLM/manual deploys stay consistent with selectTargetQuote's allocation.
+      const enabledQ = config.screening.quoteTokens?.length ? config.screening.quoteTokens : ["SOL"];
+      const qSlots   = getQuoteSlotAllocation(config.risk.maxPositions, enabledQ)[quoteMeta.symbol] ?? 0;
+      const qOpen    = positions.positions.filter((p) => (p.quote_mint || config.tokens.SOL) === quoteMeta.mint).length;
+      if (qOpen >= qSlots) {
+        return {
+          pass: false,
+          reason: `${quoteMeta.symbol} allocation full (${qOpen}/${qSlots} slots, 60:40 SOL:USDC). Close a ${quoteMeta.symbol} position or deploy the other quote.`,
+        };
+      }
       const alreadyInPool = positions.positions.some(
         (p) => p.pool === args.pool_address
       );
@@ -964,8 +977,8 @@ async function runSafetyChecks(name, args) {
           return pq === quoteMeta.mint ? sum + (Number(p?.total_value_true_usd ?? p?.total_value_usd) || 0) : sum;
         }, 0);
         const expectedDeploy = isSolQuote
-          ? computeDeployAmount(balance.sol, { openPositionsValueSol: solPrice > 0 ? openPosUsdForQuote / solPrice : 0 })
-          : computeDeployAmount(balance.sol, { quote: qSym, usdcBalance: balance.usdc, solPrice, openPositionsValueUsd: openPosUsdForQuote });
+          ? computeDeployAmount(balance.sol, { openPositionsValueSol: solPrice > 0 ? openPosUsdForQuote / solPrice : 0, quoteSlots: qSlots })
+          : computeDeployAmount(balance.sol, { quote: qSym, usdcBalance: balance.usdc, solPrice, openPositionsValueUsd: openPosUsdForQuote, quoteSlots: qSlots });
         const minAcceptable = parseFloat((expectedDeploy * 0.85).toFixed(2));
         if (amountY < minAcceptable) {
           return {
