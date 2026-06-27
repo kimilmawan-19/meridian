@@ -222,6 +222,26 @@ Progress bar format: `[████████░░░░░░░░░░░
 
 ---
 
+## PnL Poll Cooldown (index.js — 30s poller)
+
+The 30s PnL poller can trigger an off-cycle management run when a position hits a stop-loss /
+emergency-close condition before the next scheduled cycle. The trigger cooldown is **per-position**
+(`_pollTriggeredAt` is a `Map<position_address, epochMs>`, not a global scalar):
+
+- A dump on position A no longer blocks faster exits on position B. The `managementIntervalMin`
+  (default 10m) cooldown applies only to re-triggering on the **same** position.
+- When a position is exit-eligible but still in cooldown, the poll `continue`s to scan the
+  remaining positions instead of `break`ing the whole tick (the old global-scalar bug let a
+  persistently-dumping A, evaluated first each tick, starve B from ever being checked).
+- When a position actually triggers, the poll `break`s — one management cycle evaluates all
+  positions anyway. The 30s poll interval naturally caps triggers to ≤1 per 30s (no stampede).
+- Entries for closed positions are pruned at the top of each poll tick.
+
+This was added to cut left-tail in-range-dump overshoot: multiple positions dumping in the same
+10-minute window previously had only the first one exit promptly.
+
+---
+
 ## Capacity-Aware Screening Cadence (index.js)
 
 Screening runs faster while the wallet has **free capacity** (`positions < maxPositions`), not just when empty. `effectiveScreeningIntervalMs()` returns `screeningIntervalNoPositionMin` (fast, default 10m) normally. After `screeningNoDeployBackoffCount` (default 2) consecutive screening cycles end with **no deploy** (LLM "⛔ NO DEPLOY" or no successful `deploy_position`), it backs off to `screeningIntervalMin` (default 30m). `_noDeployStreak` increments on each no-deploy cycle and resets to 0 on a successful deploy (`isScreeningBackedOff()` gates the cadence). Applied in both the 0-position branch and the post-management trigger of `runManagementCycle`.

@@ -110,7 +110,7 @@ let _managementBusy = false; // prevents overlapping management cycles
 let _screeningBusy = false;  // prevents overlapping screening cycles
 let _screeningLastTriggered = 0; // epoch ms — prevents management from spamming screening
 let _noDeployStreak = 0; // consecutive screening cycles that ended without a deploy — drives backoff
-let _pollTriggeredAt = 0; // epoch ms — cooldown for poller-triggered management
+const _pollTriggeredAt = new Map(); // position_address → epoch ms; per-position poll-trigger cooldown (a dump on one position no longer blocks exits on others)
 let _cachedSolPrice = null; // updated each management cycle, reused by PnL poll for Rule 6 grace check
 let _cautionOrigFeeRatio = null; // saved before caution raise, restored in screening cycle finally
 let _cautionOrigOrganic  = null;
@@ -1428,6 +1428,9 @@ Summarize the current portfolio health, total fees earned, and performance of al
     try {
       const result = await getMyPositions({ force: true, silent: true }).catch(() => null);
       if (!result?.positions?.length) return;
+      // Prune cooldown entries for positions that are no longer open (keeps the Map bounded).
+      const activeIds = new Set(result.positions.map((p) => p.position));
+      for (const id of _pollTriggeredAt.keys()) if (!activeIds.has(id)) _pollTriggeredAt.delete(id);
       for (const p of result.positions) {
         if (
           !p.pnl_pct_suspicious &&
@@ -1445,15 +1448,16 @@ Summarize the current portfolio health, total fees earned, and performance of al
             continue;
           }
           const cooldownMs = config.schedule.managementIntervalMin * 60 * 1000;
-          const sinceLastTrigger = Date.now() - _pollTriggeredAt;
+          const sinceLastTrigger = Date.now() - (_pollTriggeredAt.get(p.position) ?? 0);
           if (sinceLastTrigger >= cooldownMs) {
-            _pollTriggeredAt = Date.now();
+            _pollTriggeredAt.set(p.position, Date.now());
             log("state", `[PnL poll] Exit alert: ${p.pair} — ${exit.reason} — triggering management`);
             runManagementCycle({ silent: true }).catch((e) => log("cron_error", `Poll-triggered management failed: ${e.message}`));
-          } else {
-            log("state", `[PnL poll] Exit alert: ${p.pair} — ${exit.reason} — cooldown (${Math.round((cooldownMs - sinceLastTrigger) / 1000)}s left)`);
+            break;
           }
-          break;
+          // This position is in cooldown — keep scanning others rather than aborting the poll tick.
+          log("state", `[PnL poll] Exit alert: ${p.pair} — ${exit.reason} — cooldown (${Math.round((cooldownMs - sinceLastTrigger) / 1000)}s left)`);
+          continue;
         }
         // BUG FIX: fetch market data so Rules 7 & 8 can evaluate in the fast 30s poll path
         const pollMd = await fetchPoolMarketData(p.pool).catch(() => null);
@@ -1468,15 +1472,16 @@ Summarize the current portfolio health, total fees earned, and performance of al
             log("market_data", `[pnl_poll] Emergency rule ${closeRule.rule} (${closeRule.reason}) triggered for ${p.pair} — price5m=${pollMd?.price_change_5m ?? "?"}% vol5m=$${pollMd?.volume_5m ?? "?"}`);
           }
           const cooldownMs = config.schedule.managementIntervalMin * 60 * 1000;
-          const sinceLastTrigger = Date.now() - _pollTriggeredAt;
+          const sinceLastTrigger = Date.now() - (_pollTriggeredAt.get(p.position) ?? 0);
           if (sinceLastTrigger >= cooldownMs) {
-            _pollTriggeredAt = Date.now();
+            _pollTriggeredAt.set(p.position, Date.now());
             log("state", `[PnL poll] Deterministic close rule: ${p.pair} — Rule ${closeRule.rule}: ${closeRule.reason} — triggering management`);
             runManagementCycle({ silent: true }).catch((e) => log("cron_error", `Poll-triggered management failed: ${e.message}`));
-          } else {
-            log("state", `[PnL poll] Deterministic close rule: ${p.pair} — Rule ${closeRule.rule}: ${closeRule.reason} — cooldown (${Math.round((cooldownMs - sinceLastTrigger) / 1000)}s left)`);
+            break;
           }
-          break;
+          // This position is in cooldown — keep scanning others rather than aborting the poll tick.
+          log("state", `[PnL poll] Deterministic close rule: ${p.pair} — Rule ${closeRule.rule}: ${closeRule.reason} — cooldown (${Math.round((cooldownMs - sinceLastTrigger) / 1000)}s left)`);
+          continue;
         }
       }
     } finally {
