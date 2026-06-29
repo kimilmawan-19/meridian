@@ -202,7 +202,13 @@ async function runBriefing() {
   try {
     const briefing = await generateBriefing();
     if (telegramEnabled()) {
-      await sendHTML(briefing);
+      const sent = await sendHTML(briefing);
+      if (!sent) {
+        // sendHTML swallows transport/parse errors and returns null. Do NOT mark the
+        // briefing sent — leave the date unset so the 6h watchdog retries it.
+        log("cron_error", "Morning briefing send failed — leaving date unset for watchdog retry");
+        return;
+      }
     }
     setLastBriefingDate();
   } catch (error) {

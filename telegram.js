@@ -136,9 +136,41 @@ export async function sendMessageWithButtons(text, inlineKeyboard) {
   });
 }
 
+// Split a message into ≤limit-char chunks on newline boundaries so an HTML tag
+// (always within a single line in our messages) is never cut mid-tag. A single
+// over-limit line is hard-sliced as a last resort.
+function splitForTelegram(text, limit = 4096) {
+  const str = String(text);
+  if (str.length <= limit) return [str];
+  const chunks = [];
+  let current = "";
+  for (const line of str.split("\n")) {
+    if (line.length > limit) {
+      if (current) { chunks.push(current); current = ""; }
+      for (let i = 0; i < line.length; i += limit) chunks.push(line.slice(i, i + limit));
+      continue;
+    }
+    const candidate = current ? `${current}\n${line}` : line;
+    if (candidate.length > limit) {
+      chunks.push(current);
+      current = line;
+    } else {
+      current = candidate;
+    }
+  }
+  if (current) chunks.push(current);
+  return chunks;
+}
+
 export async function sendHTML(html) {
-  if (!TOKEN || !chatId) return;
-  return postTelegram("sendMessage", { text: html.slice(0, 4096), parse_mode: "HTML" });
+  if (!TOKEN || !chatId) return null;
+  const chunks = splitForTelegram(html, 4096);
+  let last = null;
+  for (const chunk of chunks) {
+    last = await postTelegram("sendMessage", { text: chunk, parse_mode: "HTML" });
+    if (!last) return null; // a failed chunk → report failure so callers can retry
+  }
+  return last;
 }
 
 export async function editMessage(text, messageId) {
