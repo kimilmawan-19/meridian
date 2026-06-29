@@ -139,7 +139,7 @@ export async function sendMessageWithButtons(text, inlineKeyboard) {
 // Split a message into ≤limit-char chunks on newline boundaries so an HTML tag
 // (always within a single line in our messages) is never cut mid-tag. A single
 // over-limit line is hard-sliced as a last resort.
-function splitForTelegram(text, limit = 4096) {
+export function splitForTelegram(text, limit = 4096) {
   const str = String(text);
   if (str.length <= limit) return [str];
   const chunks = [];

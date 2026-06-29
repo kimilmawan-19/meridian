@@ -197,7 +197,7 @@ function scheduleTrailingDropConfirmation(positionAddress) {
   _trailingDropConfirmTimers.set(positionAddress, timer);
 }
 
-async function runBriefing() {
+export async function runBriefing() {
   log("cron", "Starting morning briefing");
   try {
     const briefing = await generateBriefing();
