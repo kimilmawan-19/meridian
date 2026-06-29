@@ -59,23 +59,34 @@ function isFeeGeneratingDeploy(deploy) {
   return Number.isFinite(feeEarnedPct) && feeEarnedPct >= minFeeEarnedPct;
 }
 
+// Never-shorten: a new cooldown extends but never truncates an active longer one. A severe
+// in-range-dump cooldown (48–72h) must not be cut to 12h by a later minor close on the same
+// pool/mint. The reason is updated only when we actually extend (or set fresh) so logs reflect
+// the active cause.
 function setPoolCooldown(entry, hours, reason) {
-  const cooldownUntil = new Date(Date.now() + hours * 60 * 60 * 1000).toISOString();
+  const newUntilMs = Date.now() + hours * 60 * 60 * 1000;
+  const prevMs = entry.cooldown_until ? new Date(entry.cooldown_until).getTime() : 0;
+  const effMs = Number.isFinite(prevMs) ? Math.max(prevMs, newUntilMs) : newUntilMs;
+  const cooldownUntil = new Date(effMs).toISOString();
+  if (effMs === newUntilMs) entry.cooldown_reason = reason;
   entry.cooldown_until = cooldownUntil;
-  entry.cooldown_reason = reason;
   return cooldownUntil;
 }
 
 function setBaseMintCooldown(db, baseMint, hours, reason) {
   if (!baseMint) return null;
-  const cooldownUntil = new Date(Date.now() + hours * 60 * 60 * 1000).toISOString();
+  const newUntilMs = Date.now() + hours * 60 * 60 * 1000;
+  let effMs = newUntilMs;
   for (const entry of Object.values(db)) {
     if (entry?.base_mint === baseMint) {
-      entry.base_mint_cooldown_until = cooldownUntil;
-      entry.base_mint_cooldown_reason = reason;
+      const prevMs = entry.base_mint_cooldown_until ? new Date(entry.base_mint_cooldown_until).getTime() : 0;
+      const entryEffMs = Number.isFinite(prevMs) ? Math.max(prevMs, newUntilMs) : newUntilMs;
+      entry.base_mint_cooldown_until = new Date(entryEffMs).toISOString();
+      if (entryEffMs === newUntilMs) entry.base_mint_cooldown_reason = reason;
+      effMs = Math.max(effMs, entryEffMs);
     }
   }
-  return cooldownUntil;
+  return new Date(effMs).toISOString();
 }
 
 // ─── Write ─────────────────────────────────────────────────────
@@ -514,7 +525,6 @@ export function forgetPool({ pool_address, all, days }) {
   // Mode: forget all
   if (all) {
     const count = Object.keys(db).length;
-    const cleared = Object.fromEntries(Object.entries(db).map(([k, v]) => [k, { ...v, deploys: [], total_deploys: 0, avg_pnl_pct: 0, win_rate: 0, adjusted_win_rate: 0, adjusted_win_rate_sample_count: 0, last_deployed_at: null, last_outcome: null, cooldown_until: undefined, mint_cooldown_until: undefined }]));
     // Fully delete all entries
     for (const k of Object.keys(db)) delete db[k];
     save(db);

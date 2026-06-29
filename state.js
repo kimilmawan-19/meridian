@@ -105,6 +105,7 @@ export function trackPosition({
     pending_trailing_current_pnl_pct: null,
     pending_trailing_peak_pnl_pct: null,
     pending_trailing_drop_pct: null,
+    pending_trailing_effective_drop_pct: null,
     pending_trailing_started_at: null,
     confirmed_trailing_exit_reason: null,
     confirmed_trailing_exit_until: null,
@@ -482,10 +483,10 @@ export function resolvePendingPeak(position_address, currentPnlPct, toleranceRat
   return { confirmed: false, rejected: true, pendingPeak };
 }
 
-export function queueTrailingDropConfirmation(position_address, peakPnlPct, currentPnlPct, trailingDropPct) {
-  if (peakPnlPct == null || currentPnlPct == null || trailingDropPct == null) return false;
+export function queueTrailingDropConfirmation(position_address, peakPnlPct, currentPnlPct, effectiveDropPct) {
+  if (peakPnlPct == null || currentPnlPct == null || effectiveDropPct == null) return false;
   const dropFromPeak = peakPnlPct - currentPnlPct;
-  if (dropFromPeak < trailingDropPct) return false;
+  if (dropFromPeak < effectiveDropPct) return false;
 
   const state = load();
   const pos = state.positions[position_address];
@@ -501,6 +502,9 @@ export function queueTrailingDropConfirmation(position_address, peakPnlPct, curr
   pos.pending_trailing_peak_pnl_pct = peakPnlPct;
   pos.pending_trailing_current_pnl_pct = currentPnlPct;
   pos.pending_trailing_drop_pct = dropFromPeak;
+  // Store the trigger's effective drop so the 15s recheck applies the SAME threshold (givebackDivisor,
+  // Layer-B override floor, stale-peak widening) instead of recomputing a divergent one.
+  pos.pending_trailing_effective_drop_pct = effectiveDropPct;
   pos.pending_trailing_started_at = new Date().toISOString();
   save(state);
   log("state", `Position ${position_address} trailing drop candidate queued: peak ${peakPnlPct.toFixed(2)}% -> current ${currentPnlPct.toFixed(2)}%`);
@@ -517,12 +521,15 @@ export function resolvePendingTrailingDrop(position_address, currentPnlPct, trai
   const pendingCurrent = pos.pending_trailing_current_pnl_pct;
   const pendingPeak = pos.pending_trailing_peak_pnl_pct;
   const pendingDrop = pos.pending_trailing_drop_pct ?? (pendingPeak - pendingCurrent);
-  // Use effective drop at queue time (same proportional formula as the trigger).
-  const effectiveDrop = Math.max(trailingDropPct, pendingPeak / 3);
+  // Reuse the trigger's stored effective drop so the recheck applies the identical threshold
+  // (givebackDivisor, Layer-B override floor, stale-peak widening). Fall back to the old
+  // proportional formula for positions queued before this field existed.
+  const effectiveDrop = pos.pending_trailing_effective_drop_pct ?? Math.max(trailingDropPct, pendingPeak / 3);
 
   pos.pending_trailing_current_pnl_pct = null;
   pos.pending_trailing_peak_pnl_pct = null;
   pos.pending_trailing_drop_pct = null;
+  pos.pending_trailing_effective_drop_pct = null;
   pos.pending_trailing_started_at = null;
 
   const stillNearCrash = currentPnlPct != null && currentPnlPct <= pendingCurrent + tolerancePct;

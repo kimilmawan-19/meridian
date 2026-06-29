@@ -375,7 +375,7 @@ export async function runManagementCycle({ silent = false } = {}) {
       const exit = updatePnlAndCheckExits(p.position, p, config.management);
       if (exit) {
         if (exit.action === "TRAILING_TP" && exit.needs_confirmation && shouldUsePnlRecheck()) {
-          if (queueTrailingDropConfirmation(p.position, exit.peak_pnl_pct, exit.current_pnl_pct, config.management.trailingDropPct)) {
+          if (queueTrailingDropConfirmation(p.position, exit.peak_pnl_pct, exit.current_pnl_pct, exit.effective_drop_pct ?? config.management.trailingDropPct)) {
             scheduleTrailingDropConfirmation(p.position);
           }
           continue;
@@ -1448,7 +1448,7 @@ Summarize the current portfolio health, total fees earned, and performance of al
         const exit = updatePnlAndCheckExits(p.position, p, config.management);
         if (exit) {
           if (exit.action === "TRAILING_TP" && exit.needs_confirmation && shouldUsePnlRecheck()) {
-            if (queueTrailingDropConfirmation(p.position, exit.peak_pnl_pct, exit.current_pnl_pct, config.management.trailingDropPct)) {
+            if (queueTrailingDropConfirmation(p.position, exit.peak_pnl_pct, exit.current_pnl_pct, exit.effective_drop_pct ?? config.management.trailingDropPct)) {
               scheduleTrailingDropConfirmation(p.position);
             }
             continue;
