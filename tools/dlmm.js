@@ -1819,11 +1819,14 @@ export async function closePosition({ position_address, reason }) {
         });
 
         try {
+          const quoteMint1 = pool?.lbPair?.tokenYMint?.toString?.() ?? null;
           await recordPerformance({
             position: position_address,
             pool: poolAddress,
             pool_name: tracked.pool_name || poolMeta.name || poolAddress.slice(0, 8),
             base_mint: closeBaseMint,
+            quote_mint: quoteMint1,
+            quote_symbol: quoteMint1 === "So11111111111111111111111111111111111111112" ? "SOL" : (poolMeta?.quote?.symbol ?? null),
             strategy: tracked.strategy,
             bin_range: tracked.bin_range,
             bin_step: tracked.bin_step || null,
@@ -2156,11 +2159,14 @@ export async function closePosition({ position_address, reason }) {
       });
 
       try {
+        const quoteMint2 = pool?.lbPair?.tokenYMint?.toString?.() ?? null;
         await recordPerformance({
           position: position_address,
           pool: poolAddress,
           pool_name: tracked.pool_name || poolMeta.name || poolAddress.slice(0, 8),
           base_mint: closeBaseMint,
+          quote_mint: quoteMint2,
+          quote_symbol: quoteMint2 === "So11111111111111111111111111111111111111112" ? "SOL" : (poolMeta?.quote?.symbol ?? null),
           strategy: tracked.strategy,
           bin_range: tracked.bin_range,
           bin_step: tracked.bin_step || null,

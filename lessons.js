@@ -399,6 +399,9 @@ export function evolveThresholds(perfData, config) {
     const windowed = perfData.filter((p) => (p.recorded_at ?? "") >= cutoff);
     if (windowed.length >= MIN_EVOLVE_POSITIONS) evalData = windowed;
   }
+  // Only tune thresholds on SOL-quoted records — non-SOL (e.g. SOL-USDC) deploys use a different
+  // fee/liquidity profile and would skew the SOL-strategy thresholds.
+  evalData = evalData.filter(isSolQuoteRecord);
 
   const winners = evalData.filter((p) => p.pnl_pct > 0);
   const losers  = evalData.filter((p) => p.pnl_pct < -5);
@@ -576,6 +579,21 @@ function isFiniteNum(n) {
   return typeof n === "number" && isFinite(n);
 }
 
+// Exclude non-SOL-quote records (e.g. SOL-USDC stable pairs from a different branch) from
+// learning. This agent only deploys single-sided SOL into SOL-quoted pools, so USDC/USDT-quoted
+// losses would otherwise poison aggregate stats (their tiny bin_step lands in the "80-100" bucket)
+// and skew evolveThresholds. pool_name format is "BASE-QUOTE" (e.g. "WIF-SOL", "WIF-USDC").
+const NON_SOL_QUOTES = new Set(["USDC", "USDT", "USD", "USDH", "PYUSD", "USDS"]);
+function isSolQuoteRecord(p) {
+  // Prefer explicit quote info when present (records written after the dlmm.js change).
+  const qs = String(p.quote_symbol ?? "").toUpperCase().trim();
+  if (qs) return qs === "SOL" || qs === "WSOL";
+  const name = String(p.pool_name ?? "");
+  const seg = name.includes("-") ? name.split("-").pop().toUpperCase().trim() : "";
+  if (seg) return !NON_SOL_QUOTES.has(seg);   // "WIF-SOL"→keep, "WIF-USDC"→drop
+  return true; // no parseable quote (address-fallback name) → keep (conservative: don't drop SOL data)
+}
+
 // ── Evidence weighting ─────────────────────────────────────────
 // Confidence weight ∈ [0,1] for how strongly a closed position proves the
 // FILTER was wrong (not just bad luck). Used to compute weighted effective
@@ -660,6 +678,9 @@ function generateAggregateLessons(perfData, config) {
     const windowed = perfData.filter((p) => (p.recorded_at ?? "") >= cutoff);
     if (windowed.length >= AGGREGATE_MIN_SAMPLES) evalData = windowed;
   }
+  // Exclude non-SOL-quote records so the strategy×bin_step buckets reflect only the SOL strategy.
+  // (SOL-USDC stable pairs have tiny bin_step that would otherwise fall into the "80-100" bucket.)
+  evalData = evalData.filter(isSolQuoteRecord);
 
   const lessons = [];
 
