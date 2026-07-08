@@ -386,6 +386,9 @@ const toolMap = {
       // screening
       minFeeActiveTvlRatio: ["screening", "minFeeActiveTvlRatio"],
       minFeePerBinStep: ["screening", "minFeePerBinStep"],
+      entryFlowFilterEnabled: ["screening", "entryFlowFilterEnabled"],
+      entryFlowBlockRegimes: ["screening", "entryFlowBlockRegimes"],
+      entryFlowFilterSmartMoneyOverride: ["screening", "entryFlowFilterSmartMoneyOverride"],
       excludeHighSupplyConcentration: ["screening", "excludeHighSupplyConcentration"],
       minTvl: ["screening", "minTvl"],
       maxTvl: ["screening", "maxTvl"],

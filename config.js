@@ -98,6 +98,12 @@ export const config = {
     minPoolAgeHours:    u.minPoolAgeHours    ?? null, // null = disabled. Measures token age (not LP pool age). Set to 1-2 to block very new tokens without conflicting with category="trending".
     lastPoolStandingGuard:      u.lastPoolStandingGuard      ?? true, // skip cycle when 1 MARKUP candidate survives among ≥ minBearish CAPITULATION/DISTRIBUTION pools
     lastPoolStandingMinBearish: u.lastPoolStandingMinBearish ?? 3,    // min bearish-flow pools required to trigger last-pool-standing guard
+    // Entry flow filter — drop candidates whose multi-timeframe flow consensus is bearish before
+    // the LLM sees them (precursor to in-range dumps). Conservative default: DISTRIBUTION only
+    // (active selling + volume). Add "CAPITULATION" to tighten. Smart-wallet presence overrides.
+    entryFlowFilterEnabled:            u.entryFlowFilterEnabled            ?? true,
+    entryFlowBlockRegimes:             u.entryFlowBlockRegimes             ?? ["DISTRIBUTION"],
+    entryFlowFilterSmartMoneyOverride: u.entryFlowFilterSmartMoneyOverride ?? true,
     // Volume TA entry signals (soft hints to LLM, not hard filters)
     volumeTrendDeclineThreshold: u.volumeTrendDeclineThreshold ?? 0.6,  // trend_ratio < 0.6 → DECLINING
     volumeTrendExpandThreshold:  u.volumeTrendExpandThreshold  ?? 1.4,  // trend_ratio > 1.4 → EXPANDING
@@ -436,6 +442,9 @@ export function reloadScreeningThresholds() {
     if (fresh.maxPump1hPct              !== undefined) s.maxPump1hPct              = fresh.maxPump1hPct;
     if (fresh.lastPoolStandingGuard     !== undefined) s.lastPoolStandingGuard     = fresh.lastPoolStandingGuard;
     if (fresh.lastPoolStandingMinBearish != null)      s.lastPoolStandingMinBearish = fresh.lastPoolStandingMinBearish;
+    if (fresh.entryFlowFilterEnabled            !== undefined) s.entryFlowFilterEnabled            = fresh.entryFlowFilterEnabled;
+    if (Array.isArray(fresh.entryFlowBlockRegimes))           s.entryFlowBlockRegimes             = fresh.entryFlowBlockRegimes;
+    if (fresh.entryFlowFilterSmartMoneyOverride !== undefined) s.entryFlowFilterSmartMoneyOverride = fresh.entryFlowFilterSmartMoneyOverride;
     if (fresh.maxBundlePct      != null) s.maxBundlePct     = fresh.maxBundlePct;
     if (fresh.avoidPvpSymbols   !== undefined) s.avoidPvpSymbols = fresh.avoidPvpSymbols;
     if (fresh.blockPvpSymbols   !== undefined) s.blockPvpSymbols = fresh.blockPvpSymbols;

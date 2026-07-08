@@ -1005,6 +1005,23 @@ export async function runScreeningCycle({ silent = false } = {}) {
         filteredOut.push({ name: pool.name, reason: `bundle concentration ${bundlePct}% > ${maxBundlePct}%` });
         return false;
       }
+      // RULE: entry flow filter — drop candidates whose multi-timeframe flow is bearish (default:
+      // DISTRIBUTION = active selling into bids, the precursor to in-range dumps like NEIL -16%).
+      // Smart-wallet presence overrides (accumulation can absorb the selling). Missing market data
+      // → NEUTRAL → not blocked (fail-safe). Enforces what prompt.js already recommends softly.
+      if (config.screening.entryFlowFilterEnabled) {
+        const blockRegimes = new Set(config.screening.entryFlowBlockRegimes ?? ["DISTRIBUTION"]);
+        const consensus = computeCandidateFlow(pool, md);
+        if (blockRegimes.has(consensus)) {
+          const smartPresent = (Number(pool?.gmgn_smart_wallets) || 0) > 0 || (sw?.in_pool?.length ?? 0) > 0;
+          if (!(config.screening.entryFlowFilterSmartMoneyOverride && smartPresent)) {
+            log("screening", `Entry flow filter: dropped ${pool.name} — flow ${consensus}`);
+            filteredOut.push({ name: pool.name, reason: `entry flow ${consensus}` });
+            return false;
+          }
+          log("screening", `Entry flow filter: kept ${pool.name} — flow ${consensus} but smart wallets present`);
+        }
+      }
       return true;
     });
 
@@ -1062,19 +1079,10 @@ export async function runScreeningCycle({ silent = false } = {}) {
     // Guard fires when: bearish-flow pools >= lastPoolStandingMinBearish AND exactly 1 MARKUP.
     if (config.screening.lastPoolStandingGuard && passing.length > 1) {
       const bearishFlowLabels = new Set(["CAPITULATION", "DISTRIBUTION"]);
-      const candidateFlows = passing.map(({ pool, md: pmd }) => {
-        const v5m  = pmd?.volume_5m;
-        const v1h  = pmd?.volume_1h;
-        const v6h  = pmd?.volume_6h;
-        const v24h = pmd?.volume_24h;
-        const vr5m = v5m != null && v1h  > 0 ? v5m / (v1h  / 12) : null;
-        const vr1h = v1h != null && v6h  > 0 ? v1h / (v6h  / 6)  : null;
-        const vr6h = v6h != null && v24h > 0 ? v6h / (v24h / 4)  : null;
-        const r5m  = pmd ? tfFlowRegime(pmd.price_change_5m, vr5m, 0.5) : null;
-        const r1h  = pmd ? tfFlowRegime(pmd.price_change_1h, vr1h, 1.5) : null;
-        const r6h  = pmd ? tfFlowRegime(pmd.price_change_6h, vr6h, 3.0) : null;
-        return { pool, consensus: flowConsensus([r5m, r1h, r6h]) };
-      });
+      const candidateFlows = passing.map(({ pool, md: pmd }) => ({
+        pool,
+        consensus: computeCandidateFlow(pool, pmd),
+      }));
       const bearishCandidates = candidateFlows.filter(c => bearishFlowLabels.has(c.consensus));
       const markupCandidates  = candidateFlows.filter(c => c.consensus === "MARKUP");
       const minBearish = config.screening.lastPoolStandingMinBearish ?? 3;
@@ -1614,6 +1622,21 @@ function flowConsensus(regimes) {
   if (bearish > bullish) return "BEARISH_MIXED";
   if (bullish > bearish) return "BULLISH_MIXED";
   return "MIXED";
+}
+
+// Compute a pool's multi-timeframe flow consensus from DexScreener market data (md).
+// Shared by the entry flow filter (per-candidate) and the last-pool-standing guard (aggregate).
+// Returns "NEUTRAL" when data is missing (fail-safe: callers treat NEUTRAL as "not bearish").
+export function computeCandidateFlow(pool, md) {
+  if (!md) return "NEUTRAL";
+  const v5m = md.volume_5m, v1h = md.volume_1h, v6h = md.volume_6h, v24h = md.volume_24h;
+  const vr5m = v5m != null && v1h  > 0 ? v5m / (v1h  / 12) : null;
+  const vr1h = v1h != null && v6h  > 0 ? v1h / (v6h  / 6)  : null;
+  const vr6h = v6h != null && v24h > 0 ? v6h / (v24h / 4)  : null;
+  const r5m = tfFlowRegime(md.price_change_5m, vr5m, 0.5);
+  const r1h = tfFlowRegime(md.price_change_1h, vr1h, 1.5);
+  const r6h = tfFlowRegime(md.price_change_6h, vr6h, 3.0);
+  return flowConsensus([r5m, r1h, r6h]);
 }
 
 /**

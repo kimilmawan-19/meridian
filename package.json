@@ -21,6 +21,7 @@
     "test:briefing": "node test/test-briefing.mjs",
     "test:exit-cooldown": "node test/test-exit-cooldown-fixes.mjs",
     "test:sol-quote": "node test/test-sol-quote-filter.mjs",
+    "test:entry-flow": "node test/test-entry-flow-filter.mjs",
     "test:agent": "DRY_RUN=true node test/test-agent.js",
     "postinstall": "node scripts/patch-anchor.js"
   },
