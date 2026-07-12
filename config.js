@@ -234,7 +234,7 @@ export const config = {
     // Rule 9: persistent sell-pressure streak — slow bleed exit before stop loss fires
     sellPressureStreak: {
       enabled:           u.emergencyExits?.sellPressureStreak?.enabled           ?? true,
-      streakCount:       u.emergencyExits?.sellPressureStreak?.streakCount       ?? 3,    // consecutive 5m windows
+      streakCount:       u.emergencyExits?.sellPressureStreak?.streakCount       ?? 2,    // consecutive 5m windows (was 3 — 4 days of data showed Rule 9 confirming AFTER positions already overshot auto-SL tiers by 1-6%; e.g. yep -18.12% vs -12% tier, ok-SOL -14.37% vs -12% tier)
       ratio:             u.emergencyExits?.sellPressureStreak?.ratio             ?? 1.2,  // sells > buys × ratio
       safetyPnlPct:      u.emergencyExits?.sellPressureStreak?.safetyPnlPct     ?? 5,    // skip if PnL > +5%
       windowMin:         u.emergencyExits?.sellPressureStreak?.windowMin         ?? 30,   // lookback window (min)
