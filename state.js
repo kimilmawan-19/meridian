@@ -232,13 +232,27 @@ export function updateR9GraceZone(position_address, depth_pct, graceDepth) {
  * override but clamping it between the loosest (floor) and tightest bounds so a bad
  * override can neither remove the safety net nor make it fire on normal oscillation.
  */
-export function effectiveStopLossPct(tracked, mgmtConfig) {
+export function effectiveStopLossPct(tracked, mgmtConfig, regime = "healthy") {
   const floor = mgmtConfig.stopLossFloorPct ?? -50;     // most negative allowed
-  const tightest = mgmtConfig.stopLossTightestPct ?? -10; // least negative allowed
-  const raw = (mgmtConfig.allowLlmRiskParams && tracked?.sl_pct_override != null)
+  let tightest = mgmtConfig.stopLossTightestPct ?? -10; // least negative allowed
+  let raw = (mgmtConfig.allowLlmRiskParams && tracked?.sl_pct_override != null)
     ? tracked.sl_pct_override
     : mgmtConfig.stopLossPct;
   if (raw == null) return mgmtConfig.stopLossPct;
+  // Regime-aware tightening: shrink the SL magnitude toward zero when the broad market is
+  // caution/bearish, so existing positions get defended faster during a downturn — not just
+  // new deploys throttled. Scale BOTH raw and the tightest clamp by the same multiplier —
+  // scaling raw alone would have no effect on positions already at the tightest bound (e.g.
+  // the low-vol auto-SL tier, -8%, which equals the default stopLossTightestPct and was the
+  // most common overshoot tier in observed data), since raw*mult ends up less negative than
+  // an unscaled tightest and gets clamped straight back to it.
+  if (regime === "bearish") {
+    raw *= mgmtConfig.marketRegimeBearishSlMult ?? 0.7;
+    tightest *= mgmtConfig.marketRegimeBearishSlMult ?? 0.7;
+  } else if (regime === "caution") {
+    raw *= mgmtConfig.marketRegimeCautionSlMult ?? 0.85;
+    tightest *= mgmtConfig.marketRegimeCautionSlMult ?? 0.85;
+  }
   // clamp into [floor, tightest], e.g. [-50, -10]
   return Math.min(tightest, Math.max(floor, raw));
 }
@@ -605,7 +619,7 @@ export function getStateSummary() {
  * @param {object} mgmtConfig
  * Returns { action, reason } or null if no exit needed.
  */
-export function updatePnlAndCheckExits(position_address, positionData, mgmtConfig) {
+export function updatePnlAndCheckExits(position_address, positionData, mgmtConfig, regime = "healthy") {
   const {
     pnl_pct: currentPnlPct,
     pnl_pct_suspicious,
@@ -728,7 +742,7 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   // ── Stop loss ──────────────────────────────────────────────────
   const { age_minutes: slAgeMin } = positionData;
   const minAgeForStopLoss = mgmtConfig.minAgeBeforeStopLoss ?? 15;
-  const effSL = effectiveStopLossPct(pos, mgmtConfig);
+  const effSL = effectiveStopLossPct(pos, mgmtConfig, regime);
   // Early-dump override: if loss already exceeds earlyDumpOverridePct (default -10%),
   // bypass the age gate entirely. A fast or sustained dump in the first 15 minutes is
   // real and should be cut — the age gate exists to avoid wick noise, not -10% bleeds.
@@ -763,6 +777,11 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
     // trailingGivebackDivisor (default 3) controls N; trailingDropPct acts as floor.
     const givebackDivisor = mgmtConfig.trailingGivebackDivisor ?? 3;
     let effectiveDrop = Math.max(effTrailingDropFloor, pos.peak_pnl_pct / givebackDivisor);
+    // Regime-aware profit-taking: shrink the allowed give-back when the broad market is
+    // caution/bearish, locking in gains sooner before a downturn erases them. Applied before
+    // stale-peak widening below, which still gets the last word on the final tolerance.
+    if (regime === "bearish") effectiveDrop *= mgmtConfig.marketRegimeBearishTrailMult ?? 0.6;
+    else if (regime === "caution") effectiveDrop *= mgmtConfig.marketRegimeCautionTrailMult ?? 0.8;
     // Stale-peak widening: if the all-time peak was set long ago and price has since settled
     // lower, the trailing stop is measuring against a high that no longer reflects reality.
     // Widen tolerance so a stabilized position is not force-exited against an outdated peak.

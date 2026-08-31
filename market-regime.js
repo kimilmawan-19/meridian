@@ -1,9 +1,16 @@
 import { fetchTrendingBreadth } from "./tools/screening.js";
 import { fetchPoolMarketData } from "./tools/market-data.js";
 import { log } from "./logger.js";
+import { config } from "./config.js";
+
+// In-memory ring buffer of recent SOL/USD price samples, used by Signal 4 (SOL momentum).
+// Populated once per assessMarketRegime() call (management/screening cadence, ~10min) — resets
+// on process restart, which is fine: momentum only needs the last ~1-2h of samples.
+const SOL_PRICE_HISTORY_MAX = 12; // ~2h at 10min cadence
+let _solPriceHistory = [];
 
 /**
- * Assess market regime using a 3-layer hybrid approach:
+ * Assess market regime using a 4-layer hybrid approach:
  *
  * Layer 1 + 2: Meteora unfiltered trending pools (50 pools × 2 timeframes)
  *   — Price breadth: % of 50 trending DLMM pools with positive price change
@@ -15,12 +22,19 @@ import { log } from "./logger.js";
  *   — Flow ratio: txn_buys_5m / txn_sells_5m (sell pressure)
  *   — Volume acceleration: volume_5m vs volume_1h/12 (market dying vs active)
  *
- * Score thresholds:
- *   >= 3.0 → bearish  → skip screening
- *   >= 1.5 → caution  → raise quality bar for this cycle
- *   <  1.5 → healthy  → proceed normally
+ * Layer 4: SOL/USD price momentum (self-sampled, no extra API call)
+ *   — Almost every LP here is SOL-quoted, so a SOL-denominated dump is a systemic risk
+ *     the token-breadth signals above don't directly capture. Uses solPriceUsd already
+ *     fetched each cycle by the caller (index.js, via getWalletBalances()) — samples are
+ *     kept in a small in-memory ring buffer and compared against ~30m/~60m-ago samples.
+ *
+ * Score thresholds (raised from 3.0/1.5 to 3.7/1.8 to absorb Layer 4's +1.0 max headroom
+ * — max score is now 5.5 instead of 4.5 — starting calibration, tune via market_regime logs):
+ *   >= 3.7 → bearish  → skip screening
+ *   >= 1.8 → caution  → raise quality bar for this cycle
+ *   <  1.8 → healthy  → proceed normally
  */
-export async function assessMarketRegime(candidates = []) {
+export async function assessMarketRegime(candidates = [], solPriceUsd = null) {
   try {
     // Layer 1 + 2: fetch both timeframes from Meteora (unfiltered trending)
     const [res5m, res1h] = await Promise.allSettled([
@@ -126,10 +140,36 @@ export async function assessMarketRegime(candidates = []) {
       else if (avgFlow < 0.90) flowScore = 0.5;
     }
 
+    // ── Signal 4: SOL/USD price momentum (self-sampled, no extra API call) ──
+    // Almost every LP here is SOL-quoted, so a broad SOL dump is systemic risk the
+    // token-breadth signals above don't directly see. Sample solPriceUsd into a small
+    // ring buffer and compare against ~30m/~60m-ago samples (management cadence is 10min
+    // by default, so 3/6 samples back ≈ 30m/60m — approximate, not wall-clock exact).
+    let solMomentumScore = 0;
+    let chg30m = null, chg60m = null;
+    if (solPriceUsd != null && Number.isFinite(solPriceUsd) && solPriceUsd > 0) {
+      _solPriceHistory.push({ price: solPriceUsd, ts: Date.now() });
+      if (_solPriceHistory.length > SOL_PRICE_HISTORY_MAX) _solPriceHistory.shift();
+
+      const now = Date.now();
+      const sample30m = [..._solPriceHistory].reverse().find(s => now - s.ts >= 25 * 60_000);
+      const sample60m = [..._solPriceHistory].reverse().find(s => now - s.ts >= 55 * 60_000);
+      if (sample30m) chg30m = ((solPriceUsd - sample30m.price) / sample30m.price) * 100;
+      if (sample60m) chg60m = ((solPriceUsd - sample60m.price) / sample60m.price) * 100;
+
+      if (chg30m != null) {
+        if (chg30m <= -3 && (chg60m == null || chg60m <= -4)) solMomentumScore = 1.0; // SOL itself dumping
+        else if (chg30m <= -3 || (chg60m != null && chg60m <= -4)) solMomentumScore = 0.5;
+        else if (chg30m <= -1.5) solMomentumScore = 0.25;
+      }
+    }
+
     // ── Final scoring ────────────────────────────────────────────────────
-    const totalScore = breadthScore + volumeScore + flowScore;
-    const regime = totalScore >= 3.0 ? "bearish"
-      : totalScore >= 1.5 ? "caution"
+    const totalScore = breadthScore + volumeScore + flowScore + solMomentumScore;
+    const bearishThreshold = config.marketRegime?.bearishScoreThreshold ?? 3.7;
+    const cautionThreshold = config.marketRegime?.cautionScoreThreshold ?? 1.8;
+    const regime = totalScore >= bearishThreshold ? "bearish"
+      : totalScore >= cautionThreshold ? "caution"
       : "healthy";
 
     const signals = {
@@ -142,14 +182,18 @@ export async function assessMarketRegime(candidates = []) {
       breadthScore:    +breadthScore.toFixed(2),
       volumeScore:     +volumeScore.toFixed(2),
       flowScore:       +flowScore.toFixed(2),
+      solChg30m:       chg30m !== null ? +chg30m.toFixed(2) : null,
+      solChg60m:       chg60m !== null ? +chg60m.toFixed(2) : null,
+      solMomentumScore: +solMomentumScore.toFixed(2),
     };
 
     log(
       "market_regime",
-      `${regime.toUpperCase()} score=${totalScore.toFixed(2)}/4.5 | ` +
+      `${regime.toUpperCase()} score=${totalScore.toFixed(2)}/5.5 | ` +
       `breadth 5m=${signals.breadth5m ?? "?"}% 1h=${signals.breadth1h ?? "?"}% (${pools5m.length}/${pools1h.length} pools) | ` +
       `volChange=${signals.avgVolChangePct ?? "?"}% accel=${signals.avgAccel ?? "?"}x | ` +
-      `scores: breadth=${breadthScore.toFixed(2)} vol=${volumeScore.toFixed(2)} flow=${flowScore.toFixed(2)}`
+      `sol30m=${signals.solChg30m ?? "?"}% sol60m=${signals.solChg60m ?? "?"}% | ` +
+      `scores: breadth=${breadthScore.toFixed(2)} vol=${volumeScore.toFixed(2)} flow=${flowScore.toFixed(2)} sol=${solMomentumScore.toFixed(2)}`
     );
 
     return { regime, score: +totalScore.toFixed(2), signals };

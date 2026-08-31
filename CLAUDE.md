@@ -120,10 +120,16 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 | screeningIntervalMin | schedule | 30 |
 | screeningIntervalNoPositionMin | schedule | 10 |
 | screeningNoDeployBackoffCount | schedule | 2 |
-| marketRegime.enabled | marketRegime | false |
+| marketRegime.enabled | marketRegime | true |
 | marketRegime.cautionMaxPositions | marketRegime | 3 |
 | marketRegime.cautionScreeningMult | marketRegime | 2 |
 | marketRegime.cautionPositionSizeMult | marketRegime | 0.75 |
+| marketRegime.bearishScoreThreshold | marketRegime | 3.7 |
+| marketRegime.cautionScoreThreshold | marketRegime | 1.8 |
+| marketRegimeCautionSlMult | management | 0.85 |
+| marketRegimeBearishSlMult | management | 0.7 |
+| marketRegimeCautionTrailMult | management | 0.8 |
+| marketRegimeBearishTrailMult | management | 0.6 |
 | managementModel / screeningModel / generalModel | llm | openrouter/healer-alpha |
 
 **`computeDeployAmount(walletSol, { openPositionsValueSol })`** — Equity Fair-Share + Regime Modulation. Each position targets an equal slice of **total equity** (wallet + open-position value), so size is independent of deploy order (no front-loading) and idle capital converges to ~0 as slots fill:
@@ -362,17 +368,25 @@ If override fires, the STOP_LOSS reason is tagged `[early-dump override]`.
 
 ## Market Regime Deployment Throttle (index.js)
 
-When `marketRegime.enabled=true`, the screener checks regime before each cycle. Regime is scored 0–4.5 across three signals (price breadth 5m+1h, volume momentum, flow ratio):
+When `marketRegime.enabled=true` (default), the screener checks regime before each cycle. Regime is scored 0–5.5 across four signals (price breadth 5m+1h, volume momentum, flow ratio, SOL/USD price momentum):
 
-- **healthy** (score < 1.5): normal operation
-- **caution** (1.5 ≤ score < 3.0): position cap at `cautionMaxPositions` (default 3); screening interval multiplied by `cautionScreeningMult` (default 2×); quality thresholds raised for the cycle and restored after; **deploy size scaled by `cautionPositionSizeMult` (default 0.75)** via `computeDeployAmount`
-- **bearish** (score ≥ 3.0): screening skipped entirely
+- **healthy** (score < `cautionScoreThreshold`, default 1.8): normal operation
+- **caution** (1.8 ≤ score < `bearishScoreThreshold`, default 3.7): position cap at `cautionMaxPositions` (default 3); screening interval multiplied by `cautionScreeningMult` (default 2×); quality thresholds raised for the cycle and restored after; **deploy size scaled by `cautionPositionSizeMult` (default 0.75)** via `computeDeployAmount`
+- **bearish** (score ≥ 3.7): screening skipped entirely
 
 Caution threshold elevation is stored in `_cautionOrigFeeRatio`/`_cautionOrigOrganic` before modification and restored in the `finally` block to prevent compounding across cycles.
 
 The assessed regime is also written to runtime `config.marketRegime._activeRegime` (set right after `assessMarketRegime`, or forced to `"healthy"` when `marketRegime.enabled=false`). This is the **only** channel `computeDeployAmount` (config.js) and the deploy guard (executor.js) use to apply caution size modulation — they don't import `_lastRegime`. `deployAmount` is computed **after** the regime block in `runScreeningCycle` so the current cycle's regime modulates size; the executor guard reads the same value, keeping prompt and guard consistent (15% tolerance absorbs position-value drift).
 
 **Live message safety:** the screener wraps its execution in a `try/finally` that calls `liveMessage.finalize()`. All early-returns inside the `try` block must assign `screenReport` before returning — a bare `return "string"` bypasses `finalize()` and leaves `_liveMessageDepth > 0`, which permanently suppresses all Telegram notifications (`notifyClose`, `notifyDeploy`, etc.) until process restart.
+
+**Regime protection on EXISTING positions (not just new deploys):** previously regime only gated entry (skip screening on bearish, shrink new deploy size on caution) — a position opened during a healthy market kept its original SL/trailing tolerance even if the market turned caution/bearish while it was still open. Four things now also react to `config.marketRegime._activeRegime`:
+- **SL tightening** (`state.js` `effectiveStopLossPct`): the per-position `sl_pct_override` **and** the `stopLossTightestPct` clamp are both scaled by `marketRegimeCautionSlMult` (0.85) / `marketRegimeBearishSlMult` (0.7) — a mid-vol-tier `-12%` SL becomes `-10.2%` in caution, `-8.4%` in bearish. Scaling the clamp too matters for the low-vol tier (`-8%`, equal to the default tightest bound): scaling `raw` alone would have no effect there (`-8×0.7=-5.6` is less negative than the unscaled `-8` clamp and would get pulled straight back to it) — this was the most common overshoot tier in observed data (CATWIF, reptilecoin, febu).
+- **Faster profit-taking** (`state.js` `updatePnlAndCheckExits`, trailing TP give-back): `effectiveDrop` is scaled by `marketRegimeCautionTrailMult` (0.8) / `marketRegimeBearishTrailMult` (0.6) before stale-peak widening, locking in gains sooner.
+- **SOL momentum signal** (`market-regime.js` Signal 4): self-samples `solPriceUsd` (already fetched each cycle, no extra API call) into a small in-memory ring buffer and scores a SOL-denominated dump (≥30m/60m windows) — almost every LP here is SOL-quoted, so a broad SOL move is systemic risk the token-breadth signals don't directly see. Raised the bearish/caution thresholds from the pre-signal 3.0/1.5 to 3.7/1.8 to absorb this signal's +1.0 max headroom (max score now 5.5).
+- **Rule 10 — trim-to-cap** (`index.js` `runManagementCycle`): when caution/bearish and open positions exceed `cautionMaxPositions` after other rules run, the single weakest-PnL still-open position is closed this cycle (rate-limited to 1/cycle to avoid dumping several at once — re-evaluated next cycle if still over cap).
+
+Both `effectiveStopLossPct` and `updatePnlAndCheckExits` take `regime` as an optional trailing parameter (default `"healthy"`) so any caller that doesn't pass it is unaffected — the three real call sites in `index.js` (management cycle, 30s PnL poll, `/simulate` debug command) all pass `config.marketRegime?._activeRegime ?? "healthy"`.
 
 ---
 

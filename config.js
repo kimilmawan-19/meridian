@@ -184,6 +184,13 @@ export const config = {
     allowLlmRiskParams:    u.allowLlmRiskParams     ?? true, // let SCREENER set per-position sl/trailing overrides
     stopLossFloorPct:      u.stopLossFloorPct       ?? -50,  // loosest (most negative) SL the LLM may set
     stopLossTightestPct:   u.stopLossTightestPct    ?? -8,   // tightest (least negative) SL the LLM may set
+    // ── Regime-aware risk tightening: shrink SL magnitude / trailing give-back tolerance
+    // for EXISTING positions while the broad market is caution/bearish, not just throttle new
+    // deploys. Applied in effectiveStopLossPct() and updatePnlAndCheckExits() (state.js).
+    marketRegimeCautionSlMult:    u.marketRegime?.cautionStopLossMult ?? 0.85, // caution: SL 15% tighter
+    marketRegimeBearishSlMult:    u.marketRegime?.bearishStopLossMult ?? 0.7,  // bearish: SL 30% tighter
+    marketRegimeCautionTrailMult: u.marketRegime?.cautionTrailMult    ?? 0.8,  // caution: trailing give-back 20% tighter
+    marketRegimeBearishTrailMult: u.marketRegime?.bearishTrailMult    ?? 0.6,  // bearish: trailing give-back 40% tighter
     // ── Auto-SL: code-injected volatility-adaptive stop-loss ──
     // When the LLM doesn't set sl_pct, executor.js injects one based on pool volatility.
     // Low-vol curve positions don't need -15% room; a -8% SL cuts losses before bleed.
@@ -253,6 +260,11 @@ export const config = {
     cautionMaxPositions:  u.marketRegime?.cautionMaxPositions  ?? 3,  // max concurrent positions while caution (vs risk.maxPositions)
     cautionScreeningMult: u.marketRegime?.cautionScreeningMult ?? 2,  // multiply screening interval while caution (slower cadence)
     cautionPositionSizeMult: u.marketRegime?.cautionPositionSizeMult ?? 0.75, // scale fair-share deploy size while caution (limits nominal exposure)
+    // assessMarketRegime() score thresholds (market-regime.js). Max score is 5.5 (breadth 2.0 +
+    // volume 1.5 + flow 1.0 + SOL momentum 1.0). Raised from the pre-SOL-momentum 3.0/1.5 to
+    // absorb that signal's headroom — starting calibration, tune from market_regime logs.
+    bearishScoreThreshold: u.marketRegime?.bearishScoreThreshold ?? 3.7,
+    cautionScoreThreshold: u.marketRegime?.cautionScoreThreshold ?? 1.8,
     _activeRegime: "healthy",  // runtime-only: latest assessed regime, shared with computeDeployAmount (set by index.js screening cycle)
   },
 

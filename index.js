@@ -372,7 +372,7 @@ export async function runManagementCycle({ silent = false } = {}) {
       ) {
         schedulePeakConfirmation(p.position);
       }
-      const exit = updatePnlAndCheckExits(p.position, p, config.management);
+      const exit = updatePnlAndCheckExits(p.position, p, config.management, config.marketRegime?._activeRegime ?? "healthy");
       if (exit) {
         if (exit.action === "TRAILING_TP" && exit.needs_confirmation && shouldUsePnlRecheck()) {
           if (queueTrailingDropConfirmation(p.position, exit.peak_pnl_pct, exit.current_pnl_pct, exit.effective_drop_pct ?? config.management.trailingDropPct)) {
@@ -506,7 +506,7 @@ export async function runManagementCycle({ silent = false } = {}) {
 
       const streakWindowMin = config.emergencyExits.sellPressureStreak?.windowMin ?? 30;
       const volumeWindow = getVolumeWindow(p.pool, streakWindowMin);
-      const closeRule = getDeterministicCloseRule(p, config.management, p._marketData, volumeWindow, solPriceUsd);
+      const closeRule = getDeterministicCloseRule(p, config.management, p._marketData, volumeWindow, solPriceUsd, config.marketRegime?._activeRegime ?? "healthy");
       if (closeRule) {
         actionMap.set(p.position, closeRule);
         if (closeRule.rule === 7 || closeRule.rule === 8) {
@@ -575,6 +575,28 @@ export async function runManagementCycle({ silent = false } = {}) {
         continue;
       }
       actionMap.set(p.position, { action: "STAY" });
+    }
+
+    // Rule 10: regime trim-to-cap — existing positions get trimmed toward cautionMaxPositions
+    // during caution/bearish too, not just new deploys blocked. Rate-limited to 1 position per
+    // cycle (weakest PnL among still-STAY positions) to avoid dumping several at once.
+    {
+      const activeRegime = config.marketRegime?._activeRegime ?? "healthy";
+      if (config.marketRegime?.enabled && activeRegime !== "healthy") {
+        const cap = config.marketRegime.cautionMaxPositions ?? 3;
+        const stillOpen = positionData.filter((p) => actionMap.get(p.position)?.action === "STAY");
+        const closingCount = positionData.length - stillOpen.length;
+        const projectedOpenCount = positionData.length - closingCount;
+        if (projectedOpenCount > cap && stillOpen.length > 0) {
+          const weakest = stillOpen.reduce((min, p) => (p.pnl_pct ?? 0) < (min.pnl_pct ?? 0) ? p : min);
+          actionMap.set(weakest.position, {
+            action: "CLOSE",
+            rule: 10,
+            reason: `regime trim-to-cap (${activeRegime}, ${projectedOpenCount}>${cap}, weakest PnL ${weakest.pnl_pct ?? "?"}%)`,
+          });
+          log("market_regime", `Rule 10 trim-to-cap: closing ${weakest.pair} (PnL ${weakest.pnl_pct ?? "?"}%) — ${projectedOpenCount} open > cap ${cap} during ${activeRegime}`);
+        }
+      }
     }
 
     // ── Build JS report ──────────────────────────────────────────────
@@ -821,17 +843,18 @@ export async function runScreeningCycle({ silent = false } = {}) {
     // Market regime check — uses 50 unfiltered trending pools (5m + 1h) + DexScreener flow
     // Skip screening if market is broadly bearish to avoid deploying into hostile conditions
     if (config.marketRegime?.enabled) {
-      const regime = await assessMarketRegime(candidates);
+      const regime = await assessMarketRegime(candidates, currentBalance?.sol_price ?? null);
       _lastRegime = regime.regime; // drives caution screening slowdown on the next cycle
       config.marketRegime._activeRegime = regime.regime; // shared with computeDeployAmount (fair-share size modulation)
       if (regime.regime === "bearish" && config.marketRegime.skipOnBearish) {
         const s = regime.signals;
         const msg =
           `⏸️ <b>Screening paused — market bearish</b>\n` +
-          `Score: ${regime.score}/4.5\n` +
+          `Score: ${regime.score}/5.5\n` +
           `Breadth: 5m ${s.breadth5m ?? "?"}% | 1h ${s.breadth1h ?? "?"}% (${s.poolsSampled5m ?? 0} pools)\n` +
           `Volume trend: ${s.avgVolChangePct ?? "?"}% | Acceleration: ${s.avgAccel ?? "?"}x\n` +
-          `Signals: breadth=${s.breadthScore} vol=${s.volumeScore} flow=${s.flowScore}`;
+          `SOL momentum: 30m ${s.solChg30m ?? "?"}% | 60m ${s.solChg60m ?? "?"}%\n` +
+          `Signals: breadth=${s.breadthScore} vol=${s.volumeScore} flow=${s.flowScore} sol=${s.solMomentumScore}`;
         log("market_regime", `Screening skipped — bearish regime (score=${regime.score})`);
         appendDecision({ type: "skip", actor: "SCREENER", summary: "Market bearish — screening paused", reason: msg });
         if (config.marketRegime.notifyOnSkip && telegramEnabled()) await sendHTML(msg).catch(() => {});
@@ -843,12 +866,14 @@ export async function runScreeningCycle({ silent = false } = {}) {
       if (regime.regime === "caution") {
         // Deployment throttle: cap concurrent positions below maxPositions to limit
         // correlated exposure on soft-market days (when tokens dump together in-range).
-        // Existing positions keep running with their own SL — we only stop NEW deploys.
+        // Existing positions also get defended faster (regime-aware SL/trailing tightening
+        // in effectiveStopLossPct + updatePnlAndCheckExits, and Rule 10 trim-to-cap above) —
+        // we don't just stop new deploys anymore.
         const cautionCap = config.marketRegime.cautionMaxPositions ?? 3;
         if (prePositions.total_positions >= cautionCap) {
           const msg =
             `⏸️ <b>Screening throttled — caution regime</b>\n` +
-            `Score: ${regime.score}/4.5 — at caution capacity (${prePositions.total_positions}/${cautionCap})\n` +
+            `Score: ${regime.score}/5.5 — at caution capacity (${prePositions.total_positions}/${cautionCap})\n` +
             `New deploys paused to limit correlated exposure. Existing positions unaffected.`;
           log("market_regime", `Screening throttled — caution at capacity (${prePositions.total_positions}/${cautionCap}, score=${regime.score})`);
           appendDecision({ type: "skip", actor: "SCREENER", summary: "Caution regime — at capacity", reason: msg });
@@ -1453,7 +1478,7 @@ Summarize the current portfolio health, total fees earned, and performance of al
         ) {
           schedulePeakConfirmation(p.position);
         }
-        const exit = updatePnlAndCheckExits(p.position, p, config.management);
+        const exit = updatePnlAndCheckExits(p.position, p, config.management, config.marketRegime?._activeRegime ?? "healthy");
         if (exit) {
           if (exit.action === "TRAILING_TP" && exit.needs_confirmation && shouldUsePnlRecheck()) {
             if (queueTrailingDropConfirmation(p.position, exit.peak_pnl_pct, exit.current_pnl_pct, exit.effective_drop_pct ?? config.management.trailingDropPct)) {
@@ -1479,7 +1504,7 @@ Summarize the current portfolio health, total fees earned, and performance of al
           addVolumeSnapshot(p.pool, { vol_5m: pollMd.volume_5m, buys_5m: pollMd.txn_buys_5m ?? 0, sells_5m: pollMd.txn_sells_5m ?? 0 });
         }
         const pollVolumeWindow = getVolumeWindow(p.pool, config.emergencyExits.sellPressureStreak?.windowMin ?? 30);
-        const closeRule = getDeterministicCloseRule(p, config.management, pollMd, pollVolumeWindow, _cachedSolPrice);
+        const closeRule = getDeterministicCloseRule(p, config.management, pollMd, pollVolumeWindow, _cachedSolPrice, config.marketRegime?._activeRegime ?? "healthy");
         if (closeRule) {
           const isEmergency = closeRule.rule === 7 || closeRule.rule === 8;
           if (isEmergency) {
@@ -1687,7 +1712,7 @@ function isOverageStillEarning(position, lookbackMin, minGrowthSol, solPriceUsd,
   return false;
 }
 
-function getDeterministicCloseRule(position, managementConfig, marketData = null, volumeWindow = [], solPriceUsd = null) {
+function getDeterministicCloseRule(position, managementConfig, marketData = null, volumeWindow = [], solPriceUsd = null, regime = "healthy") {
   const tracked = getTrackedPosition(position.position);
   const pnlSuspect = (() => {
     if (position.pnl_pct == null) return false;
@@ -1707,7 +1732,7 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
     return { action: "CLOSE", rule: 1, reason: "break-even stop" };
   }
 
-  const effSL1 = effectiveStopLossPct(tracked, managementConfig);
+  const effSL1 = effectiveStopLossPct(tracked, managementConfig, regime);
   if (!pnlSuspect && position.pnl_pct != null && effSL1 != null && position.pnl_pct <= effSL1 && posAgeMin >= minAgeForStopLoss) {
     return { action: "CLOSE", rule: 1, reason: `stop loss (<=${effSL1}%)` };
   }
@@ -2623,7 +2648,7 @@ async function telegramHandler(msg) {
       const md = await fetchPoolMarketData(pos.pool);
       if (!md) { await sendMessage(`⚠️ DexScreener returned no data for ${pos.pair} (${pos.pool.slice(0, 8)})`); return; }
       const tracked = getTrackedPosition(pos.position);
-      const rule = getDeterministicCloseRule(pos, config.management, md);
+      const rule = getDeterministicCloseRule(pos, config.management, md, [], null, config.marketRegime?._activeRegime ?? "healthy");
       const cur = config.management.solMode ? "◎" : "$";
       const lines = [
         `🧪 Emergency Exit Simulation: ${pos.pair}`,
@@ -2665,8 +2690,8 @@ async function telegramHandler(msg) {
       const hitRateStr = stats.hitRatePct != null ? `${stats.hitRatePct}%` : "n/a";
 
       const tracked = getTrackedPosition(pos.position);
-      const trailingExit = updatePnlAndCheckExits(pos.position, pos, config.management);
-      const closeRule = getDeterministicCloseRule(pos, config.management, md);
+      const trailingExit = updatePnlAndCheckExits(pos.position, pos, config.management, config.marketRegime?._activeRegime ?? "healthy");
+      const closeRule = getDeterministicCloseRule(pos, config.management, md, [], null, config.marketRegime?._activeRegime ?? "healthy");
 
       const mdLines = md ? [
         `DexScreener (${fetchMs < 10 ? `cache HIT` : `cache MISS, ${fetchMs}ms`}):`,
