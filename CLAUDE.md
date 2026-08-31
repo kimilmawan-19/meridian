@@ -41,7 +41,7 @@ Three agent roles filter which tools the LLM can call:
 | Role | Purpose | Key Tools |
 |------|---------|-----------|
 | `SCREENER` | Find and deploy new positions | deploy_position, get_top_candidates, get_token_holders, check_smart_wallets_on_pool |
-| `MANAGER` | Manage open positions | close_position, claim_fees, swap_token, get_position_pnl, set_position_note |
+| `MANAGER` | Manage open positions | close_position, partial_close_position, claim_fees, swap_token, get_position_pnl, set_position_note |
 | `GENERAL` | Chat / manual commands | All tools |
 
 Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant set(s).
@@ -69,6 +69,7 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 | Key | Section | Default |
 |-----|---------|---------|
 | minFeeActiveTvlRatio | screening | 0.05 |
+| minFeePerBinStep | screening | 0.0007 |
 | minTvl / maxTvl | screening | 10k / 150k |
 | minVolume | screening | 500 |
 | minOrganic | screening | 60 |
@@ -80,6 +81,12 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 | minTokenFeesSol | screening | 30 |
 | maxBundlersPct | screening | 30 |
 | maxTop10Pct | screening | 60 |
+| maxPump1hPct | screening | 80 |
+| lastPoolStandingGuard | screening | true |
+| lastPoolStandingMinBearish | screening | 3 |
+| entryFlowFilterEnabled | screening | true |
+| entryFlowBlockRegimes | screening | ["DISTRIBUTION"] |
+| entryFlowFilterSmartMoneyOverride | screening | true |
 | blockedLaunchpads | screening | [] |
 | deployAmountSol | management | 0.5 |
 | maxDeployAmount | risk | 50 |
@@ -88,11 +95,57 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 | positionSizePct | management | 0.35 |
 | minSolToOpen | management | 0.55 |
 | outOfRangeWaitMinutes | management | 30 |
+| maxPositionAgeMinutes | management | 2880 |
+| feeGrowthLookbackMinutes | management | 20 |
+| feeGrowthMinSol | management | 0.01 |
+| ageExtensionMinutes | management | 45 |
+| maxAgeExtensions | management | 3 |
+| breakEvenInRangeDeferMin | management | 60 |
+| trailingInRangeDeferMin | management | 90 |
+| trailingGivebackDivisor | management | 3 |
+| stopLossTightestPct | management | -8 |
+| earlyDumpOverridePct | management | -10 |
+| autoSlEnabled | management | true |
+| autoSlLowVolMax | management | 2 |
+| autoSlLowVolPct | management | -8 |
+| autoSlMidVolMax | management | 4 |
+| autoSlMidVolPct | management | -12 |
+| autoSlHighVolPct | management | -15 |
+| inRangeDumpCooldownEnabled | management | true |
+| inRangeDumpCooldownHours | management | 12 |
+| inRangeDumpCooldownLossPct | management | -5 |
+| inRangeDumpCooldownRangeEff | management | 70 |
+| inRangeDumpCooldownBidAskMult | management | 2 |
 | managementIntervalMin | schedule | 10 |
 | screeningIntervalMin | schedule | 30 |
+| screeningIntervalNoPositionMin | schedule | 10 |
+| screeningNoDeployBackoffCount | schedule | 2 |
+| marketRegime.enabled | marketRegime | true |
+| marketRegime.cautionMaxPositions | marketRegime | 3 |
+| marketRegime.cautionScreeningMult | marketRegime | 2 |
+| marketRegime.cautionPositionSizeMult | marketRegime | 0.75 |
+| marketRegime.bearishScoreThreshold | marketRegime | 3.7 |
+| marketRegime.cautionScoreThreshold | marketRegime | 1.8 |
+| marketRegimeCautionSlMult | management | 0.85 |
+| marketRegimeBearishSlMult | management | 0.7 |
+| marketRegimeCautionTrailMult | management | 0.8 |
+| marketRegimeBearishTrailMult | management | 0.6 |
 | managementModel / screeningModel / generalModel | llm | openrouter/healer-alpha |
 
-**`computeDeployAmount(walletSol)`** — scales position size with wallet balance (compounding). Formula: `clamp(deployable × positionSizePct, floor=deployAmountSol, ceil=maxDeployAmount)`.
+**`computeDeployAmount(walletSol, { openPositionsValueSol })`** — Equity Fair-Share + Regime Modulation. Each position targets an equal slice of **total equity** (wallet + open-position value), so size is independent of deploy order (no front-loading) and idle capital converges to ~0 as slots fill:
+
+```
+equitySol  = walletSol + openPositionsValueSol
+baseShare  = equitySol / risk.maxPositions          # fixed divisor, NOT cautionMaxPositions
+regimeMult = (_activeRegime === "caution") ? cautionPositionSizeMult (0.75) : 1.0
+deployable = max(0, walletSol - gasReserve)
+deploy     = clamp(baseShare × regimeMult, floor=deployAmountSol, ceil=min(maxDeployAmount, deployable))
+```
+
+- Pembagi **tetap** `maxPositions` (bukan `cautionMaxPositions`) — kalau caution memakai pembagi lebih kecil, posisi malah membesar (salah arah). `regimeMult` yang menangani pengecilan saat caution.
+- Regime dibaca dari runtime `config.marketRegime._activeRegime` (di-set di `index.js` screening cycle setelah `assessMarketRegime`). Guard di `executor.js` membaca nilai yang sama → konsisten dengan prompt.
+- Nilai posisi dikonversi via `position.total_value_true_usd ÷ sol_price` (hindari ambiguitas `solMode`). Pemanggil tanpa opts → equity degrade ke `walletSol` saja (konservatif).
+- `positionSizePct` (config lama) tidak lagi dipakai untuk sizing utama; tetap ada agar `user-config.json` lama tidak pecah.
 
 ---
 
@@ -100,8 +153,9 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 
 1. **Deploy**: `deploy_position` → executor safety checks → `trackPosition()` in state.js → Telegram notify
 2. **Monitor**: management cron → `getMyPositions()` → `getPositionPnl()` → OOR detection → pool-memory snapshots
-3. **Close**: `close_position` → `recordPerformance()` in lessons.js → auto-swap base token to SOL → Telegram notify
-4. **Learn**: `evolveThresholds()` runs on performance data → updates config.screening → persists to user-config.json
+3. **Partial** (optional): on a TP_PROPOSAL the MANAGER may `partial_close_position` → SDK `removeLiquidity(bps<10000, shouldClaimAndClose=false)` → `markPartialExit()` tightens remainder trailing stop, resets veto budget → auto-swap scaled-out token to SOL. Relay path is NOT used for partials (zap-out is full-close only).
+4. **Close**: `close_position` → `recordPerformance()` in lessons.js → auto-swap base token to SOL → Telegram notify. Closed PnL uses `allTimeWithdrawals` which already accumulates partial withdrawals (PnL is blended, no manual adjustment).
+5. **Learn**: `evolveThresholds()` runs on performance data → updates config.screening → persists to user-config.json
 
 ---
 
@@ -117,6 +171,29 @@ Before `deploy_position` executes:
 - `amount_x > 0` is rejected. Deploys are single-side SOL only (`amount_y` / `amount_sol`)
 - SOL balance must cover `amount_y + gasReserve`
 - `blockedLaunchpads` enforced in `getTopCandidates()` before LLM sees candidates
+- **Auto-SL injection**: if `sl_pct` is not provided by LLM and `autoSlEnabled=true`, executor auto-injects based on volatility tier (see Auto Stop-Loss section)
+
+## Screener Hard Filters (index.js + screening.js — before LLM sees candidates)
+
+Applied in order during `passing = allCandidates.filter(...)` (index.js) and `getRawPoolScreeningRejectReason()` (screening.js):
+- **`maxPump1hPct`** (default 80%): drops any pool whose 1h price change exceeds threshold. Primary source: DexScreener `price_change_1h`; fallback: Jupiter `stats_1h.price_change`. Directly prevents FOMO deploys into parabolic pumps (ANSEM +172% 1h would have been blocked). Set `null` to disable.
+- **`maxDump1hPct`** (default -35%): drops falling-knife tokens unless smart wallets are present.
+- **`minFeePerBinStep`** (default 0.0007): `fee_active_tvl_ratio / bin_step` — normalises fee productivity against range width. A pool with bin_step=125 barely clearing the fee_tvl gate (0.05%) scores 0.0004 and is rejected; a pool with bin_step=80 and fee_tvl=0.08% scores 0.001 and passes. Prevents low-fee-density wide-bin pools that empirically produce poor bid_ask results (17-day data: bid_ask+bin_step≥100 averaged -0.7% PnL, 0.8% fee-yield). Applied in `screening.js:getRawPoolScreeningRejectReason` after the `minFeeActiveTvlRatio` check.
+- **`entryFlowFilterEnabled`** (default true): drops candidates whose multi-timeframe flow consensus (`computeCandidateFlow` — DexScreener price_change + volume ratio over 5m/1h/6h) is in `entryFlowBlockRegimes` (default `["DISTRIBUTION"]` — active selling into bids, the precursor to in-range dumps like NEIL −16%). Smart-wallet presence overrides (`entryFlowFilterSmartMoneyOverride`, accumulation can absorb selling). Missing market data → NEUTRAL → not blocked (fail-safe). Hardens the soft guidance in `prompt.js` (DISTRIBUTION/CAPITULATION = skip). Shares `computeCandidateFlow` with the Last Pool Standing guard. Conservative default (DISTRIBUTION only, not CAPITULATION) to avoid over-restriction on top of auto-evolved `minFeeActiveTvlRatio`.
+- `minPoolAgeHours`, `maxTop10Pct`, `minTokenFeesSol`, `maxBundlersPct`, `maxBotHoldersPct`, `blockedLaunchpads`, rugpull/PVP flags — all applied before LLM prompt is built.
+
+## Last Pool Standing Guard (index.js — after hard filters, before LLM)
+
+Runs after `passing` is finalized (and after single-candidate `getLoneCandidateSkipReason` check).
+
+Trigger (all must hold, gated by `lastPoolStandingGuard=true`):
+- `passing.length > 1` — multiple pools survived hard filters
+- Exactly **1** pool has MARKUP flow consensus
+- At least `lastPoolStandingMinBearish` (default 3) pools have CAPITULATION or DISTRIBUTION flow consensus
+
+On trigger: cycle is skipped with `⛔ NO DEPLOY`, logging which pool was the lone MARKUP and which pools were bearish-flow. Prevents the "last pool standing" anti-pattern — deploying the only token still pumping while the market broadly sells off (the pattern that produced ANSEM -24.97%).
+
+Flow consensus uses the same `tfFlowRegime`/`flowConsensus` functions as the screener prompt, computed from DexScreener `price_change_*` and volume ratios for each pool in `passing`.
 
 ---
 
@@ -152,6 +229,32 @@ Progress bar format: `[████████░░░░░░░░░░░
 ## Race Condition: Double Deploy
 
 `_screeningLastTriggered` in index.js prevents concurrent screener invocations. Management cycle sets this before triggering screener. Also, `deploy_position` safety check uses `force: true` on `getMyPositions()` for a fresh count.
+
+---
+
+## PnL Poll Cooldown (index.js — 30s poller)
+
+The 30s PnL poller can trigger an off-cycle management run when a position hits a stop-loss /
+emergency-close condition before the next scheduled cycle. The trigger cooldown is **per-position**
+(`_pollTriggeredAt` is a `Map<position_address, epochMs>`, not a global scalar):
+
+- A dump on position A no longer blocks faster exits on position B. The `managementIntervalMin`
+  (default 10m) cooldown applies only to re-triggering on the **same** position.
+- When a position is exit-eligible but still in cooldown, the poll `continue`s to scan the
+  remaining positions instead of `break`ing the whole tick (the old global-scalar bug let a
+  persistently-dumping A, evaluated first each tick, starve B from ever being checked).
+- When a position actually triggers, the poll `break`s — one management cycle evaluates all
+  positions anyway. The 30s poll interval naturally caps triggers to ≤1 per 30s (no stampede).
+- Entries for closed positions are pruned at the top of each poll tick.
+
+This was added to cut left-tail in-range-dump overshoot: multiple positions dumping in the same
+10-minute window previously had only the first one exit promptly.
+
+---
+
+## Capacity-Aware Screening Cadence (index.js)
+
+Screening runs faster while the wallet has **free capacity** (`positions < maxPositions`), not just when empty. `effectiveScreeningIntervalMs()` returns `screeningIntervalNoPositionMin` (fast, default 10m) normally. After `screeningNoDeployBackoffCount` (default 2) consecutive screening cycles end with **no deploy** (LLM "⛔ NO DEPLOY" or no successful `deploy_position`), it backs off to `screeningIntervalMin` (default 30m). `_noDeployStreak` increments on each no-deploy cycle and resets to 0 on a successful deploy (`isScreeningBackedOff()` gates the cadence). Applied in both the 0-position branch and the post-management trigger of `runManagementCycle`.
 
 ---
 
@@ -196,6 +299,116 @@ const actualBaseFee = baseFactor > 0
 - Performance recorded via `recordPerformance()` called from executor.js after `close_position`
 - `evolveThresholds()` evolves `minFeeActiveTvlRatio` and `minOrganic` based on winner/loser fee_tvl_ratio and organic_score distributions
 
+**Lesson types:**
+- `AVOID` — screener should avoid similar pools
+- `PREFER` — screener should seek similar pools
+- `WARN` — in-range dump: high range-efficiency (>70%) position that still hit SL/sell-pressure. Indicates token quality failure, not position design failure. Uses higher `loserEvidenceWeight` (+0.20).
+
+**`loserEvidenceWeight` scaling:**
+- `range_efficiency >= 70` (in-range dump): +0.20 — meaningful token-quality signal
+- `range_efficiency <= 30` (OOR): +0.20 — position design signal
+- `range_efficiency <= 50`: +0.10
+- Otherwise: +0.05 (ambiguous)
+
+---
+
+## Auto Stop-Loss (executor.js)
+
+Volatility-adaptive SL enforced at deploy time when `autoSlEnabled=true`:
+
+```
+vol <= autoSlLowVolMax (2)  → autoSlLowVolPct  (-8%)   [tier: low]
+vol <= autoSlMidVolMax (4)  → autoSlMidVolPct  (-12%)  [tier: mid]
+vol >  autoSlMidVolMax      → autoSlHighVolPct (-15%)  [tier: high]
+```
+
+`autoSl` is clamped to `[stopLossFloorPct, stopLossTightestPct]` = `[-50%, -8%]`, then:
+- **`sl_pct` absent** → inject `autoSl`
+- **LLM `sl_pct` WIDER than `autoSl`** (more negative) → **cap to `autoSl`**. Prevents the WOC pattern (LLM self-set -25% stop bled to -22.9%; auto-SL -12% would have cut it).
+- **LLM `sl_pct` TIGHTER than `autoSl`** → kept (high-conviction override allowed).
+
+High tier uses dedicated `autoSlHighVolPct` (-15%), **not** `stopLossPct` (which is the -50% emergency floor — reusing it gave high-vol deploys a -50% auto-SL bug). Logged as `Auto-SL: ...` / `Auto-SL cap: ...`.
+
+---
+
+## In-Range Deferral (state.js)
+
+Break-even and trailing TP are **not** suppressed indefinitely while `in_range=true`. Instead, a bounded grace timer gates the close:
+
+**Break-even (`breakEvenInRangeDeferMin`, default 60m):**
+- Timer starts (`break_even_in_range_since`) on first in-range detection with PnL ≤ 0
+- If position goes OOR before timer expires → timer resets, fires immediately
+- If PnL recovers above 0 → timer resets (position improving, no close needed)
+- After grace expires → BREAK_EVEN fires normally
+
+**Trailing TP (`trailingInRangeDeferMin`, default 90m):**
+- Mirror logic with `trailing_in_range_since` timestamp
+- Timer only runs while `dropFromPeak >= effectiveDrop` and `in_range=true`
+- Resets if drop recovers or position goes OOR
+
+**Trailing giveback divisor (`trailingGivebackDivisor`, default 3):**
+```js
+effectiveDrop = max(effTrailingDropFloor, peak_pnl_pct / trailingGivebackDivisor)
+```
+Higher divisor = tighter stop relative to peak.
+
+---
+
+## Early-Dump SL Override (state.js)
+
+Normally `minAgeBeforeStopLoss` (default 15m) suppresses SL in the first 15 minutes to avoid noise. The early-dump override bypasses this gate when the position is clearly dying:
+
+```js
+earlyDumpOverride = age < minAgeBeforeStopLoss && currentPnlPct <= earlyDumpOverridePct (-10%)
+```
+
+If override fires, the STOP_LOSS reason is tagged `[early-dump override]`.
+
+---
+
+## Market Regime Deployment Throttle (index.js)
+
+When `marketRegime.enabled=true` (default), the screener checks regime before each cycle. Regime is scored 0–5.5 across four signals (price breadth 5m+1h, volume momentum, flow ratio, SOL/USD price momentum):
+
+- **healthy** (score < `cautionScoreThreshold`, default 1.8): normal operation
+- **caution** (1.8 ≤ score < `bearishScoreThreshold`, default 3.7): position cap at `cautionMaxPositions` (default 3); screening interval multiplied by `cautionScreeningMult` (default 2×); quality thresholds raised for the cycle and restored after; **deploy size scaled by `cautionPositionSizeMult` (default 0.75)** via `computeDeployAmount`
+- **bearish** (score ≥ 3.7): screening skipped entirely
+
+Caution threshold elevation is stored in `_cautionOrigFeeRatio`/`_cautionOrigOrganic` before modification and restored in the `finally` block to prevent compounding across cycles.
+
+The assessed regime is also written to runtime `config.marketRegime._activeRegime` (set right after `assessMarketRegime`, or forced to `"healthy"` when `marketRegime.enabled=false`). This is the **only** channel `computeDeployAmount` (config.js) and the deploy guard (executor.js) use to apply caution size modulation — they don't import `_lastRegime`. `deployAmount` is computed **after** the regime block in `runScreeningCycle` so the current cycle's regime modulates size; the executor guard reads the same value, keeping prompt and guard consistent (15% tolerance absorbs position-value drift).
+
+**Live message safety:** the screener wraps its execution in a `try/finally` that calls `liveMessage.finalize()`. All early-returns inside the `try` block must assign `screenReport` before returning — a bare `return "string"` bypasses `finalize()` and leaves `_liveMessageDepth > 0`, which permanently suppresses all Telegram notifications (`notifyClose`, `notifyDeploy`, etc.) until process restart.
+
+**Regime protection on EXISTING positions (not just new deploys):** previously regime only gated entry (skip screening on bearish, shrink new deploy size on caution) — a position opened during a healthy market kept its original SL/trailing tolerance even if the market turned caution/bearish while it was still open. Four things now also react to `config.marketRegime._activeRegime`:
+- **SL tightening** (`state.js` `effectiveStopLossPct`): the per-position `sl_pct_override` **and** the `stopLossTightestPct` clamp are both scaled by `marketRegimeCautionSlMult` (0.85) / `marketRegimeBearishSlMult` (0.7) — a mid-vol-tier `-12%` SL becomes `-10.2%` in caution, `-8.4%` in bearish. Scaling the clamp too matters for the low-vol tier (`-8%`, equal to the default tightest bound): scaling `raw` alone would have no effect there (`-8×0.7=-5.6` is less negative than the unscaled `-8` clamp and would get pulled straight back to it) — this was the most common overshoot tier in observed data (CATWIF, reptilecoin, febu).
+- **Faster profit-taking** (`state.js` `updatePnlAndCheckExits`, trailing TP give-back): `effectiveDrop` is scaled by `marketRegimeCautionTrailMult` (0.8) / `marketRegimeBearishTrailMult` (0.6) before stale-peak widening, locking in gains sooner.
+- **SOL momentum signal** (`market-regime.js` Signal 4): self-samples `solPriceUsd` (already fetched each cycle, no extra API call) into a small in-memory ring buffer and scores a SOL-denominated dump (≥30m/60m windows) — almost every LP here is SOL-quoted, so a broad SOL move is systemic risk the token-breadth signals don't directly see. Raised the bearish/caution thresholds from the pre-signal 3.0/1.5 to 3.7/1.8 to absorb this signal's +1.0 max headroom (max score now 5.5).
+- **Rule 10 — trim-to-cap** (`index.js` `runManagementCycle`): when caution/bearish and open positions exceed `cautionMaxPositions` after other rules run, the single weakest-PnL still-open position is closed this cycle (rate-limited to 1/cycle to avoid dumping several at once — re-evaluated next cycle if still over cap).
+
+Both `effectiveStopLossPct` and `updatePnlAndCheckExits` take `regime` as an optional trailing parameter (default `"healthy"`) so any caller that doesn't pass it is unaffected — the three real call sites in `index.js` (management cycle, 30s PnL poll, `/simulate` debug command) all pass `config.marketRegime?._activeRegime ?? "healthy"`.
+
+---
+
+## In-Range Dump Cooldown (pool-memory.js)
+
+`recordPoolDeploy()` already cools pools/tokens for low-yield, emergency-exit ("rapid dump"/"volume collapse"), repeated-OOR, and repeat-fee-generating closes. The **in-range dump** trigger covers the token-quality failure pattern those miss: a token that fell *within* our bin range and closed via stop-loss/sell-pressure.
+
+Trigger (all must hold, gated by `inRangeDumpCooldownEnabled`):
+- `range_efficiency > inRangeDumpCooldownRangeEff` (default 70) — token died in-range, not OOR
+- `pnl_pct <= inRangeDumpCooldownLossPct` (default -5%) — meaningful loss, not a small dip
+- `close_reason` matches `/stop.?loss|sell.?pressure/`
+
+On trigger, the **base mint** is cooled for `inRangeDumpCooldownHours` (default 12h base), scaled by loss severity and strategy:
+
+```
+severityMult = |pnl_pct| >= 20 ? 4 : |pnl_pct| >= 12 ? 2 : 1   // rug-grade / large / normal
+strategyMult = bid_ask ? inRangeDumpCooldownBidAskMult (2) : 1
+hours        = min(72, baseHours * severityMult * strategyMult)  // capped at 72h
+```
+
+Examples: -7% curve → 12h; -14% bid_ask → 48h; -22.9% curve (WOC) → 48h; -22.9% bid_ask → 72h (cap). Enforced via `isBaseMintOnCooldown()` in `screening.js` — cooled tokens are filtered out before the LLM sees candidates. Prevents repeat-deploying the same dying token (e.g. SPCX losing twice, or WOC returning as a candidate after one night on a flat 12h cooldown).
+
 ---
 
 ## HiveMind
@@ -226,3 +439,6 @@ Agent Meridian HiveMind sync is handled by `hivemind.js`. It uses built-in Agent
 
 - `lessons.js evolveThresholds()` evolves `minFeeActiveTvlRatio` and `minOrganic`. Fixed: `maxVolatility` block removed (key never existed), `minFeeTvlRatio` renamed to `minFeeActiveTvlRatio`.
 - `get_wallet_positions` tool (dlmm.js) is in definitions.js but not in MANAGER_TOOLS or SCREENER_TOOLS — only available in GENERAL role.
+- Rule 6 (max age, `index.js`) is a **soft cap with earning-grace**: past `maxPositionAgeMinutes` the position closes only if it has stopped earning. While PnL still drifts up (or unclaimed fees accrue ≥ `feeGrowthMinSol` over `feeGrowthLookbackMinutes`), the close is deferred up to `maxAgeExtensions` blocks of `ageExtensionMinutes` (hard ceiling = `maxPositionAgeMinutes + maxAgeExtensions * ageExtensionMinutes`). Earning is judged from pool-memory position snapshots via `getSnapshotWindow()`. Fixed: `maxPositionAgeMinutes` is now mapped in `config.js` management block (previously absent → writes to user-config.json silently had no effect; only the hardcoded `?? 2880` fallback applied).
+- Rule 9 (sell pressure): `streakCount` default lowered 3 → 2 (fixed). 4 days of data showed Rule 9 confirming AFTER positions already overshot their auto-SL tier by 1-6% (e.g. yep -18.12% vs -12% tier, ok-SOL -14.37% vs -12% tier) — the 3-window confirm was too slow for fast bleeds. Cadence validation in `startCronJobs` (`maxSnapshots = windowMin/managementIntervalMin`) still holds at defaults (30/10=3 ≥ 2).
+- `curveMaxVolatility` (strategy block): default shifted from 3 → 3.5 to avoid premature maxBinsBelow on mid-volatility tokens.

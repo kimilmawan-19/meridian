@@ -13,7 +13,8 @@
   "gasReserve": 0.2,
   "positionSizePct": 0.35,
 
-  "strategy": "bid_ask",
+  "strategy": "curve",
+  "curveMaxVolatility": 3,
   "minBinsBelow": 35,
   "maxBinsBelow": 69,
   "defaultBinsBelow": 69,
@@ -31,7 +32,12 @@
   "maxMcap": 10000000,
   "minBinStep": 80,
   "maxBinStep": 125,
+  "filterDecliningVolume": true,
+  "volumeCollapseRejectThreshold": -50,
   "minFeeActiveTvlRatio": 0.05,
+  "evolveWindowDays": 14,
+  "minFeeActiveTvlRatioFloor": 0.04,
+  "minOrganicFloor": 55,
   "minTokenFeesSol": 30,
   "useDiscordSignals": false,
   "discordSignalMode": "merge",
@@ -44,12 +50,17 @@
   "blockedLaunchpads": [],
   "minTokenAgeHours": null,
   "maxTokenAgeHours": null,
+  "minPoolAgeHours": null,
   "athFilterPct": null,
+  "maxPump1hPct": null,
+  "maxDump1hPct": -35,
 
   "minClaimAmount": 5,
   "autoSwapAfterClaim": false,
   "outOfRangeBinsToClose": 10,
   "outOfRangeWaitMinutes": 30,
+  "outOfRangeWaitMinutesAbove": 30,
+  "oorAboveGraceMin": 15,
   "oorCooldownTriggerCount": 3,
   "oorCooldownHours": 12,
   "minVolumeToRebalance": 1000,
@@ -57,14 +68,35 @@
   "takeProfitPct": 5,
   "minFeePerTvl24h": 7,
   "minAgeBeforeYieldCheck": 60,
+  "curveEntryGraceDepthPct": 50,
+  "bidAskEntryGraceDepthPct": 80,
+  "entryGraceConfirmMinutes": 15,
   "trailingTakeProfit": true,
   "trailingTriggerPct": 3,
   "trailingDropPct": 1.5,
+  "trailingStalePeakMinutes": 90,
+  "trailingStalePeakDropMult": 1.75,
+  "partialExit": {
+    "enabled": false,
+    "minPeakPct": 4,
+    "defaultPct": 50,
+    "minPct": 25,
+    "maxPct": 75,
+    "stage2TrailingDropPct": 0.8,
+    "minRemainderUsd": 15
+  },
+  "allowLlmRiskParams": true,
+  "stopLossFloorPct": -50,
+  "stopLossTightestPct": -10,
+  "allowTpVeto": true,
+  "maxTpVetos": 3,
+  "tpVetoFloorDivisor": 2,
   "pnlSanityMaxDiffPct": 5,
   "solMode": false,
 
   "managementIntervalMin": 10,
   "screeningIntervalMin": 30,
+  "screeningIntervalNoPositionMin": 10,
   "healthCheckIntervalMin": 60,
 
   "temperature": 0.373,
@@ -90,13 +122,18 @@
   "chartIndicators": {
     "enabled": false,
     "entryPreset": "supertrend_break",
-    "exitPreset": "supertrend_break",
+    "exitPreset": "rsi_reversal",
     "rsiLength": 2,
     "intervals": ["5_MINUTE"],
     "candles": 298,
     "rsiOversold": 30,
     "rsiOverbought": 80,
-    "requireAllIntervals": false
+    "requireAllIntervals": false,
+    "taExitEnabled": false,
+    "taExitMinPnlPct": 2,
+    "taExitRsiLength": 14,
+    "taExitNearAbovePct": 80,
+    "taExitModulatorDropPct": 0.5
   },
   "emergencyExits": {
     "volumeCollapse": {
@@ -104,13 +141,33 @@
       "dropThresholdPct": 30,
       "minPositionAgeMin": 10,
       "minPeakVolumeUsd": 2000,
-      "sellPressureRatio": 2
+      "sellPressureRatio": 2,
+      "minSellConfirmTxns": 5
     },
     "rapidPriceDrop": {
       "enabled": true,
       "dropPct5m": -8,
-      "requireNegativePnl": true
+      "dropPct1h": 0,
+      "requireNegativePnl": true,
+      "minPositionAgeMin": 10,
+      "requireSellConfirm": false,
+      "minSellBuyRatio": 1.5,
+      "minSellConfirmTxns": 5
+    },
+    "sellPressureStreak": {
+      "enabled": true,
+      "streakCount": 3,
+      "ratio": 1.2,
+      "safetyPnlPct": 5,
+      "windowMin": 30,
+      "minPositionAgeMin": 20
     }
+  },
+
+  "marketRegime": {
+    "enabled": true,
+    "skipOnBearish": true,
+    "notifyOnSkip": true
   },
 
   "telegramChatId": "",

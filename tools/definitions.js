@@ -1,3 +1,5 @@
+import { config } from "../config.js";
+
 const toolDefinitions = [
   // ═══════════════════════════════════════════
   //  SCREENING TOOLS
@@ -133,7 +135,7 @@ PRIORITY ORDER for strategy and bins:
 
 HARD RULES:
 - Never use 'curve'.
-- Bin Step: Only deploy in pools with bin_step between 80 and 125.
+- Bin Step: Only deploy in pools with bin_step between ${config.screening.minBinStep} and ${config.screening.maxBinStep}.
 - Volatility must be positive. If volatility is 0, null, or missing, do not deploy.
 - Range must cover at least 35 total bins. Never deploy 1-bin/tiny ranges.
 - For single-side SOL deploys (amount_y only, amount_x=0): set bins_above to ~25% of bins_below (e.g. bins_below=40 → bins_above=10, max 30% of bins_below). This gives the position upside buffer before going out-of-range.
@@ -174,7 +176,7 @@ WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
           },
           bins_above: {
             type: "number",
-            description: "Number of bins above the current active bin. Keep this at 0 for single-side SOL deploys. Only use this for dual-sided or explicit upside-exposure deploys."
+            description: "OOR tolerance buffer above active bin. Bins above cost no capital (empty for single-side SOL). curve: 5–7 bins. bid_ask: round(bins_below × 0.25) clamped to [10, 20] — high-volatility tokens need wider headroom to oscillate without triggering an OOR close."
           },
           downside_pct: {
             type: "number",
@@ -191,7 +193,11 @@ WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
           volatility: { type: "number", description: "Pool volatility at deploy time, sourced from max(screening timeframe, 30m)" },
           fee_tvl_ratio: { type: "number", description: "fee/TVL ratio at deploy time" },
           organic_score: { type: "number", description: "Base token organic score at deploy time" },
-          initial_value_usd: { type: "number", description: "Estimated USD value being deployed" }
+          initial_value_usd: { type: "number", description: "Estimated USD value being deployed" },
+          top_cluster_trend: { type: "string", enum: ["bullish", "bearish", "neutral"], description: "OKX top holder cluster sentiment at screening time. Pass whenever present in candidate data — used to refine strategy selection." },
+          sl_pct: { type: "number", description: "Optional per-position stop-loss %, negative (e.g. -30). Tighter for fragile/high-vol tokens, looser for high-conviction. Clamped to a safe range; omit to use the global default." },
+          trailing_trigger_pct: { type: "number", description: "Optional per-position PnL % at which trailing take-profit activates (e.g. 5). Higher lets strong runners build more before trailing arms. Omit to use the global default." },
+          trailing_drop_pct: { type: "number", description: "Optional per-position give-back floor % from peak before trailing TP fires (e.g. 2.5). Wider for volatile tokens. Omit to use the global default." }
         },
         required: ["pool_address"]
       }
@@ -293,6 +299,39 @@ WARNING: This executes a real on-chain transaction. Cannot be undone.`,
           }
         },
         required: ["position_address"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "partial_close_position",
+      description: `Scale out of a WINNING position: remove part of the liquidity now and let the rest keep running.
+Use ONLY when presented with a TP_PROPOSAL and you judge the move may continue but want to lock in gains:
+- Take part of the profit off the table (converted back to SOL) while a "runner" stays in to capture more upside.
+- The remainder's trailing stop is automatically tightened, so the runner is well-protected.
+Prefer this over a full close when momentum is mixed (e.g. flow_regime NEUTRAL/MARKUP) but you still want to de-risk.
+Prefer a FULL close_position when the signal is clearly bearish (flow_regime DISTRIBUTION, RSI overbought + reversal, heavy sell pressure).
+
+WARNING: This executes a real on-chain transaction. Cannot be undone. The position stays open with reduced size.`,
+      parameters: {
+        type: "object",
+        properties: {
+          position_address: {
+            type: "string",
+            description: "The position public key to partially close"
+          },
+          pct: {
+            type: "number",
+            description: "Percent of the CURRENT position to scale out now (e.g. 50 = take half). Clamped to the configured min/max so a runner always remains."
+          },
+          reason: {
+            type: "string",
+            description: "Why scaling out now, e.g. 'partial take-profit at peak, holding runner for continuation'."
+          }
+        },
+        required: ["position_address", "pct"]
       }
     }
   },
@@ -980,6 +1019,36 @@ Also useful during screening to skip pools with a bad track record.`,
           }
         },
         required: ["pool_address"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "forget_pool",
+      description: `Wipe deploy history, win rate, and cooldowns from pool memory. Three modes:
+- Single pool: provide pool_address only
+- Recent pools: provide days (e.g. days=7 clears all pools deployed in the last 7 days)
+- All pools: provide all=true to wipe everything
+
+Does NOT affect the token blacklist — only clears pool-level memory.`,
+      parameters: {
+        type: "object",
+        properties: {
+          pool_address: {
+            type: "string",
+            description: "Address of a single pool to forget. Omit when using all or days."
+          },
+          all: {
+            type: "boolean",
+            description: "Set true to wipe the entire pool memory."
+          },
+          days: {
+            type: "number",
+            description: "Clear all pools that were last deployed within this many days (e.g. 7)."
+          }
+        }
       }
     }
   },

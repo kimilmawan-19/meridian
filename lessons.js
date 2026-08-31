@@ -58,6 +58,32 @@ function save(data) {
   fs.writeFileSync(LESSONS_FILE, JSON.stringify(data, null, 2));
 }
 
+// ── Auto-prune stale lessons ───────────────────────────────────
+// Lessons are interpretive and lose relevance over time; performance[]
+// (raw facts) is never touched here. Protects pinned + operator-authored
+// lessons. Mutates data.lessons in place, returns count pruned.
+const LESSON_TTL_DAYS = { bad: 30, poor: 30, failed: 30, good: 60, worked: 60, evolution: 90 };
+const LESSON_CONFIDENCE_FLOOR = 0.30;
+
+function pruneStaleLessons(data) {
+  const now = Date.now();
+  const before = data.lessons.length;
+  data.lessons = data.lessons.filter((l) => {
+    // Protected: pinned + true operator input
+    if (l.pinned) return true;
+    if (l.sourceType === "manual" || l.sourceType === "config_change") return true;
+    // Mechanism B: confidence floor
+    if (typeof l.confidence === "number" && isFinite(l.confidence) && l.confidence < LESSON_CONFIDENCE_FLOOR) return false;
+    // Mechanism A: TTL (auto-evolved keyed by tag, else by outcome)
+    const ttlKey = l.tags?.includes("evolution") ? "evolution" : l.outcome;
+    const ttlDays = LESSON_TTL_DAYS[ttlKey];
+    if (!ttlDays) return true;       // unknown category → keep (conservative)
+    if (!l.created_at) return true;  // no timestamp → keep (can't age)
+    return (now - new Date(l.created_at).getTime()) < ttlDays * 86_400_000;
+  });
+  return before - data.lessons.length;
+}
+
 function buildSignalSnapshot(perf) {
   const snapshot = { ...(perf.signal_snapshot || {}) };
   if (perf.base_mint && snapshot.base_mint == null) snapshot.base_mint = perf.base_mint;
@@ -92,6 +118,12 @@ function buildSignalSnapshot(perf) {
  * @param {number} perf.minutes_in_range  - Total minutes position was in range
  * @param {number} perf.minutes_held      - Total minutes position was held
  * @param {string} perf.close_reason   - Why it was closed
+ * @param {number} [perf.peak_pnl_pct]        - All-time peak PnL % during hold
+ * @param {string} [perf.peak_pnl_at]         - ISO timestamp when peak was reached
+ * @param {number} [perf.tp_veto_count]       - How many trailing-TP vetos were burned
+ * @param {boolean} [perf.ta_exit_triggered]  - Whether RSI/TA signal drove the exit
+ * @param {number} [perf.partial_taken_count] - How many partial scale-outs were taken
+ * @param {number} [perf.partial_taken_pct]   - Cumulative % scaled out before final close
  */
 export async function recordPerformance(perf) {
   const data = load();
@@ -149,6 +181,15 @@ export async function recordPerformance(perf) {
   if (lesson) {
     data.lessons.push(lesson);
     log("lessons", `New lesson: ${lesson.rule}`);
+  }
+
+  const pruned = pruneStaleLessons(data);
+  if (pruned > 0) log("lessons", `Pruned ${pruned} stale lesson(s)`);
+
+  // Refresh aggregate lessons every 20 closed positions (before save — single write)
+  if (data.performance.length % AGGREGATE_REFRESH_EVERY === 0) {
+    const { config: cfg } = await import("./config.js");
+    refreshAggregateLessons(data, data.performance, cfg);
   }
 
   save(data);
@@ -238,9 +279,45 @@ function derivLesson(perf) {
   let rule = "";
 
   if (outcome === "good" || outcome === "bad") {
+    // Strong OOR-avoid signal takes precedence over everything.
     if (perf.range_efficiency < 30 && outcome === "bad") {
       rule = `AVOID: ${perf.pool_name}-type pools (volatility=${perf.volatility}, bin_step=${perf.bin_step}) with strategy="${perf.strategy}" — went OOR ${100 - perf.range_efficiency}% of the time. Consider wider bin_range or bid_ask strategy.`;
       tags.push("oor", perf.strategy, `volatility_${Math.round(perf.volatility)}`);
+    // Exit-mechanism lessons (veto / partial / TA) are more specific and actionable than
+    // generic pool-quality lessons, so they are evaluated before PREFER/volume branches —
+    // otherwise a high-efficiency winner would always be labelled PREFER and the exit
+    // signal would never be learned.
+    } else if ((perf.tp_veto_count ?? 0) >= 2 && outcome === "bad") {
+      rule = `AVOID: Holding trailing TP (${perf.tp_veto_count} vetos) on ${perf.pool_name}-type pools hurt — position closed at ${perf.pnl_pct}% after giving back from peak ${perf.peak_pnl_pct ?? "?"}%. When trailing TP fires, bias toward taking profit.`;
+      tags.push("tp_veto_bad");
+    } else if ((perf.tp_veto_count ?? 0) >= 2 && outcome === "good") {
+      rule = `WORKED: Holding trailing TP (${perf.tp_veto_count} vetos) on ${perf.pool_name}-type pools paid off — final PnL +${perf.pnl_pct}% (peak ${perf.peak_pnl_pct ?? "?"}%).`;
+      tags.push("tp_veto_good");
+    // Partial scale-out quality: did taking part off the table help or leave money behind?
+    } else if ((perf.partial_taken_count ?? 0) > 0 && outcome === "good") {
+      rule = `WORKED: Scaling out (${perf.partial_taken_pct}% partial) on ${perf.pool_name}-type pools locked gains while a runner captured more — final PnL +${perf.pnl_pct}% (peak ${perf.peak_pnl_pct ?? "?"}%).`;
+      tags.push("partial_exit", "worked");
+    } else if ((perf.partial_taken_count ?? 0) > 0 && outcome === "bad") {
+      rule = `NOTE: Scaled out ${perf.partial_taken_pct}% on ${perf.pool_name}-type pools but the runner still closed at ${perf.pnl_pct}% — partial protected part of the position, but consider fuller exits when the signal is clearly bearish.`;
+      tags.push("partial_exit", "failed");
+    // TA-triggered exit quality
+    } else if (perf.ta_exit_triggered && outcome === "good") {
+      rule = `WORKED: RSI overbought exit on ${perf.pool_name} locked in +${perf.pnl_pct}% from a ${perf.peak_pnl_pct ?? "?"}% peak — TA exit signal was accurate.`;
+      tags.push("ta_exit", "worked");
+    } else if (perf.ta_exit_triggered && outcome === "bad") {
+      rule = `AVOID: RSI overbought exit on ${perf.pool_name} fired too early — closed at ${perf.pnl_pct}%, peak was only ${perf.peak_pnl_pct ?? "?"}%. TA exit may have a false-positive issue on this type of pool.`;
+      tags.push("ta_exit", "failed");
+    // Generic pool-quality lessons (lower priority than the exit-mechanism signals above).
+    // In-range dump: high range efficiency + bad outcome + SL/sell-pressure.
+    // This is a TOKEN quality signal, not a position design flaw. Label it explicitly
+    // so the LLM learns that high range-eff does NOT mean safe — token can dump within range.
+    } else if (
+      perf.range_efficiency > 70 &&
+      outcome === "bad" &&
+      /stop.?loss|sell.?pressure|break.?even/i.test(String(perf.close_reason || ""))
+    ) {
+      rule = `WARN: ${perf.pool_name} dumped IN-RANGE (${perf.range_efficiency}% range-eff) → PnL ${perf.pnl_pct}% due to ${perf.close_reason}. High in-range efficiency does NOT guarantee safety — token price fell within the bin range. strategy=${perf.strategy}, volatility=${perf.volatility}, bin_step=${perf.bin_step}.`;
+      tags.push("in_range_dump", "failed", perf.strategy);
     } else if (perf.range_efficiency > 80 && outcome === "good") {
       rule = `PREFER: ${perf.pool_name}-type pools (volatility=${perf.volatility}, bin_step=${perf.bin_step}) with strategy="${perf.strategy}" — ${perf.range_efficiency}% in-range efficiency, PnL +${perf.pnl_pct}%.`;
       tags.push("efficient", perf.strategy);
@@ -311,12 +388,68 @@ function derivLesson(perf) {
 export function evolveThresholds(perfData, config) {
   if (!perfData || perfData.length < MIN_EVOLVE_POSITIONS) return null;
 
-  const winners = perfData.filter((p) => p.pnl_pct > 0);
-  const losers  = perfData.filter((p) => p.pnl_pct < -5);
+  // ── Recency window ────────────────────────────────────────────
+  // Evaluate only positions closed within evolveWindowDays so thresholds
+  // track current market conditions, not stale history. Fall back to full
+  // history when the recent window is too thin to be meaningful.
+  const windowDays = config.screening?.evolveWindowDays;
+  let evalData = perfData;
+  if (isFiniteNum(windowDays) && windowDays > 0) {
+    const cutoff = new Date(Date.now() - windowDays * 86_400_000).toISOString();
+    const windowed = perfData.filter((p) => (p.recorded_at ?? "") >= cutoff);
+    if (windowed.length >= MIN_EVOLVE_POSITIONS) evalData = windowed;
+  }
+  // Only tune thresholds on SOL-quoted records — non-SOL (e.g. SOL-USDC) deploys use a different
+  // fee/liquidity profile and would skew the SOL-strategy thresholds.
+  evalData = evalData.filter(isSolQuoteRecord);
+
+  const winners = evalData.filter((p) => p.pnl_pct > 0);
+  const losers  = evalData.filter((p) => p.pnl_pct < -5);
 
   // Need at least some signal in both directions before adjusting
   const hasSignal = winners.length >= 2 || losers.length >= 2;
   if (!hasSignal) return null;
+
+  // ── Relax gate (shared by all threshold blocks) ───────────────
+  // When the filter is over-tight in a thin market, allow thresholds to
+  // step DOWN. Asymmetric vs raising: smaller step, stricter evidence,
+  // hard floor. Three OR paths qualify; safeguards always required.
+  const total      = winners.length + evalData.filter((p) => p.pnl_pct <= 0).length;
+  const winRate    = total > 0 ? winners.length / total : 0;
+  const pnlVals    = evalData.map((p) => p.pnl_pct).filter(isFiniteNum);
+  const avgPnlPct  = pnlVals.length ? avg(pnlVals) : 0;
+
+  // Confidence-weighted effective counts — weak/noise outcomes contribute little
+  const effectiveLosers  = losers.reduce((s, l) => s + loserEvidenceWeight(l), 0);
+  const effectiveWinners = winners.reduce((s, w) => s + winnerEvidenceWeight(w), 0);
+
+  // ── Raise gate ────────────────────────────────────────────────
+  // Tighten ONLY when there is strong, demonstrated harm: enough quality
+  // losers (not noise) plus sufficient data. Avoids false-positive raises
+  // from a couple of unlucky wick-closes, and reinforces #1 anti-ratchet —
+  // we only tighten when loose filters provably caused losses.
+  const RAISE_EFFECTIVE_LOSERS = 2.5;
+  const RAISE_MIN_POSITIONS    = 10;
+  const raiseAllowed =
+    effectiveLosers >= RAISE_EFFECTIVE_LOSERS &&
+    winners.length >= 2 &&
+    evalData.length >= RAISE_MIN_POSITIONS;
+
+  // ── Relax gate ────────────────────────────────────────────────
+  // When the filter is over-tight in a thin market, allow thresholds to
+  // step DOWN. Asymmetric vs raising: smaller step, stricter evidence,
+  // hard floor. Three OR paths qualify; safeguards always required.
+  const RELAX_POSITION_FLOOR = 10; // only relax when window is thin (dry market)
+  const relaxQualifies =
+    (winRate > 0.60 && evalData.length >= 5) ||  // path 1: win-rate dominant
+    (winRate > 0.50 && avgPnlPct > 2) ||         // path 2: positive expected value
+    (avgPnlPct > 5);                             // path 3: strong returns
+  const RELAX_MAX_LOSER_EVIDENCE = 1.5; // block relax when quality losers prove harm
+  const relaxAllowed =
+    relaxQualifies &&
+    evalData.length < RELAX_POSITION_FLOOR &&
+    effectiveWinners >= 2 &&                       // require quality winner evidence
+    effectiveLosers < RELAX_MAX_LOSER_EVIDENCE;    // don't loosen if losses are real
 
   const changes   = {};
   const rationale = {};
@@ -328,7 +461,7 @@ export function evolveThresholds(perfData, config) {
     const loserFees  = losers.map((p) => p.fee_tvl_ratio).filter(isFiniteNum);
     const current    = config.screening.minFeeActiveTvlRatio;
 
-    if (winnerFees.length >= 2) {
+    if (raiseAllowed && winnerFees.length >= 2) {
       // Minimum fee/TVL among winners — we know pools below this don't work for us
       const minWinnerFee = Math.min(...winnerFees);
       if (minWinnerFee > current * 1.2) {
@@ -342,7 +475,7 @@ export function evolveThresholds(perfData, config) {
       }
     }
 
-    if (loserFees.length >= 2) {
+    if (raiseAllowed && loserFees.length >= 2) {
       // If losers had low fee/TVL, raise min
       const maxLoserFee = Math.max(...loserFees);
       if (maxLoserFee < current * 1.5 && winnerFees.length > 0) {
@@ -358,6 +491,18 @@ export function evolveThresholds(perfData, config) {
         }
       }
     }
+
+    // Relax (step down) — only when no raise was applied and gate qualifies
+    if (!changes.minFeeActiveTvlRatio && relaxAllowed) {
+      const floor   = config.screening.minFeeActiveTvlRatioFloor ?? 0.04;
+      const target  = current * 0.90; // smaller step than raise (10%)
+      const newVal  = clamp(nudge(current, target, MAX_CHANGE_PER_STEP), floor, 10.0);
+      const rounded = Number(newVal.toFixed(2));
+      if (rounded < current) {
+        changes.minFeeActiveTvlRatio = rounded;
+        rationale.minFeeActiveTvlRatio = `Relaxed: winRate=${(winRate * 100).toFixed(0)}% avgPnl=${avgPnlPct.toFixed(1)}% n=${evalData.length} (thin market) — lowered floor from ${current} → ${rounded}`;
+      }
+    }
   }
 
   // ── 2. minOrganic ─────────────────────────────────────────────
@@ -367,7 +512,7 @@ export function evolveThresholds(perfData, config) {
     const winnerOrganics = winners.map((p) => p.organic_score).filter(isFiniteNum);
     const current        = config.screening.minOrganic;
 
-    if (loserOrganics.length >= 2 && winnerOrganics.length >= 1) {
+    if (raiseAllowed && loserOrganics.length >= 2 && winnerOrganics.length >= 1) {
       const avgLoserOrganic  = avg(loserOrganics);
       const avgWinnerOrganic = avg(winnerOrganics);
       // Only raise if there's a clear gap (winners consistently more organic)
@@ -380,6 +525,17 @@ export function evolveThresholds(perfData, config) {
           changes.minOrganic = newVal;
           rationale.minOrganic = `Winner avg organic ${avgWinnerOrganic.toFixed(0)} vs loser avg ${avgLoserOrganic.toFixed(0)} — raised from ${current} → ${newVal}`;
         }
+      }
+    }
+
+    // Relax (step down) — only when no raise was applied and gate qualifies
+    if (!changes.minOrganic && relaxAllowed) {
+      const floor  = config.screening.minOrganicFloor ?? 55;
+      const target = current * 0.95; // smaller step than fee floor (5% for organic)
+      const newVal = clamp(Math.round(nudge(current, target, MAX_CHANGE_PER_STEP)), floor, 90);
+      if (newVal < current) {
+        changes.minOrganic = newVal;
+        rationale.minOrganic = `Relaxed: winRate=${(winRate * 100).toFixed(0)}% avgPnl=${avgPnlPct.toFixed(1)}% n=${evalData.length} (thin market) — lowered from ${current} → ${newVal}`;
       }
     }
   }
@@ -421,6 +577,173 @@ export function evolveThresholds(perfData, config) {
 
 function isFiniteNum(n) {
   return typeof n === "number" && isFinite(n);
+}
+
+// Exclude non-SOL-quote records (e.g. SOL-USDC stable pairs from a different branch) from
+// learning. This agent only deploys single-sided SOL into SOL-quoted pools, so USDC/USDT-quoted
+// losses would otherwise poison aggregate stats (their tiny bin_step lands in the "80-100" bucket)
+// and skew evolveThresholds. pool_name format is "BASE-QUOTE" (e.g. "WIF-SOL", "WIF-USDC").
+const NON_SOL_QUOTES = new Set(["USDC", "USDT", "USD", "USDH", "PYUSD", "USDS"]);
+function isSolQuoteRecord(p) {
+  // Prefer explicit quote info when present (records written after the dlmm.js change).
+  const qs = String(p.quote_symbol ?? "").toUpperCase().trim();
+  if (qs) return qs === "SOL" || qs === "WSOL";
+  const name = String(p.pool_name ?? "");
+  const seg = name.includes("-") ? name.split("-").pop().toUpperCase().trim() : "";
+  if (seg) return !NON_SOL_QUOTES.has(seg);   // "WIF-SOL"→keep, "WIF-USDC"→drop
+  return true; // no parseable quote (address-fallback name) → keep (conservative: don't drop SOL data)
+}
+
+// ── Evidence weighting ─────────────────────────────────────────
+// Confidence weight ∈ [0,1] for how strongly a closed position proves the
+// FILTER was wrong (not just bad luck). Used to compute weighted effective
+// counts so raise/relax react to evidence quality, not raw counts.
+function loserEvidenceWeight(p) {
+  let w = 0.30;
+  const pnl = p.pnl_pct;
+  if (isFiniteNum(pnl)) {
+    if (pnl <= -15) w += 0.30;
+    else if (pnl <= -10) w += 0.20;
+    else if (pnl <= -5) w += 0.10;
+  }
+  const reason = String(p.close_reason || "").toLowerCase();
+  if (/out of range|oor|volume|low yield/.test(reason)) w += 0.25;
+  const eff = p.range_efficiency;
+  if (isFiniteNum(eff)) {
+    // High range-eff losers (token dumped IN range) are real, strong signals — not noise.
+    // Low range-eff losers are also real (OOR). Mid range-eff is ambiguous.
+    if (eff >= 70) w += 0.20;      // in-range dump: meaningful token-quality signal
+    else if (eff <= 30) w += 0.20; // OOR: position design signal
+    else if (eff <= 50) w += 0.10; // partial OOR: moderate signal
+  }
+  if (isFiniteNum(p.minutes_held) && p.minutes_held < 15) w -= 0.20; // wick/noise
+  return clamp(w, 0, 1);
+}
+
+function winnerEvidenceWeight(p) {
+  let w = 0.30;
+  const feeYield = isFiniteNum(p.initial_value_usd) && p.initial_value_usd > 0
+    ? ((p.fees_earned_usd || 0) / p.initial_value_usd) * 100
+    : 0;
+  if (feeYield >= 3) w += 0.30;
+  else if (feeYield >= 1) w += 0.15;
+  const eff = p.range_efficiency;
+  if (isFiniteNum(eff)) {
+    if (eff >= 80) w += 0.20;
+    else if (eff >= 60) w += 0.10;
+  }
+  if (isFiniteNum(p.pnl_pct) && p.pnl_pct >= 5) w += 0.20;
+  if (isFiniteNum(p.minutes_held) && p.minutes_held < 15) w -= 0.15; // quick flip
+  return clamp(w, 0, 1);
+}
+
+// ── Aggregate lesson generation ────────────────────────────────
+
+const AGGREGATE_REFRESH_EVERY = 20;
+const AGGREGATE_MIN_SAMPLES   = 5;
+const AGGREGATE_BIN_RANGES = [
+  { label: "80-100",  test: (bs) => isFiniteNum(bs) && bs <= 100 },
+  { label: "100-125", test: (bs) => isFiniteNum(bs) && bs > 100  },
+];
+
+// Unified quality weight for aggregate stats: how representative/reliable
+// is this data point regardless of whether it won or lost.
+function positionQualityWeight(p) {
+  let w = 0.30;
+  if (isFiniteNum(p.minutes_held)) {
+    if (p.minutes_held >= 60) w += 0.25;
+    else if (p.minutes_held >= 30) w += 0.15;
+    else if (p.minutes_held >= 15) w += 0.05;
+    else w -= 0.15; // wick/noise — held too briefly
+  }
+  const eff = p.range_efficiency;
+  if (isFiniteNum(eff)) {
+    if (eff >= 70) w += 0.20;
+    else if (eff >= 50) w += 0.10;
+  }
+  if (String(p.close_reason || "").trim().length > 3) w += 0.10;
+  return clamp(w, 0, 1);
+}
+
+/**
+ * Build aggregate lessons from performance data grouped by strategy × bin_step range.
+ * Uses the same recency window as evolveThresholds.
+ * Confidence scales with effective N (quality-weighted count) so outliers carry less weight.
+ */
+function generateAggregateLessons(perfData, config) {
+  const windowDays = config.screening?.evolveWindowDays;
+  let evalData = perfData;
+  if (isFiniteNum(windowDays) && windowDays > 0) {
+    const cutoff = new Date(Date.now() - windowDays * 86_400_000).toISOString();
+    const windowed = perfData.filter((p) => (p.recorded_at ?? "") >= cutoff);
+    if (windowed.length >= AGGREGATE_MIN_SAMPLES) evalData = windowed;
+  }
+  // Exclude non-SOL-quote records so the strategy×bin_step buckets reflect only the SOL strategy.
+  // (SOL-USDC stable pairs have tiny bin_step that would otherwise fall into the "80-100" bucket.)
+  evalData = evalData.filter(isSolQuoteRecord);
+
+  const lessons = [];
+
+  for (const strat of ["curve", "bid_ask", "spot"]) {
+    const stratData = evalData.filter(
+      (p) => String(p.strategy || "").toLowerCase() === strat
+    );
+    if (stratData.length === 0) continue;
+
+    for (const range of AGGREGATE_BIN_RANGES) {
+      const bucket  = stratData.filter((p) => range.test(p.bin_step));
+      if (bucket.length < AGGREGATE_MIN_SAMPLES) continue;
+
+      // Quality-weighted stats
+      const weights = bucket.map(positionQualityWeight);
+      const totalW  = weights.reduce((s, w) => s + w, 0);
+      if (totalW === 0) continue;
+
+      const wWin = bucket.reduce((s, p, i) =>
+        s + (p.pnl_pct > 0 ? weights[i] : 0), 0);
+      const wPnl = bucket.reduce((s, p, i) =>
+        s + (isFiniteNum(p.pnl_pct) ? p.pnl_pct * weights[i] : 0), 0);
+      const wEff = bucket.reduce((s, p, i) =>
+        s + (isFiniteNum(p.range_efficiency) ? p.range_efficiency * weights[i] : 0), 0);
+      const wFee = bucket.reduce((s, p, i) => {
+        const fy = isFiniteNum(p.initial_value_usd) && p.initial_value_usd > 0
+          ? ((p.fees_earned_usd || 0) / p.initial_value_usd) * 100 : 0;
+        return s + fy * weights[i];
+      }, 0);
+
+      const winRatePct  = Math.round((wWin / totalW) * 100);
+      const avgPnlPct   = Math.round((wPnl / totalW) * 10) / 10;
+      const avgRangeEff = Math.round((wEff / totalW) * 10) / 10;
+      const avgFeeYield = Math.round((wFee / totalW) * 10) / 10;
+      const effectiveN  = Math.round(totalW * 10) / 10; // quality-weighted count
+      const confidence  = Math.round(Math.min(0.95, 0.40 + effectiveN * 0.03) * 100) / 100;
+      const outcome     = winRatePct >= 55 ? "good" : winRatePct >= 45 ? "neutral" : "bad";
+      const sign        = avgPnlPct >= 0 ? "+" : "";
+
+      lessons.push({
+        id: Date.now() + lessons.length,
+        rule: `AGGREGATE: ${strat} + bin_step ${range.label} → ${winRatePct}% win, ${sign}${avgPnlPct}% avg PnL, ${avgRangeEff}% range-eff, ${avgFeeYield}% fee-yield (n=${bucket.length}, effN=${effectiveN})`,
+        tags:       ["aggregate", strat, "strategy", "screening"],
+        outcome,
+        sourceType: "aggregate",
+        confidence,
+        created_at: new Date().toISOString(),
+      });
+    }
+  }
+
+  return lessons;
+}
+
+/**
+ * Replace all existing aggregate lessons with a fresh snapshot.
+ * Aggregate lessons are point-in-time statistics, not historical events.
+ */
+function refreshAggregateLessons(data, perfData, config) {
+  data.lessons = data.lessons.filter((l) => !l.tags?.includes("aggregate"));
+  const fresh = generateAggregateLessons(perfData, config);
+  data.lessons.push(...fresh);
+  if (fresh.length > 0) log("lessons", `Refreshed ${fresh.length} aggregate lesson(s)`);
 }
 
 function avg(arr) {

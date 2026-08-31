@@ -63,6 +63,11 @@ export const config = {
   screening: {
     excludeHighSupplyConcentration: u.excludeHighSupplyConcentration ?? true,
     minFeeActiveTvlRatio: u.minFeeActiveTvlRatio ?? 0.05,
+    minFeePerBinStep: u.minFeePerBinStep ?? 0.0007, // fee_active_tvl_ratio / bin_step — normalises fee density against range width. Prevents low-fee-density wide-bin pools from passing screening.
+    // Adaptive evolution (lessons.js evolveThresholds)
+    evolveWindowDays:          numericConfig(u.evolveWindowDays)          ?? 14,   // only evaluate closed positions within this window (0/null = all history)
+    minFeeActiveTvlRatioFloor: numericConfig(u.minFeeActiveTvlRatioFloor) ?? 0.04, // relax can never lower minFeeActiveTvlRatio below this
+    minOrganicFloor:           numericConfig(u.minOrganicFloor)           ?? 55,   // relax can never lower minOrganic below this
     minTvl:            u.minTvl            ?? 10_000,
     maxTvl:            u.maxTvl !== undefined ? u.maxTvl : 150_000,
     minVolume:         u.minVolume         ?? 500,
@@ -82,14 +87,31 @@ export const config = {
     blockPvpSymbols:   u.blockPvpSymbols   ?? false, // hard-filter PVP rivals before the LLM sees them
     maxBundlePct:      u.maxBundlePct      ?? 30,  // max bundle holding % (OKX advanced-info)
     maxBotHoldersPct:  u.maxBotHoldersPct  ?? 30,  // max bot holder addresses % (Jupiter audit)
-    maxTop10Pct:       u.maxTop10Pct       ?? 60,  // max top 10 holders concentration
+    maxTop10Pct:       u.maxTop10Pct       ?? 55,  // max top 10 holders concentration
     allowedLaunchpads: u.allowedLaunchpads ?? [],  // allow-list launchpads, [] = no allow-list
     blockedLaunchpads:  u.blockedLaunchpads  ?? [],  // e.g. ["letsbonk.fun", "pump.fun"]
     minTokenAgeHours:   u.minTokenAgeHours   ?? null, // null = no minimum
     maxTokenAgeHours:   u.maxTokenAgeHours   ?? null, // null = no maximum
     athFilterPct:       u.athFilterPct       ?? null, // e.g. -20 = only deploy if price is >= 20% below ATH
-    maxPump1hPct:       u.maxPump1hPct       ?? 40,  // max 1h price pump %, reject FOMO entries
-    minPoolAgeHours:    u.minPoolAgeHours    ?? 6,   // min pool age in hours before deploying
+    maxPump1hPct:       u.maxPump1hPct       ?? 80,   // block extreme 1h pumps (anti-FOMO). Set null to disable.
+    maxDump1hPct:       u.maxDump1hPct       ?? -35, // default -35. Drop candidates whose 1h price change is below this. Smart-money escape hatch. Set null to disable.
+    minPoolAgeHours:    u.minPoolAgeHours    ?? null, // null = disabled. Measures token age (not LP pool age). Set to 1-2 to block very new tokens without conflicting with category="trending".
+    lastPoolStandingGuard:      u.lastPoolStandingGuard      ?? true, // skip cycle when 1 MARKUP candidate survives among ≥ minBearish CAPITULATION/DISTRIBUTION pools
+    lastPoolStandingMinBearish: u.lastPoolStandingMinBearish ?? 3,    // min bearish-flow pools required to trigger last-pool-standing guard
+    // Entry flow filter — drop candidates whose multi-timeframe flow consensus is bearish before
+    // the LLM sees them (precursor to in-range dumps). Conservative default: DISTRIBUTION only
+    // (active selling + volume). Add "CAPITULATION" to tighten. Smart-wallet presence overrides.
+    entryFlowFilterEnabled:            u.entryFlowFilterEnabled            ?? true,
+    entryFlowBlockRegimes:             u.entryFlowBlockRegimes             ?? ["DISTRIBUTION"],
+    entryFlowFilterSmartMoneyOverride: u.entryFlowFilterSmartMoneyOverride ?? true,
+    // Volume TA entry signals (soft hints to LLM, not hard filters)
+    volumeTrendDeclineThreshold: u.volumeTrendDeclineThreshold ?? 0.6,  // trend_ratio < 0.6 → DECLINING
+    volumeTrendExpandThreshold:  u.volumeTrendExpandThreshold  ?? 1.4,  // trend_ratio > 1.4 → EXPANDING
+    entryBuySellRatio:           u.entryBuySellRatio           ?? 1.5,  // sells/buys > 1.5 → BEARISH signal
+    // Declining-volume HARD filter (rejects candidate before LLM). Uses volume_change_pct
+    // at the volatility timeframe (>=30m), not the noisy 5m window. Smart money overrides.
+    filterDecliningVolume:        u.filterDecliningVolume        ?? true, // toggle the hard filter
+    volumeCollapseRejectThreshold: u.volumeCollapseRejectThreshold ?? -50,  // reject if vol_change < -50% over the volatility timeframe
   },
 
   // ─── Position Management ────────────────
@@ -98,6 +120,8 @@ export const config = {
     autoSwapAfterClaim:    u.autoSwapAfterClaim    ?? false,
     outOfRangeBinsToClose: u.outOfRangeBinsToClose ?? 10,
     outOfRangeWaitMinutes: u.outOfRangeWaitMinutes ?? 30,
+    outOfRangeWaitMinutesAbove: u.outOfRangeWaitMinutesAbove ?? u.outOfRangeWaitMinutes ?? 30, // override OOR timeout when active_bin > upper_bin (bid_ask: position still SOL, never activated)
+    oorAboveGraceMin:    u.oorAboveGraceMin    ?? 15, // grace window (min) after OOR ABOVE — Rule 8/9 skip during this period (entry phase protection)
     oorCooldownTriggerCount: u.oorCooldownTriggerCount ?? 3,
     oorCooldownHours:       u.oorCooldownHours       ?? 12,
     repeatDeployCooldownEnabled: u.repeatDeployCooldownEnabled ?? true,
@@ -106,13 +130,41 @@ export const config = {
     repeatDeployCooldownScope: u.repeatDeployCooldownScope ?? "token", // pool | token | both
     repeatDeployCooldownMinFeeEarnedPct: u.repeatDeployCooldownMinFeeEarnedPct ?? u.repeatDeployCooldownMinFeeYieldPct ?? 0,
     emergencyExitCooldownHours: u.emergencyExitCooldownHours ?? 4,
+    // In-range dump cooldown: token died WITHIN our bin range (high range-eff + meaningful
+    // loss + SL/sell-pressure close) — a token-quality failure, not position design. Cool the
+    // base mint so the screener does not immediately redeploy the same dying token. bid_ask
+    // losses get a longer cooldown (they produce the worst left-tail dumps).
+    inRangeDumpCooldownEnabled: u.inRangeDumpCooldownEnabled ?? true,
+    inRangeDumpCooldownHours: u.inRangeDumpCooldownHours ?? 12,
+    inRangeDumpCooldownLossPct: u.inRangeDumpCooldownLossPct ?? -5,
+    inRangeDumpCooldownRangeEff: u.inRangeDumpCooldownRangeEff ?? 70,
+    inRangeDumpCooldownBidAskMult: u.inRangeDumpCooldownBidAskMult ?? 2,
     minVolumeToRebalance:  u.minVolumeToRebalance  ?? 1000,
     stopLossPct:           u.stopLossPct           ?? u.emergencyPriceDropPct ?? -50,
     takeProfitPct:         u.takeProfitPct         ?? u.takeProfitFeePct ?? 5,
     minFeePerTvl24h:       u.minFeePerTvl24h       ?? 7,
     minAgeBeforeYieldCheck: u.minAgeBeforeYieldCheck ?? 60, // minutes before low yield can trigger close
     minAgeBeforeStopLoss:  u.minAgeBeforeStopLoss  ?? 15, // minutes before stop loss can fire
+    earlyDumpOverridePct:  u.earlyDumpOverridePct  ?? -10, // bypass age gate when loss already this deep (early dump guard)
+    // Rule 6 max-age: soft cap rather than a hard close. Once a position is older than
+    // maxPositionAgeMinutes it is closed ONLY if it has stopped earning. While PnL is still
+    // drifting up (or unclaimed fees are still accruing >= feeGrowthMinSol over the lookback
+    // window) the close is deferred, up to maxAgeExtensions grace blocks of ageExtensionMinutes
+    // each (hard ceiling = maxPositionAgeMinutes + maxAgeExtensions * ageExtensionMinutes).
+    maxPositionAgeMinutes:    u.maxPositionAgeMinutes    ?? 2880, // soft cap (48h default)
+    feeGrowthLookbackMinutes: u.feeGrowthLookbackMinutes ?? 20,   // window to measure "still earning"
+    feeGrowthMinSol:          u.feeGrowthMinSol          ?? 0.01, // min fee accrual over window to count as earning
+    ageExtensionMinutes:      u.ageExtensionMinutes      ?? 45,   // length of one grace block
+    maxAgeExtensions:         u.maxAgeExtensions          ?? 3,    // max grace blocks before hard close
+    // Entry-grace zone: Rule 9 is suppressed while price is still in the SOL-rich part of range.
+    // curveEntryGraceDepthPct: grace while depth < 35% (curve SOL mostly near top, still buying)
+    // bidAskEntryGraceDepthPct: grace while depth < 80% (bid_ask SOL heavy at bottom, accumulating)
+    // entryGraceConfirmMinutes: sustained breach required before Rule 9 activates (wick filter)
+    curveEntryGraceDepthPct:   numericConfig(u.curveEntryGraceDepthPct)   ?? 50,
+    bidAskEntryGraceDepthPct:  numericConfig(u.bidAskEntryGraceDepthPct)  ?? 80,
+    entryGraceConfirmMinutes:  numericConfig(u.entryGraceConfirmMinutes)  ?? 15,
     breakEvenTriggerPct:   u.breakEvenTriggerPct   ?? 1,  // once peak PnL >= this, protect against going below 0%
+    breakEvenInRangeDeferMin: u.breakEvenInRangeDeferMin ?? 60, // max minutes to defer break-even while in-range (0 = no deferral)
     minSolToOpen:          u.minSolToOpen          ?? 0.55,
     deployAmountSol:       u.deployAmountSol       ?? 0.5,
     gasReserve:            u.gasReserve            ?? 0.2,
@@ -121,7 +173,48 @@ export const config = {
     trailingTakeProfit:    u.trailingTakeProfit    ?? true,
     trailingTriggerPct:    u.trailingTriggerPct    ?? 3,    // activate trailing at X% PnL
     trailingDropPct:       u.trailingDropPct       ?? 1.5,  // close when drops X% from peak
+    trailingGivebackDivisor: u.trailingGivebackDivisor ?? 3, // widened drop = peak / N; lower N = more tolerant
+    // Stale-peak handling: a peak set long ago no longer reflects the current price regime.
+    // Once the all-time peak is older than trailingStalePeakMinutes, widen the trailing drop
+    // tolerance by trailingStalePeakDropMult so a settled position is not closed against a stale high.
+    trailingStalePeakMinutes:  u.trailingStalePeakMinutes  ?? 90,
+    trailingStalePeakDropMult: u.trailingStalePeakDropMult ?? 1.75,
+    trailingInRangeDeferMin:   u.trailingInRangeDeferMin   ?? 90, // max minutes to defer trailing TP while in-range
+    // ── Layer B: LLM-set per-position risk thresholds (clamped) ──
+    allowLlmRiskParams:    u.allowLlmRiskParams     ?? true, // let SCREENER set per-position sl/trailing overrides
+    stopLossFloorPct:      u.stopLossFloorPct       ?? -50,  // loosest (most negative) SL the LLM may set
+    stopLossTightestPct:   u.stopLossTightestPct    ?? -8,   // tightest (least negative) SL the LLM may set
+    // ── Regime-aware risk tightening: shrink SL magnitude / trailing give-back tolerance
+    // for EXISTING positions while the broad market is caution/bearish, not just throttle new
+    // deploys. Applied in effectiveStopLossPct() and updatePnlAndCheckExits() (state.js).
+    marketRegimeCautionSlMult:    u.marketRegime?.cautionStopLossMult ?? 0.85, // caution: SL 15% tighter
+    marketRegimeBearishSlMult:    u.marketRegime?.bearishStopLossMult ?? 0.7,  // bearish: SL 30% tighter
+    marketRegimeCautionTrailMult: u.marketRegime?.cautionTrailMult    ?? 0.8,  // caution: trailing give-back 20% tighter
+    marketRegimeBearishTrailMult: u.marketRegime?.bearishTrailMult    ?? 0.6,  // bearish: trailing give-back 40% tighter
+    // ── Auto-SL: code-injected volatility-adaptive stop-loss ──
+    // When the LLM doesn't set sl_pct, executor.js injects one based on pool volatility.
+    // Low-vol curve positions don't need -15% room; a -8% SL cuts losses before bleed.
+    autoSlEnabled:    u.autoSlEnabled    ?? true,
+    autoSlLowVolMax:  u.autoSlLowVolMax  ?? 2,   // vol <= this → low-vol tier
+    autoSlLowVolPct:  u.autoSlLowVolPct  ?? -8,  // SL for low-vol pools
+    autoSlMidVolMax:  u.autoSlMidVolMax  ?? 4,   // vol <= this → mid-vol tier
+    autoSlMidVolPct:  u.autoSlMidVolPct  ?? -12, // SL for mid-vol pools
+    autoSlHighVolPct: u.autoSlHighVolPct ?? -15, // SL for high-vol pools (vol > autoSlMidVolMax). Dedicated key — do NOT reuse stopLossPct (that is the -50 emergency floor).
+    // ── Layer A: LLM veto on trailing take-profit (soft exit only) ──
+    allowTpVeto:           u.allowTpVeto            ?? true, // let MANAGER hold a triggered trailing TP
+    maxTpVetos:            u.maxTpVetos             ?? 3,    // max consecutive holds before force-close
+    tpVetoFloorDivisor:    u.tpVetoFloorDivisor     ?? 2,    // force-close once give-back >= peak / divisor
     pnlSanityMaxDiffPct:   u.pnlSanityMaxDiffPct   ?? 5,    // max allowed diff between reported and derived pnl % before ignoring a tick
+    // ── Partial exit (scale-out) — let MANAGER take part of a winner at the trailing-TP point ──
+    partialExit: {
+      enabled:               u.partialExit?.enabled               ?? false, // opt-in; off → existing binary TP behaviour
+      minPeakPct:            u.partialExit?.minPeakPct            ?? 4,     // partial only offered once peak PnL >= this
+      defaultPct:            u.partialExit?.defaultPct            ?? 50,    // suggested scale-out size shown to the LLM
+      minPct:                u.partialExit?.minPct                ?? 25,    // clamp: smallest allowed scale-out
+      maxPct:                u.partialExit?.maxPct                ?? 75,    // clamp: largest allowed scale-out (always leave a runner)
+      stage2TrailingDropPct: u.partialExit?.stage2TrailingDropPct ?? 0.8,  // tighten remainder's trailing drop after a partial
+      minRemainderUsd:       u.partialExit?.minRemainderUsd       ?? 15,    // skip partial if the leftover position would be dust
+    },
     // SOL mode — positions, PnL, and balances reported in SOL instead of USD
     solMode:               u.solMode               ?? false,
   },
@@ -133,13 +226,46 @@ export const config = {
       dropThresholdPct:  u.emergencyExits?.volumeCollapse?.dropThresholdPct  ?? 30,
       minPositionAgeMin: u.emergencyExits?.volumeCollapse?.minPositionAgeMin ?? 10,
       minPeakVolumeUsd:  u.emergencyExits?.volumeCollapse?.minPeakVolumeUsd  ?? 2000,
-      sellPressureRatio: u.emergencyExits?.volumeCollapse?.sellPressureRatio ?? 2,
+      sellPressureRatio:  u.emergencyExits?.volumeCollapse?.sellPressureRatio  ?? 2,
+      minSellConfirmTxns: u.emergencyExits?.volumeCollapse?.minSellConfirmTxns ?? 5,   // min total txns before sell/buy ratio is trusted
     },
     rapidPriceDrop: {
-      enabled:            u.emergencyExits?.rapidPriceDrop?.enabled            ?? true,
-      dropPct5m:          u.emergencyExits?.rapidPriceDrop?.dropPct5m          ?? -8,
-      requireNegativePnl: u.emergencyExits?.rapidPriceDrop?.requireNegativePnl ?? true,
+      enabled:               u.emergencyExits?.rapidPriceDrop?.enabled               ?? true,
+      dropPct5m:             u.emergencyExits?.rapidPriceDrop?.dropPct5m             ?? -8,
+      requireNegativePnl:    u.emergencyExits?.rapidPriceDrop?.requireNegativePnl    ?? true,
+      minPositionAgeMin:     u.emergencyExits?.rapidPriceDrop?.minPositionAgeMin     ?? 10,
+      requireSellConfirm:    u.emergencyExits?.rapidPriceDrop?.requireSellConfirm    ?? false,
+      minSellBuyRatio:       u.emergencyExits?.rapidPriceDrop?.minSellBuyRatio       ?? 1.5,
+      minSellConfirmTxns:    u.emergencyExits?.rapidPriceDrop?.minSellConfirmTxns    ?? 5,   // min total txns (sells+buys) before sell/buy ratio is trusted
     },
+    // Rule 9: persistent sell-pressure streak — slow bleed exit before stop loss fires
+    sellPressureStreak: {
+      enabled:           u.emergencyExits?.sellPressureStreak?.enabled           ?? true,
+      streakCount:       u.emergencyExits?.sellPressureStreak?.streakCount       ?? 2,    // consecutive 5m windows (was 3 — 4 days of data showed Rule 9 confirming AFTER positions already overshot auto-SL tiers by 1-6%; e.g. yep -18.12% vs -12% tier, ok-SOL -14.37% vs -12% tier)
+      ratio:             u.emergencyExits?.sellPressureStreak?.ratio             ?? 1.2,  // sells > buys × ratio
+      safetyPnlPct:      u.emergencyExits?.sellPressureStreak?.safetyPnlPct     ?? 5,    // skip if PnL > +5%
+      windowMin:         u.emergencyExits?.sellPressureStreak?.windowMin         ?? 30,   // lookback window (min)
+      snapshotMaxAgeMin: u.emergencyExits?.sellPressureStreak?.snapshotMaxAgeMin ?? 120,  // max snapshot retention (min)
+      minPositionAgeMin: u.emergencyExits?.sellPressureStreak?.minPositionAgeMin ?? 0,    // skip if position younger than N minutes (avoid early-window noise)
+    },
+  },
+
+  // ─── Market Regime Detection ─────────────
+  marketRegime: {
+    enabled:       u.marketRegime?.enabled       ?? true,
+    skipOnBearish: u.marketRegime?.skipOnBearish ?? true,
+    notifyOnSkip:  u.marketRegime?.notifyOnSkip  ?? true,
+    // Caution-regime deployment throttle: reduce correlated exposure on soft-market days.
+    // When caution, cap concurrent positions below maxPositions and slow screening cadence.
+    cautionMaxPositions:  u.marketRegime?.cautionMaxPositions  ?? 3,  // max concurrent positions while caution (vs risk.maxPositions)
+    cautionScreeningMult: u.marketRegime?.cautionScreeningMult ?? 2,  // multiply screening interval while caution (slower cadence)
+    cautionPositionSizeMult: u.marketRegime?.cautionPositionSizeMult ?? 0.75, // scale fair-share deploy size while caution (limits nominal exposure)
+    // assessMarketRegime() score thresholds (market-regime.js). Max score is 5.5 (breadth 2.0 +
+    // volume 1.5 + flow 1.0 + SOL momentum 1.0). Raised from the pre-SOL-momentum 3.0/1.5 to
+    // absorb that signal's headroom — starting calibration, tune from market_regime logs.
+    bearishScoreThreshold: u.marketRegime?.bearishScoreThreshold ?? 3.7,
+    cautionScoreThreshold: u.marketRegime?.cautionScoreThreshold ?? 1.8,
+    _activeRegime: "healthy",  // runtime-only: latest assessed regime, shared with computeDeployAmount (set by index.js screening cycle)
   },
 
   // ─── Strategy Mapping ───────────────────
@@ -148,13 +274,17 @@ export const config = {
     minBinsBelow: strategyMinBinsBelow,
     maxBinsBelow: strategyMaxBinsBelow,
     defaultBinsBelow: strategyDefaultBinsBelow,
+    bidAskMinVolatility: numericConfig(u.bidAskMinVolatility) ?? null, // deprecated: kept so old configs don't break
+    curveMaxVolatility: numericConfig(u.curveMaxVolatility) ?? numericConfig(u.bidAskMinVolatility) ?? 3.5, // vol <= this → curve (concentrated fee); above → bid_ask (dip accumulation)
   },
 
   // ─── Scheduling ─────────────────────────
   schedule: {
-    managementIntervalMin:  u.managementIntervalMin  ?? 10,
-    screeningIntervalMin:   u.screeningIntervalMin   ?? 30,
-    healthCheckIntervalMin: u.healthCheckIntervalMin ?? 60,
+    managementIntervalMin:            u.managementIntervalMin            ?? 10,
+    screeningIntervalMin:             u.screeningIntervalMin             ?? 30,
+    screeningIntervalNoPositionMin:   u.screeningIntervalNoPositionMin   ?? 10, // faster screening cadence while below maxPositions (capacity free)
+    screeningNoDeployBackoffCount:    u.screeningNoDeployBackoffCount    ?? 2,  // consecutive no-deploy screens before backing off to screeningIntervalMin
+    healthCheckIntervalMin:           u.healthCheckIntervalMin           ?? 60,
   },
 
   // ─── LLM Settings ──────────────────────
@@ -214,7 +344,7 @@ export const config = {
   indicators: {
     enabled: indicatorUserConfig.enabled ?? false,
     entryPreset: indicatorUserConfig.entryPreset ?? "supertrend_break",
-    exitPreset: indicatorUserConfig.exitPreset ?? "supertrend_break",
+    exitPreset: indicatorUserConfig.exitPreset ?? "rsi_reversal",
     rsiLength: indicatorUserConfig.rsiLength ?? 2,
     intervals: Array.isArray(indicatorUserConfig.intervals)
       ? indicatorUserConfig.intervals
@@ -223,30 +353,64 @@ export const config = {
     rsiOversold: indicatorUserConfig.rsiOversold ?? 30,
     rsiOverbought: indicatorUserConfig.rsiOverbought ?? 80,
     requireAllIntervals: indicatorUserConfig.requireAllIntervals ?? false,
+    // TA-based exit (independent of entry indicator gate)
+    taExitEnabled:         indicatorUserConfig.taExitEnabled         ?? false,
+    taExitMinPnlPct:       indicatorUserConfig.taExitMinPnlPct       ?? 2,    // min PnL % before TA exit can trigger
+    taExitRsiLength:       indicatorUserConfig.taExitRsiLength       ?? 14,   // RSI length for exit (longer = smoother than entry default 2)
+    taExitNearAbovePct:    indicatorUserConfig.taExitNearAbovePct    ?? 80,   // depth% at which position is "near above" (0% = OOR above, 100% = deep in range)
+    taExitModulatorDropPct: indicatorUserConfig.taExitModulatorDropPct ?? 0.5, // tightened trailing drop % when RSI overbought
   },
 };
 
 /**
- * Compute the optimal deploy amount for a given wallet balance.
- * Scales position size with wallet growth (compounding).
+ * Compute the optimal deploy amount using Equity Fair-Share + Regime Modulation.
  *
- * Formula: clamp(deployable × positionSizePct, floor=deployAmountSol, ceil=maxDeployAmount)
+ * Each position targets an equal slice of TOTAL equity (wallet + open-position value),
+ * independent of deploy order — this removes the front-loading of the old
+ * `deployable × positionSizePct` formula (where the first deploy was always largest and
+ * idle capital piled up in the tail). When the market regime is "caution", the target is
+ * scaled down by `cautionPositionSizeMult` to limit nominal exposure on soft-market days.
  *
- * Examples (defaults: gasReserve=0.2, positionSizePct=0.35, floor=0.5):
- *   0.8 SOL wallet → 0.6 SOL deploy  (floor)
- *   2.0 SOL wallet → 0.63 SOL deploy
- *   3.0 SOL wallet → 0.98 SOL deploy
- *   4.0 SOL wallet → 1.33 SOL deploy
+ * Formula:
+ *   equitySol  = walletSol + openPositionsValueSol
+ *   baseShare  = equitySol / risk.maxPositions          (fixed divisor — NOT cautionMaxPositions)
+ *   regimeMult = (_activeRegime === "caution") ? cautionPositionSizeMult : 1.0
+ *   deployable = max(0, walletSol - gasReserve)
+ *   deploy     = clamp(baseShare × regimeMult, floor=deployAmountSol, ceil=min(maxDeployAmount, deployable))
+ *
+ * @param {number} walletSol            Native SOL balance available in wallet.
+ * @param {object} [opts]
+ * @param {number} [opts.openPositionsValueSol=0]  Total value of open positions, in SOL.
+ *                 When omitted (fallback callers), equity degrades to walletSol — conservative, never errors.
+ *
+ * Examples (defaults: gasReserve=0.2, maxPositions=5, floor=0.5; healthy regime):
+ *   wallet 3.41 SOL + positions 4.07 SOL → equity 7.48 / 5 = 1.50 SOL deploy
+ *   same, caution regime (×0.75)                              → 1.12 SOL deploy
  */
-export function computeDeployAmount(walletSol) {
-  const reserve  = config.management.gasReserve      ?? 0.2;
-  const pct      = config.management.positionSizePct ?? 0.35;
-  const floor    = config.management.deployAmountSol;
-  const ceil     = config.risk.maxDeployAmount;
+export const configMeta = {
+  lastEvolved:          u._lastEvolved          ?? null,
+  positionsAtEvolution: u._positionsAtEvolution ?? null,
+};
+
+export function computeDeployAmount(walletSol, { openPositionsValueSol = 0 } = {}) {
+  const reserve = config.management.gasReserve ?? 0.2;
+  const floor   = config.management.deployAmountSol;
+  const ceil    = config.risk.maxDeployAmount;
+  const maxPositions = config.risk.maxPositions || 1;
+
+  const posValueSol = Number.isFinite(openPositionsValueSol) ? Math.max(0, openPositionsValueSol) : 0;
+  const equitySol   = Math.max(0, walletSol) + posValueSol;
+  const baseShare   = equitySol / maxPositions;
+
+  const regime     = config.marketRegime?._activeRegime ?? "healthy";
+  const regimeMult = regime === "caution"
+    ? (config.marketRegime?.cautionPositionSizeMult ?? 0.75)
+    : 1.0;
+
   const deployable = Math.max(0, walletSol - reserve);
-  const dynamic    = deployable * pct;
-  const result     = Math.min(ceil, Math.max(floor, dynamic));
-  return parseFloat(result.toFixed(2));
+  const target     = baseShare * regimeMult;
+  const result     = Math.min(ceil, deployable, Math.max(floor, target));
+  return parseFloat(Math.max(0, result).toFixed(2));
 }
 
 /**
@@ -260,6 +424,10 @@ export function reloadScreeningThresholds() {
     const fresh = JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"));
     const s = config.screening;
     if (fresh.minFeeActiveTvlRatio != null) s.minFeeActiveTvlRatio = fresh.minFeeActiveTvlRatio;
+    if (fresh.minFeePerBinStep     != null) s.minFeePerBinStep     = fresh.minFeePerBinStep;
+    if (fresh.evolveWindowDays          != null) s.evolveWindowDays          = numericConfig(fresh.evolveWindowDays);
+    if (fresh.minFeeActiveTvlRatioFloor != null) s.minFeeActiveTvlRatioFloor = numericConfig(fresh.minFeeActiveTvlRatioFloor);
+    if (fresh.minOrganicFloor           != null) s.minOrganicFloor           = numericConfig(fresh.minOrganicFloor);
     if (fresh.minTokenFeesSol  != null) s.minTokenFeesSol  = fresh.minTokenFeesSol;
     if (fresh.maxTop10Pct      != null) s.maxTop10Pct      = fresh.maxTop10Pct;
     if (fresh.useDiscordSignals !== undefined) s.useDiscordSignals = fresh.useDiscordSignals;
@@ -280,6 +448,15 @@ export function reloadScreeningThresholds() {
     if (fresh.minTokenAgeHours  !== undefined) s.minTokenAgeHours = fresh.minTokenAgeHours;
     if (fresh.maxTokenAgeHours  !== undefined) s.maxTokenAgeHours = fresh.maxTokenAgeHours;
     if (fresh.athFilterPct      !== undefined) s.athFilterPct     = fresh.athFilterPct;
+    if (fresh.filterDecliningVolume        !== undefined) s.filterDecliningVolume        = fresh.filterDecliningVolume;
+    if (fresh.volumeCollapseRejectThreshold != null)      s.volumeCollapseRejectThreshold = fresh.volumeCollapseRejectThreshold;
+    if (fresh.maxDump1hPct               !== undefined) s.maxDump1hPct               = fresh.maxDump1hPct;
+    if (fresh.maxPump1hPct              !== undefined) s.maxPump1hPct              = fresh.maxPump1hPct;
+    if (fresh.lastPoolStandingGuard     !== undefined) s.lastPoolStandingGuard     = fresh.lastPoolStandingGuard;
+    if (fresh.lastPoolStandingMinBearish != null)      s.lastPoolStandingMinBearish = fresh.lastPoolStandingMinBearish;
+    if (fresh.entryFlowFilterEnabled            !== undefined) s.entryFlowFilterEnabled            = fresh.entryFlowFilterEnabled;
+    if (Array.isArray(fresh.entryFlowBlockRegimes))           s.entryFlowBlockRegimes             = fresh.entryFlowBlockRegimes;
+    if (fresh.entryFlowFilterSmartMoneyOverride !== undefined) s.entryFlowFilterSmartMoneyOverride = fresh.entryFlowFilterSmartMoneyOverride;
     if (fresh.maxBundlePct      != null) s.maxBundlePct     = fresh.maxBundlePct;
     if (fresh.avoidPvpSymbols   !== undefined) s.avoidPvpSymbols = fresh.avoidPvpSymbols;
     if (fresh.blockPvpSymbols   !== undefined) s.blockPvpSymbols = fresh.blockPvpSymbols;

@@ -113,6 +113,12 @@ function getRawPoolScreeningRejectReason(pool, s) {
   if (feeActiveTvlRatio == null || feeActiveTvlRatio < s.minFeeActiveTvlRatio) {
     return `fee/active-TVL ${feeActiveTvlRatio ?? "unknown"} below minFeeActiveTvlRatio ${s.minFeeActiveTvlRatio}`;
   }
+  if (s.minFeePerBinStep != null && feeActiveTvlRatio != null && binStep != null && binStep > 0) {
+    const feePerBinStep = feeActiveTvlRatio / binStep;
+    if (feePerBinStep < s.minFeePerBinStep) {
+      return `fee/bin_step ${feePerBinStep.toFixed(6)} below minFeePerBinStep ${s.minFeePerBinStep} (fee_tvl=${feeActiveTvlRatio}, bin_step=${binStep})`;
+    }
+  }
   if (!isUsableVolatility(volatility)) {
     return `volatility ${volatility ?? "unknown"} is unusable`;
   }
@@ -190,8 +196,12 @@ async function applyVolatilityTimeframe(rawPools, sourceTimeframe) {
   if (!Array.isArray(rawPools) || rawPools.length === 0) return rawPools;
   const volatilityTimeframe = getVolatilityTimeframe(sourceTimeframe);
   if (sourceTimeframe === volatilityTimeframe) {
+    // Source is already at/above the volatility-timeframe floor (>=30m), so its own
+    // volume_change_pct is already measured over a noise-resistant window.
     for (const pool of rawPools) {
-      if (pool) pool.volatility_timeframe = volatilityTimeframe;
+      if (!pool) continue;
+      pool.volatility_timeframe = volatilityTimeframe;
+      pool.long_volume_change_pct = numeric(pool.volume_change_pct);
     }
     return rawPools;
   }
@@ -200,21 +210,29 @@ async function applyVolatilityTimeframe(rawPools, sourceTimeframe) {
   const volatilityResults = await Promise.allSettled(
     uniquePoolAddresses.map((poolAddress) =>
       fetchPoolDiscoveryDetail({ poolAddress, timeframe: volatilityTimeframe })
-        .then((pool) => ({ poolAddress, volatility: numeric(pool?.volatility) }))
+        .then((pool) => ({
+          poolAddress,
+          volatility: numeric(pool?.volatility),
+          // Same detail response also carries volume_change_pct at the volatility
+          // timeframe — reuse it for the declining-volume filter (no extra API call).
+          longVolumeChangePct: numeric(pool?.volume_change_pct),
+        }))
     )
   );
 
-  const volatilityByPool = new Map();
+  const detailByPool = new Map();
   for (const result of volatilityResults) {
     if (result.status !== "fulfilled") continue;
     if (result.value.volatility == null) continue;
-    volatilityByPool.set(result.value.poolAddress, result.value.volatility);
+    detailByPool.set(result.value.poolAddress, result.value);
   }
 
   for (const pool of rawPools) {
-    if (!pool?.pool_address || !volatilityByPool.has(pool.pool_address)) continue;
-    pool.volatility = volatilityByPool.get(pool.pool_address);
+    if (!pool?.pool_address || !detailByPool.has(pool.pool_address)) continue;
+    const detail = detailByPool.get(pool.pool_address);
+    pool.volatility = detail.volatility;
     pool.volatility_timeframe = volatilityTimeframe;
+    if (detail.longVolumeChangePct != null) pool.long_volume_change_pct = detail.longVolumeChangePct;
   }
 
   return rawPools;
@@ -374,6 +392,7 @@ export async function discoverPools({
   });
 
   let rawPools = Array.isArray(data.data) ? data.data : [];
+  log("screening", `Pool Discovery API: ${rawPools.length} raw pools (total=${data.total ?? "?"}) | filters: ${filters}`);
 
   if (config.screening.useDiscordSignals) {
     const signalCandidates = await fetchDiscordSignalCandidates().catch((error) => {
@@ -415,6 +434,20 @@ export async function discoverPools({
       }
       rawPools = Array.from(byPool.values());
     }
+  }
+
+  // Enforce SOL-only quote token. The executor only supports single-side SOL deploys
+  // (amount_x=0, amount_y>0), so USDC/USDT/other-quote pools will always fail on-chain.
+  // Filter here so the LLM never sees non-SOL candidates.
+  const SOL_MINT = "So11111111111111111111111111111111111111112";
+  const beforeSolFilter = rawPools.length;
+  rawPools = rawPools.filter((p) => {
+    const sym = p.token_y?.symbol ?? p.quote?.symbol ?? "";
+    const mint = p.token_y?.address ?? p.quote?.mint ?? "";
+    return sym === "SOL" || mint === SOL_MINT;
+  });
+  if (rawPools.length < beforeSolFilter) {
+    log("screening", `SOL-only filter: removed ${beforeSolFilter - rawPools.length} non-SOL-quote pools (${rawPools.length} remain)`);
   }
 
   rawPools = await applyVolatilityTimeframe(rawPools, s.timeframe);
@@ -488,6 +521,20 @@ export async function discoverPools({
 }
 
 /**
+ * Fetch unfiltered trending DLMM pools from Meteora for market breadth analysis.
+ * Used by market regime detection — no quality filters applied intentionally.
+ */
+export async function fetchTrendingBreadth({ timeframe = "5m" } = {}) {
+  const data = await fetchPoolDiscoveryPage({
+    page_size: 50,
+    filters: "pool_type=dlmm",
+    timeframe,
+    category: "trending",
+  });
+  return Array.isArray(data.data) ? data.data : [];
+}
+
+/**
  * Returns eligible pools for the agent to evaluate and pick from.
  * Hard filters applied in code, agent decides which to deploy into.
  */
@@ -502,30 +549,9 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   const { positions } = await getMyPositions();
   const occupiedPools = new Set(positions.map((p) => p.pool));
   const occupiedMints = new Set(positions.map((p) => p.base_mint).filter(Boolean));
-  const minTvl = Number(config.screening.minTvl ?? 0);
-  const maxTvl = config.screening.maxTvl == null ? null : Number(config.screening.maxTvl);
-  const minFeeActiveTvlRatio = Number(config.screening.minFeeActiveTvlRatio ?? 0);
-
   const eligible = pools
     .filter((p) => {
-      const tvl = Number(p.tvl ?? p.active_tvl ?? 0);
-      if (Number.isFinite(minTvl) && minTvl > 0 && tvl < minTvl) {
-        pushFilteredReason(filteredOut, p, `TVL $${tvl} below minTvl $${minTvl}`);
-        return false;
-      }
-      if (Number.isFinite(maxTvl) && maxTvl > 0 && tvl > maxTvl) {
-        pushFilteredReason(filteredOut, p, `TVL $${tvl} above maxTvl $${maxTvl}`);
-        return false;
-      }
-      const feeActiveTvlRatio = Number(p.fee_active_tvl_ratio);
-      if (Number.isFinite(minFeeActiveTvlRatio) && minFeeActiveTvlRatio > 0 && (!Number.isFinite(feeActiveTvlRatio) || feeActiveTvlRatio < minFeeActiveTvlRatio)) {
-        pushFilteredReason(filteredOut, p, `fee/active-TVL ${Number.isFinite(feeActiveTvlRatio) ? feeActiveTvlRatio : "unknown"} below minFeeActiveTvlRatio ${minFeeActiveTvlRatio}`);
-        return false;
-      }
-      if (!isUsableVolatility(p.volatility)) {
-        pushFilteredReason(filteredOut, p, `volatility ${p.volatility ?? "unknown"} is unusable`);
-        return false;
-      }
+      // TVL, feeTvl, and volatility are already guaranteed by Stage 1 (API) + Stage 2 (getRawPoolScreeningRejectReason)
       if (occupiedPools.has(p.pool)) {
         pushFilteredReason(filteredOut, p, "already have an open position in this pool");
         return false;
@@ -629,6 +655,37 @@ export async function getTopCandidates({ limit = 10 } = {}) {
       return true;
     }));
 
+    // Bundle concentration filter — high bundler % = coordinated supply control, dump risk.
+    // Fail-open when OKX data unavailable (bundle_pct null) so API outages don't block all candidates.
+    const maxBundle = config.screening.maxBundlePct;
+    if (maxBundle != null) {
+      const beforeBundle = eligible.length;
+      eligible.splice(0, eligible.length, ...eligible.filter((p) => {
+        if (p.bundle_pct == null) return true;
+        if (p.bundle_pct > maxBundle) {
+          log("screening", `Bundle filter: dropped ${p.name} — bundle_pct ${p.bundle_pct}% > ${maxBundle}%`);
+          pushFilteredReason(filteredOut, p, `bundle ${p.bundle_pct}% > max ${maxBundle}%`);
+          return false;
+        }
+        return true;
+      }));
+      if (eligible.length < beforeBundle) log("screening", `Bundle filter removed ${beforeBundle - eligible.length} pool(s)`);
+    }
+
+    // Rugpull-without-smart-money filter — OKX rugpull flag with no smart wallet activity
+    // means no upside catalyst to offset the risk. Smart wallets present = override allowed.
+    // Fail-open when OKX data unavailable.
+    const beforeRugpull = eligible.length;
+    eligible.splice(0, eligible.length, ...eligible.filter((p) => {
+      if (p.is_rugpull && !p.smart_money_buy) {
+        log("screening", `Risk filter: dropped ${p.name} — rugpull flag with no smart wallet activity`);
+        pushFilteredReason(filteredOut, p, "rugpull flag, no smart money");
+        return false;
+      }
+      return true;
+    }));
+    if (eligible.length < beforeRugpull) log("screening", `Rugpull filter removed ${beforeRugpull - eligible.length} pool(s)`);
+
     // ATH filter — drop pools where price is too close to ATH
     const athFilter = config.screening.athFilterPct;
     if (athFilter != null) {
@@ -644,6 +701,28 @@ export async function getTopCandidates({ limit = 10 } = {}) {
         return true;
       }));
       if (eligible.length < before) log("screening", `ATH filter removed ${before - eligible.length} pool(s)`);
+    }
+
+    // Declining-volume hard filter — a pool whose volume is collapsing is a dying fee
+    // engine. fee/TVL is backward-looking (24h) and can stay attractive while today's
+    // volume evaporates, baiting the LLM into a dead pool. Measured on the volatility
+    // timeframe (>=30m), NOT the noisy 5m screening window. Smart-money presence overrides.
+    if (config.screening.filterDecliningVolume) {
+      const rejectPct = config.screening.volumeCollapseRejectThreshold ?? -50;
+      const before2 = eligible.length;
+      eligible.splice(0, eligible.length, ...eligible.filter((p) => {
+        const vc = p.long_volume_change_pct;
+        if (vc == null) return true;       // no data → fail-open
+        if (vc > rejectPct) return true;   // not collapsing
+        if (p.smart_money_buy || p.kol_in_clusters) {
+          log("screening", `Volume filter: kept ${p.name} despite vol_change ${vc}% (${p.volatility_timeframe}) — smart money present`);
+          return true;
+        }
+        log("screening", `Volume filter: dropped ${p.name} — vol_change ${vc}% over ${p.volatility_timeframe} (limit: ${rejectPct}%)`);
+        pushFilteredReason(filteredOut, p, `volume collapsing ${vc}% over ${p.volatility_timeframe} < ${rejectPct}% limit`);
+        return false;
+      }));
+      if (eligible.length < before2) log("screening", `Volume filter removed ${before2 - eligible.length} pool(s)`);
     }
 
     // Drop any pools whose creator is on the dev blocklist (caught via advanced-info)
@@ -719,6 +798,26 @@ export async function getPoolDetail({ pool_address, timeframe = "5m" }) {
   }
 
   return pool;
+}
+
+/**
+ * Fetch current volatility for a pool from the Meteora pool discovery API.
+ * Uses the volatility timeframe (>=30m) to avoid noisy short-window values.
+ * Returns null on any failure — never throws.
+ *
+ * @param {string} poolAddress
+ * @returns {Promise<number|null>}
+ */
+export async function fetchPoolVolatility(poolAddress) {
+  if (!poolAddress) return null;
+  try {
+    const timeframe = getVolatilityTimeframe(config.screening.timeframe ?? "5m");
+    const pool = await fetchPoolDiscoveryDetail({ poolAddress, timeframe });
+    const v = numeric(pool?.volatility);
+    return v != null && Number.isFinite(v) && v > 0 ? v : null;
+  } catch {
+    return null;
+  }
 }
 
 /**

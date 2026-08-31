@@ -59,23 +59,34 @@ function isFeeGeneratingDeploy(deploy) {
   return Number.isFinite(feeEarnedPct) && feeEarnedPct >= minFeeEarnedPct;
 }
 
+// Never-shorten: a new cooldown extends but never truncates an active longer one. A severe
+// in-range-dump cooldown (48–72h) must not be cut to 12h by a later minor close on the same
+// pool/mint. The reason is updated only when we actually extend (or set fresh) so logs reflect
+// the active cause.
 function setPoolCooldown(entry, hours, reason) {
-  const cooldownUntil = new Date(Date.now() + hours * 60 * 60 * 1000).toISOString();
+  const newUntilMs = Date.now() + hours * 60 * 60 * 1000;
+  const prevMs = entry.cooldown_until ? new Date(entry.cooldown_until).getTime() : 0;
+  const effMs = Number.isFinite(prevMs) ? Math.max(prevMs, newUntilMs) : newUntilMs;
+  const cooldownUntil = new Date(effMs).toISOString();
+  if (effMs === newUntilMs) entry.cooldown_reason = reason;
   entry.cooldown_until = cooldownUntil;
-  entry.cooldown_reason = reason;
   return cooldownUntil;
 }
 
 function setBaseMintCooldown(db, baseMint, hours, reason) {
   if (!baseMint) return null;
-  const cooldownUntil = new Date(Date.now() + hours * 60 * 60 * 1000).toISOString();
+  const newUntilMs = Date.now() + hours * 60 * 60 * 1000;
+  let effMs = newUntilMs;
   for (const entry of Object.values(db)) {
     if (entry?.base_mint === baseMint) {
-      entry.base_mint_cooldown_until = cooldownUntil;
-      entry.base_mint_cooldown_reason = reason;
+      const prevMs = entry.base_mint_cooldown_until ? new Date(entry.base_mint_cooldown_until).getTime() : 0;
+      const entryEffMs = Number.isFinite(prevMs) ? Math.max(prevMs, newUntilMs) : newUntilMs;
+      entry.base_mint_cooldown_until = new Date(entryEffMs).toISOString();
+      if (entryEffMs === newUntilMs) entry.base_mint_cooldown_reason = reason;
+      effMs = Math.max(effMs, entryEffMs);
     }
   }
-  return cooldownUntil;
+  return new Date(effMs).toISOString();
 }
 
 // ─── Write ─────────────────────────────────────────────────────
@@ -180,6 +191,38 @@ export function recordPoolDeploy(poolAddress, deployData) {
     log("pool-memory", `Emergency cooldown set for ${entry.name} until ${cooldownUntil} (${deploy.close_reason})`);
     if (entry.base_mint && mintCooldownUntil) {
       log("pool-memory", `Emergency token cooldown set for ${entry.base_mint.slice(0, 8)} until ${mintCooldownUntil} (${deploy.close_reason})`);
+    }
+  }
+
+  // In-range dump cooldown: token fell WITHIN our bin range (high range-eff) and closed at a
+  // meaningful loss via stop-loss/sell-pressure. This is a token-quality failure — cool the base
+  // mint so the screener does not redeploy the same dying token next cycle (e.g. SPCX losing
+  // twice in two days). bid_ask losses produce the worst dumps, so they get a longer cooldown.
+  if (config.management.inRangeDumpCooldownEnabled) {
+    const lossPct = Number(config.management.inRangeDumpCooldownLossPct ?? -5);
+    const minRangeEff = Number(config.management.inRangeDumpCooldownRangeEff ?? 70);
+    const baseHours = Math.max(0, Number(config.management.inRangeDumpCooldownHours ?? 12));
+    const bidAskMult = Math.max(1, Number(config.management.inRangeDumpCooldownBidAskMult ?? 2));
+    const rangeEff = Number(deploy.range_efficiency);
+    const isInRangeDump =
+      baseHours > 0 &&
+      Number.isFinite(rangeEff) && rangeEff > minRangeEff &&
+      deploy.pnl_pct != null && deploy.pnl_pct <= lossPct &&
+      /stop.?loss|sell.?pressure/i.test(deploy.close_reason || "");
+    if (isInRangeDump && entry.base_mint) {
+      // Scale cooldown by loss severity — a rug-grade -22.9% dump should cool far longer
+      // than a routine -7% dump. bid_ask multiplier stacks on top; total capped at 72h.
+      const severity = Math.abs(deploy.pnl_pct);
+      const severityMult = severity >= 20 ? 4   // rug-grade ≥20% → 48h base
+                         : severity >= 12 ? 2   // large loss  ≥12% → 24h base
+                         : 1;                   // normal -5% to -12% → 12h base
+      const strategyMult = deploy.strategy === "bid_ask" ? bidAskMult : 1;
+      const hours = Math.min(72, baseHours * severityMult * strategyMult);
+      const reason = `in-range dump ${deploy.pnl_pct}% (${deploy.strategy || "?"}, ${rangeEff}% range-eff)`;
+      const mintCooldownUntil = setBaseMintCooldown(db, entry.base_mint, hours, reason);
+      if (mintCooldownUntil) {
+        log("pool-memory", `In-range dump cooldown for ${entry.base_mint.slice(0, 8)} until ${mintCooldownUntil} (${reason}, ${hours}h)`);
+      }
     }
   }
 
@@ -338,6 +381,94 @@ export function recordPositionSnapshot(poolAddress, snapshot) {
 }
 
 /**
+ * Record a 5-minute volume/orderflow snapshot for sell-pressure streak tracking.
+ * Deduplicates: skips if last snapshot is less than 55 seconds old (within DexScreener cache TTL).
+ * Called each management cycle and 30s PnL poll from already-fetched market data — no extra I/O.
+ */
+export function addVolumeSnapshot(poolAddress, { vol_5m, buys_5m, sells_5m }) {
+  if (!poolAddress) return;
+  const db = load();
+
+  if (!db[poolAddress]) {
+    db[poolAddress] = {
+      name: poolAddress.slice(0, 8),
+      base_mint: null,
+      deploys: [],
+      total_deploys: 0,
+      avg_pnl_pct: 0,
+      win_rate: 0,
+      adjusted_win_rate: 0,
+      adjusted_win_rate_sample_count: 0,
+      last_deployed_at: null,
+      last_outcome: null,
+      notes: [],
+    };
+  }
+
+  if (!db[poolAddress].volume_snapshots) db[poolAddress].volume_snapshots = [];
+
+  const snaps = db[poolAddress].volume_snapshots;
+  if (snaps.length > 0) {
+    const lastTs = new Date(snaps[snaps.length - 1].ts).getTime();
+    if (Date.now() - lastTs < 55_000) return;
+  }
+
+  snaps.push({
+    ts: new Date().toISOString(),
+    vol_5m: vol_5m ?? null,
+    buys_5m: buys_5m ?? null,
+    sells_5m: sells_5m ?? null,
+  });
+
+  const maxAgeMin = config.emergencyExits?.sellPressureStreak?.snapshotMaxAgeMin ?? 120;
+  const cutoff = Date.now() - maxAgeMin * 60 * 1000;
+  db[poolAddress].volume_snapshots = snaps.filter(s => new Date(s.ts).getTime() >= cutoff);
+
+  save(db);
+}
+
+/**
+ * Clear volume snapshots for a pool — called on fresh deploy so stale
+ * sell-pressure history from a previous position does not bleed into Rule 9.
+ */
+export function clearVolumeSnapshots(poolAddress) {
+  if (!poolAddress) return;
+  const db = load();
+  if (!db[poolAddress]?.volume_snapshots?.length) return;
+  db[poolAddress].volume_snapshots = [];
+  save(db);
+  log("pool-memory", `Volume snapshots cleared for ${poolAddress.slice(0, 8)} (new deploy)`);
+}
+
+/**
+ * Get volume snapshots within the last N minutes for a pool.
+ * Returns ordered array of { ts, vol_5m, buys_5m, sells_5m }.
+ */
+export function getVolumeWindow(poolAddress, windowMin = 30) {
+  if (!poolAddress) return [];
+  const db = load();
+  const entry = db[poolAddress];
+  if (!Array.isArray(entry?.volume_snapshots)) return [];
+  const cutoff = Date.now() - windowMin * 60 * 1000;
+  return entry.volume_snapshots.filter(s => new Date(s.ts).getTime() >= cutoff);
+}
+
+/**
+ * Get position snapshots within the last N minutes for a pool.
+ * Returns ordered array of { ts, pnl_pct, unclaimed_fees_usd, in_range, age_minutes, ... }.
+ * Used by the Rule 6 max-age grace check to judge whether an over-age position
+ * is still actively earning before closing it.
+ */
+export function getSnapshotWindow(poolAddress, windowMin = 30) {
+  if (!poolAddress) return [];
+  const db = load();
+  const entry = db[poolAddress];
+  if (!Array.isArray(entry?.snapshots)) return [];
+  const cutoff = Date.now() - windowMin * 60 * 1000;
+  return entry.snapshots.filter(s => new Date(s.ts).getTime() >= cutoff);
+}
+
+/**
  * Recall focused context for a specific pool — used before screening or management.
  * Returns a short formatted string ready for injection into the agent goal.
  */
@@ -388,6 +519,43 @@ export function recallForPool(poolAddress) {
  * Tool handler: add_pool_note
  * Agent can annotate a pool with a freeform note.
  */
+export function forgetPool({ pool_address, all, days }) {
+  const db = load();
+
+  // Mode: forget all
+  if (all) {
+    const count = Object.keys(db).length;
+    // Fully delete all entries
+    for (const k of Object.keys(db)) delete db[k];
+    save(db);
+    log("pool-memory", `All pool memory cleared (${count} pools)`);
+    return { forgotten: true, mode: "all", pools_cleared: count };
+  }
+
+  // Mode: forget by recency (last N days)
+  if (days != null) {
+    const cutoff = new Date(Date.now() - Number(days) * 24 * 60 * 60 * 1000).toISOString();
+    const toDelete = Object.entries(db).filter(([, entry]) => {
+      const ts = entry.last_deployed_at ?? entry.deploys?.at(-1)?.closed_at ?? null;
+      return ts != null && ts >= cutoff;
+    });
+    for (const [addr] of toDelete) delete db[addr];
+    save(db);
+    const names = toDelete.map(([, e]) => e.name ?? "?").join(", ");
+    log("pool-memory", `Pool memory cleared for last ${days}d: ${toDelete.length} pools (${names})`);
+    return { forgotten: true, mode: `last_${days}_days`, pools_cleared: toDelete.length, pools: toDelete.map(([addr, e]) => ({ pool_address: addr, name: e.name })) };
+  }
+
+  // Mode: single pool
+  if (!pool_address) return { error: "Provide pool_address, all: true, or days: N" };
+  if (!db[pool_address]) return { forgotten: false, reason: "pool not found in memory" };
+  const name = db[pool_address].name ?? pool_address.slice(0, 8);
+  delete db[pool_address];
+  save(db);
+  log("pool-memory", `History cleared for ${pool_address.slice(0, 8)} (${name})`);
+  return { forgotten: true, mode: "single", pool_address, name };
+}
+
 export function addPoolNote({ pool_address, note }) {
   if (!pool_address) return { error: "pool_address required" };
   const safeNote = sanitizeStoredNote(note);

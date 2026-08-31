@@ -22,6 +22,7 @@ import {
   getTrackedPosition,
   minutesOutOfRange,
   syncOpenPositions,
+  markPartialExit,
 } from "../state.js";
 import { recordPerformance } from "../lessons.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
@@ -466,6 +467,11 @@ export async function deployPosition({
   fee_tvl_ratio,
   organic_score,
   initial_value_usd,
+  top_cluster_trend,
+  // Layer B: optional per-position risk overrides set by the SCREENER LLM
+  sl_pct,
+  trailing_trigger_pct,
+  trailing_drop_pct,
 }) {
   pool_address = normalizeMint(pool_address);
   const activeStrategy = strategy || config.strategy.strategy;
@@ -544,7 +550,8 @@ export async function deployPosition({
   }
   const isSingleSidedSol = finalAmountX <= 0 && finalAmountY > 0;
   if (isSingleSidedSol) {
-    activeBinsAbove = Math.min(Number(bins_above ?? 0), Math.ceil(activeBinsBelow * 0.3));
+    // Enforce minimum 5 bins_above as free OOR tolerance — upper bins hold no capital (amount_x=0)
+    activeBinsAbove = Math.max(5, Math.min(Number(bins_above ?? 5), Math.ceil(activeBinsBelow * 0.3)));
   }
   activeBinsBelow = Number(activeBinsBelow);
   activeBinsAbove = Number(activeBinsAbove);
@@ -691,6 +698,10 @@ export async function deployPosition({
           amount_x: finalAmountX,
           active_bin: activeBin.binId,
           initial_value_usd,
+          top_cluster_trend: top_cluster_trend ?? null,
+          sl_pct_override: sl_pct ?? null,
+          trailing_trigger_override: trailing_trigger_pct ?? null,
+          trailing_drop_override: trailing_drop_pct ?? null,
           signal_snapshot: signalSnapshot,
         });
       }
@@ -829,6 +840,10 @@ export async function deployPosition({
       amount_x: finalAmountX,
       active_bin: activeBin.binId,
       initial_value_usd,
+      top_cluster_trend: top_cluster_trend ?? null,
+      sl_pct_override: sl_pct ?? null,
+      trailing_trigger_override: trailing_trigger_pct ?? null,
+      trailing_drop_override: trailing_drop_pct ?? null,
       signal_snapshot: signalSnapshot,
     });
 
@@ -1490,6 +1505,138 @@ export async function claimFees({ position_address }) {
   }
 }
 
+// ─── Partial Close (scale-out) ─────────────────────────────────
+// Removes a fraction (pct) of the position's liquidity while keeping the
+// position account open. Always uses the local Meteora SDK path — the LPAgent
+// relay zap-out is hardcoded to full close (bps=10000, verification assumes the
+// position disappears), so partial must not go through it. Claims fees first,
+// then removeLiquidity(bps<10000, shouldClaimAndClose=false). The remainder
+// keeps earning; index.js tightens its trailing stop via markPartialExit.
+export async function partialClosePosition({ position_address, pct, reason }) {
+  position_address = normalizeMint(position_address);
+  const cfg = config.management.partialExit;
+
+  // Validate + clamp the requested percentage BEFORE any short-circuit so bad input is
+  // rejected even in DRY_RUN. Always leave a runner (clamp to configured min/max).
+  const requested = Number(pct);
+  if (!Number.isFinite(requested) || requested <= 0) {
+    return { success: false, error: `Invalid partial pct: ${pct}` };
+  }
+  const clampedPct = Math.max(cfg.minPct, Math.min(cfg.maxPct, Math.round(requested)));
+  const bps = Math.round(clampedPct * 100); // 50% → 5000 bps
+
+  if (process.env.DRY_RUN === "true") {
+    return { dry_run: true, would_partial_close: position_address, pct: clampedPct, message: "DRY RUN — no transaction sent" };
+  }
+
+  const tracked = getTrackedPosition(position_address);
+
+  try {
+    log("close", `Partial close ${clampedPct}% of position: ${position_address}`);
+    const wallet = getWallet();
+    const poolAddress = await lookupPoolForPosition(position_address, wallet.publicKey.toString());
+
+    // Capture pre-partial value so we can estimate USD locked in.
+    const beforePositions = await getMyPositions({ force: true, silent: true });
+    const beforePos = beforePositions?.positions?.find((p) => p.position === position_address);
+    const beforeValueUsd = beforePos?.total_value_usd ?? null;
+    const peakAtExit = tracked?.peak_pnl_pct ?? beforePos?.pnl_pct ?? null;
+
+    poolCache.delete(poolAddress.toString());
+    const pool = await getPool(poolAddress);
+    const positionPubKey = new PublicKey(position_address);
+    const claimTxHashes = [];
+    const partialTxHashes = [];
+
+    // ─── Step 1: Claim fees first (clears accrued-fee accounting) ───
+    const recentlyClaimed = tracked?.last_claim_at && (Date.now() - new Date(tracked.last_claim_at).getTime()) < 60_000;
+    try {
+      if (!recentlyClaimed) {
+        const positionData = await pool.getPosition(positionPubKey);
+        const claimTxs = await pool.claimSwapFee({ owner: wallet.publicKey, position: positionData });
+        for (const tx of (claimTxs || [])) {
+          const claimHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet]);
+          claimTxHashes.push(claimHash);
+        }
+        if (claimTxHashes.length) recordClaim(position_address);
+      }
+    } catch (e) {
+      log("close_warn", `Partial step 1 (claim) failed or nothing to claim: ${e.message}`);
+    }
+
+    // ─── Step 2: Remove a fraction of liquidity (keep account open) ──
+    let fromBinId = tracked?.bin_range?.min ?? -887272;
+    let toBinId = tracked?.bin_range?.max ?? 887272;
+    try {
+      const processed = (await pool.getPosition(positionPubKey))?.positionData;
+      if (processed) {
+        fromBinId = processed.lowerBinId ?? fromBinId;
+        toBinId = processed.upperBinId ?? toBinId;
+      }
+    } catch (e) {
+      log("close_warn", `Partial: could not read bin range, using fallback: ${e.message}`);
+    }
+
+    const removeTx = await pool.removeLiquidity({
+      user: wallet.publicKey,
+      position: positionPubKey,
+      fromBinId,
+      toBinId,
+      bps: new BN(bps),
+      shouldClaimAndClose: false, // keep the position open
+    });
+    for (const tx of Array.isArray(removeTx) ? removeTx : [removeTx]) {
+      const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet]);
+      partialTxHashes.push(txHash);
+    }
+
+    await new Promise((r) => setTimeout(r, 5000));
+    _positionsCacheAt = 0;
+
+    // Estimate USD pulled out this round (fraction of pre-partial value).
+    const lockedUsd = beforeValueUsd != null ? beforeValueUsd * (clampedPct / 100) : 0;
+
+    // Record in state: accumulate, stamp peak, tighten remainder trailing stop.
+    markPartialExit(position_address, {
+      pct: clampedPct,
+      usd: lockedUsd,
+      peak_pnl_pct: peakAtExit,
+      tightenDropPct: cfg.stage2TrailingDropPct,
+    });
+
+    const baseMint = beforePos?.base_mint || pool.lbPair.tokenXMint.toString();
+
+    appendDecision({
+      type: "partial_exit",
+      actor: "MANAGER",
+      pool: poolAddress,
+      pool_name: tracked?.pool_name || beforePos?.pair || poolAddress.slice(0, 8),
+      position: position_address,
+      summary: `Partial scale-out ${clampedPct}% at peak ${peakAtExit != null ? peakAtExit.toFixed(1) : "?"}%`,
+      reason: reason || "partial take-profit",
+      metrics: { pct: clampedPct, locked_usd: Math.round(lockedUsd * 100) / 100, peak_pnl_pct: peakAtExit },
+    });
+
+    log("close", `Partial close OK: ${clampedPct}% removed, remainder still open. txs: ${partialTxHashes.join(", ")}`);
+    return {
+      success: true,
+      partial: true,
+      position: position_address,
+      pool: poolAddress,
+      pool_name: tracked?.pool_name || beforePos?.pair || null,
+      pct: clampedPct,
+      locked_usd: Math.round(lockedUsd * 100) / 100,
+      peak_pnl_pct: peakAtExit,
+      claim_txs: claimTxHashes,
+      partial_txs: partialTxHashes,
+      base_mint: baseMint,
+    };
+  } catch (error) {
+    log("close_error", `Partial close failed: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+}
+
 // ─── Close Position ────────────────────────────────────────────
 export async function closePosition({ position_address, reason }) {
   position_address = normalizeMint(position_address);
@@ -1594,6 +1741,20 @@ export async function closePosition({ position_address, reason }) {
       }
 
       if (!closedConfirmed) {
+        // TX was submitted on-chain but position still shows after retries. Untrack it so
+        // the bot doesn't keep managing a ghost position. Don't call recordPerformance —
+        // PnL data is unreliable when settlement is uncertain.
+        recordClose(position_address, reason || "agent decision");
+        appendDecision({
+          type: "close",
+          actor: "MANAGER",
+          pool: poolAddress,
+          pool_name: poolMeta.name || poolAddress.slice(0, 8),
+          position: position_address,
+          summary: "Relay close submitted but position still showing (verification timeout — untracked)",
+          reason: reason || "agent decision",
+          metrics: { close_txs: closeTxHashes },
+        });
         return {
           success: false,
           error: "Close submit succeeded but position still appears open after verification window",
@@ -1603,8 +1764,6 @@ export async function closePosition({ position_address, reason }) {
           txs: txHashes,
         };
       }
-
-      recordClose(position_address, reason || "agent decision");
 
       if (tracked) {
         const deployedAt = new Date(tracked.deployed_at).getTime();
@@ -1659,26 +1818,42 @@ export async function closePosition({ position_address, reason }) {
           tracked,
         });
 
-        await recordPerformance({
-          position: position_address,
-          pool: poolAddress,
-          pool_name: tracked.pool_name || poolMeta.name || poolAddress.slice(0, 8),
-          base_mint: closeBaseMint,
-          strategy: tracked.strategy,
-          bin_range: tracked.bin_range,
-          bin_step: tracked.bin_step || null,
-          volatility: tracked.volatility ?? null,
-          fee_tvl_ratio: tracked.fee_tvl_ratio || null,
-          organic_score: tracked.organic_score || null,
-          amount_sol: tracked.amount_sol,
-          fees_earned_usd: feesUsd,
-          final_value_usd: finalValueUsd,
-          initial_value_usd: initialUsd,
-          minutes_in_range: minutesHeld - minutesOOR,
-          minutes_held: minutesHeld,
-          close_reason: reason || "agent decision",
-          signal_snapshot: signalSnapshot,
-        });
+        try {
+          const quoteMint1 = pool?.lbPair?.tokenYMint?.toString?.() ?? null;
+          await recordPerformance({
+            position: position_address,
+            pool: poolAddress,
+            pool_name: tracked.pool_name || poolMeta.name || poolAddress.slice(0, 8),
+            base_mint: closeBaseMint,
+            quote_mint: quoteMint1,
+            quote_symbol: quoteMint1 === "So11111111111111111111111111111111111111112" ? "SOL" : (poolMeta?.quote?.symbol ?? null),
+            strategy: tracked.strategy,
+            bin_range: tracked.bin_range,
+            bin_step: tracked.bin_step || null,
+            volatility: tracked.volatility ?? null,
+            fee_tvl_ratio: tracked.fee_tvl_ratio || null,
+            organic_score: tracked.organic_score || null,
+            amount_sol: tracked.amount_sol,
+            fees_earned_usd: feesUsd,
+            final_value_usd: finalValueUsd,
+            initial_value_usd: initialUsd,
+            minutes_in_range: minutesHeld - minutesOOR,
+            minutes_held: minutesHeld,
+            close_reason: reason || "agent decision",
+            signal_snapshot: signalSnapshot,
+            // Exit quality fields — enable lessons to learn from peak timing and TA signals
+            peak_pnl_pct:     tracked.peak_pnl_pct    ?? null,
+            peak_pnl_at:      tracked.peak_pnl_at      ?? null,
+            tp_veto_count:    tracked.tp_veto_count    ?? 0,
+            ta_exit_triggered: tracked.ta_exit_triggered ?? false,
+            // Partial scale-out metadata (informational only — PnL is already blended via
+            // allTimeWithdrawals, which accumulates partial withdrawals; do NOT re-add).
+            partial_taken_count: tracked.partial_taken_count ?? 0,
+            partial_taken_pct:   tracked.partial_taken_pct   ?? 0,
+          });
+        } catch (e) {
+          log("close_warn", `recordPerformance (relay) failed — close succeeded but not recorded: ${e.message}`);
+        }
 
         appendDecision({
           type: "close",
@@ -1716,13 +1891,29 @@ export async function closePosition({ position_address, reason }) {
         };
       }
 
+      // Position was not in the tracking registry (e.g. bot restarted mid-position).
+      // Record with minimal data so the lessons system at least counts this close.
+      await recordPerformance({
+        position: position_address,
+        pool: poolAddress,
+        pool_name: poolMeta.name || poolAddress.slice(0, 8),
+        base_mint: livePosition?.base_mint || pool.lbPair.tokenXMint.toString(),
+        strategy: null,
+        close_reason: reason || "agent decision",
+        fees_earned_usd: 0,
+        final_value_usd: 0,
+        initial_value_usd: 0,
+        minutes_in_range: 0,
+        minutes_held: 0,
+      }).catch(e => log("close_warn", `recordPerformance (relay untracked) failed: ${e.message}`));
+
       appendDecision({
         type: "close",
         actor: "MANAGER",
         pool: poolAddress,
         pool_name: poolMeta.name || poolAddress.slice(0, 8),
         position: position_address,
-        summary: "Relay closed position",
+        summary: "Relay closed position (untracked — no deploy record found)",
         reason: reason || "agent decision",
         metrics: {},
       });
@@ -1843,6 +2034,20 @@ export async function closePosition({ position_address, reason }) {
     }
 
     if (!closedConfirmed) {
+      // sendAndConfirmTransaction already confirmed on-chain, but position still shows in
+      // getMyPositions after retries — likely a cache lag. Untrack it so the bot doesn't
+      // keep managing a stale entry. Don't call recordPerformance (PnL would be all zeros).
+      recordClose(position_address, reason || "agent decision");
+      appendDecision({
+        type: "close",
+        actor: "MANAGER",
+        pool: poolAddress,
+        pool_name: poolMeta.name || poolAddress.slice(0, 8),
+        position: position_address,
+        summary: "Close txs confirmed on-chain but position still showing (verification timeout — untracked)",
+        reason: reason || "agent decision",
+        metrics: { close_txs: closeTxHashes.join(",") },
+      });
       return {
         success: false,
         error: "Close transactions sent but position still appears open after verification window",
@@ -1853,8 +2058,6 @@ export async function closePosition({ position_address, reason }) {
         txs: txHashes,
       };
     }
-
-    recordClose(position_address, reason || "agent decision");
 
     // Record performance for learning
     if (tracked) {
@@ -1955,26 +2158,42 @@ export async function closePosition({ position_address, reason }) {
         tracked,
       });
 
-      await recordPerformance({
-        position: position_address,
-        pool: poolAddress,
-        pool_name: tracked.pool_name || poolMeta.name || poolAddress.slice(0, 8),
-        base_mint: closeBaseMint,
-        strategy: tracked.strategy,
-        bin_range: tracked.bin_range,
-        bin_step: tracked.bin_step || null,
-        volatility: tracked.volatility ?? null,
-        fee_tvl_ratio: tracked.fee_tvl_ratio || null,
-        organic_score: tracked.organic_score || null,
-        amount_sol: tracked.amount_sol,
-        fees_earned_usd: feesUsd,
-        final_value_usd: finalValueUsd,
-        initial_value_usd: initialUsd,
-        minutes_in_range: minutesHeld - minutesOOR,
-        minutes_held: minutesHeld,
-        close_reason: reason || "agent decision",
-        signal_snapshot: signalSnapshot,
-      });
+      try {
+        const quoteMint2 = pool?.lbPair?.tokenYMint?.toString?.() ?? null;
+        await recordPerformance({
+          position: position_address,
+          pool: poolAddress,
+          pool_name: tracked.pool_name || poolMeta.name || poolAddress.slice(0, 8),
+          base_mint: closeBaseMint,
+          quote_mint: quoteMint2,
+          quote_symbol: quoteMint2 === "So11111111111111111111111111111111111111112" ? "SOL" : (poolMeta?.quote?.symbol ?? null),
+          strategy: tracked.strategy,
+          bin_range: tracked.bin_range,
+          bin_step: tracked.bin_step || null,
+          volatility: tracked.volatility ?? null,
+          fee_tvl_ratio: tracked.fee_tvl_ratio || null,
+          organic_score: tracked.organic_score || null,
+          amount_sol: tracked.amount_sol,
+          fees_earned_usd: feesUsd,
+          final_value_usd: finalValueUsd,
+          initial_value_usd: initialUsd,
+          minutes_in_range: minutesHeld - minutesOOR,
+          minutes_held: minutesHeld,
+          close_reason: reason || "agent decision",
+          signal_snapshot: signalSnapshot,
+          // Exit quality fields — enable lessons to learn from peak timing and TA signals
+          peak_pnl_pct:     tracked.peak_pnl_pct    ?? null,
+          peak_pnl_at:      tracked.peak_pnl_at      ?? null,
+          tp_veto_count:    tracked.tp_veto_count    ?? 0,
+          ta_exit_triggered: tracked.ta_exit_triggered ?? false,
+          // Partial scale-out metadata (informational only — PnL is already blended via
+          // allTimeWithdrawals, which accumulates partial withdrawals; do NOT re-add).
+          partial_taken_count: tracked.partial_taken_count ?? 0,
+          partial_taken_pct:   tracked.partial_taken_pct   ?? 0,
+        });
+      } catch (e) {
+        log("close_warn", `recordPerformance (SDK) failed — close succeeded but not recorded: ${e.message}`);
+      }
 
       appendDecision({
         type: "close",
@@ -2010,13 +2229,29 @@ export async function closePosition({ position_address, reason }) {
       };
     }
 
+    // Position was not in the tracking registry (e.g. bot restarted mid-position).
+    // Record with minimal data so the lessons system at least counts this close.
+    await recordPerformance({
+      position: position_address,
+      pool: poolAddress,
+      pool_name: poolMeta.name || poolAddress.slice(0, 8),
+      base_mint: pool.lbPair.tokenXMint.toString(),
+      strategy: null,
+      close_reason: reason || "agent decision",
+      fees_earned_usd: 0,
+      final_value_usd: 0,
+      initial_value_usd: 0,
+      minutes_in_range: 0,
+      minutes_held: 0,
+    }).catch(e => log("close_warn", `recordPerformance (SDK untracked) failed: ${e.message}`));
+
     appendDecision({
       type: "close",
       actor: "MANAGER",
       pool: poolAddress,
       pool_name: poolMeta.name || poolAddress.slice(0, 8),
       position: position_address,
-      summary: "Closed position",
+      summary: "Closed position (untracked — no deploy record found)",
       reason: reason || "agent decision",
       metrics: {},
     });

@@ -136,9 +136,41 @@ export async function sendMessageWithButtons(text, inlineKeyboard) {
   });
 }
 
+// Split a message into ≤limit-char chunks on newline boundaries so an HTML tag
+// (always within a single line in our messages) is never cut mid-tag. A single
+// over-limit line is hard-sliced as a last resort.
+export function splitForTelegram(text, limit = 4096) {
+  const str = String(text);
+  if (str.length <= limit) return [str];
+  const chunks = [];
+  let current = "";
+  for (const line of str.split("\n")) {
+    if (line.length > limit) {
+      if (current) { chunks.push(current); current = ""; }
+      for (let i = 0; i < line.length; i += limit) chunks.push(line.slice(i, i + limit));
+      continue;
+    }
+    const candidate = current ? `${current}\n${line}` : line;
+    if (candidate.length > limit) {
+      chunks.push(current);
+      current = line;
+    } else {
+      current = candidate;
+    }
+  }
+  if (current) chunks.push(current);
+  return chunks;
+}
+
 export async function sendHTML(html) {
-  if (!TOKEN || !chatId) return;
-  return postTelegram("sendMessage", { text: html.slice(0, 4096), parse_mode: "HTML" });
+  if (!TOKEN || !chatId) return null;
+  const chunks = splitForTelegram(html, 4096);
+  let last = null;
+  for (const chunk of chunks) {
+    last = await postTelegram("sendMessage", { text: chunk, parse_mode: "HTML" });
+    if (!last) return null; // a failed chunk → report failure so callers can retry
+  }
+  return last;
 }
 
 export async function editMessage(text, messageId) {
@@ -421,12 +453,24 @@ export async function notifyDeploy({ pair, amountSol, position, tx, priceRange, 
   );
 }
 
-export async function notifyClose({ pair, pnlUsd, pnlPct }) {
+export async function notifyClose({ pair, pnlUsd, pnlPct, reason }) {
   if (hasActiveLiveMessage()) return;
   const sign = pnlUsd >= 0 ? "+" : "";
+  const reasonLine = reason ? `\nReason: ${reason}` : "";
   await sendHTML(
     `🔒 <b>Closed</b> ${pair}\n` +
-    `PnL: ${sign}$${(pnlUsd ?? 0).toFixed(2)} (${sign}${(pnlPct ?? 0).toFixed(2)}%)`
+    `PnL: ${sign}$${(pnlUsd ?? 0).toFixed(2)} (${sign}${(pnlPct ?? 0).toFixed(2)}%)` +
+    reasonLine
+  );
+}
+
+export async function notifyPartialClose({ pair, pct, lockedUsd, peakPct }) {
+  if (hasActiveLiveMessage()) return;
+  const peakLine = peakPct != null ? ` at peak ${peakPct.toFixed(1)}%` : "";
+  await sendHTML(
+    `⚡ <b>Partial Close</b> ${pair}\n` +
+    `Took ${pct}%${peakLine} — locked $${(lockedUsd ?? 0).toFixed(2)} to SOL\n` +
+    `Runner held with tightened trailing stop`
   );
 }
 
@@ -463,10 +507,15 @@ export async function notifyEmergencyExit({ pair, reason, volume5m, peakVolume5m
   );
 }
 
-export async function notifyOutOfRange({ pair, minutesOOR }) {
+export async function notifyOutOfRange({ pair, minutesOOR, direction = null }) {
   if (hasActiveLiveMessage()) return;
+  const dirLabel = direction === "ABOVE"
+    ? " (price <b>above</b> range — position idle, still SOL)"
+    : direction === "BELOW"
+    ? " (price <b>below</b> range — cycle complete, now token)"
+    : "";
   await sendHTML(
-    `⚠️ <b>Out of Range</b> ${pair}\n` +
+    `⚠️ <b>Out of Range</b> ${pair}${dirLabel}\n` +
     `Been OOR for ${minutesOOR} minutes`
   );
 }

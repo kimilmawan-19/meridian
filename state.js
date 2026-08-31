@@ -68,6 +68,10 @@ export function trackPosition({
   organic_score,
   initial_value_usd,
   signal_snapshot = null,
+  top_cluster_trend = null,
+  sl_pct_override = null,
+  trailing_trigger_override = null,
+  trailing_drop_override = null,
 }) {
   const state = load();
   state.positions[position] = {
@@ -95,19 +99,35 @@ export function trackPosition({
     closed_at: null,
     notes: [],
     peak_pnl_pct: 0,
+    peak_pnl_at: null,
     pending_peak_pnl_pct: null,
     pending_peak_started_at: null,
     pending_trailing_current_pnl_pct: null,
     pending_trailing_peak_pnl_pct: null,
     pending_trailing_drop_pct: null,
+    pending_trailing_effective_drop_pct: null,
     pending_trailing_started_at: null,
     confirmed_trailing_exit_reason: null,
     confirmed_trailing_exit_until: null,
     trailing_active: false,
     break_even_active: false,
+    top_cluster_trend: top_cluster_trend ?? null,
+    // Layer B: per-position risk overrides (raw; clamped at read time)
+    sl_pct_override: sl_pct_override ?? null,
+    trailing_trigger_override: trailing_trigger_override ?? null,
+    trailing_drop_override: trailing_drop_override ?? null,
+    // Layer A: trailing-TP veto budget tracking
+    tp_veto_count: 0,
+    tp_veto_peak: null,
     peak_volume_5m_usd: null,
     last_market_data_at: null,
     volume_history: [],
+    // Partial exit (scale-out) tracking
+    partial_taken_count: 0,
+    partial_taken_pct: 0,
+    partial_taken_usd: 0,
+    partial_taken_at: null,
+    partial_peak_at_exit: null,
   };
   pushEvent(state, { action: "deploy", position, pool_name: pool_name || pool });
   save(state);
@@ -155,6 +175,116 @@ export function minutesOutOfRange(position_address) {
 }
 
 /**
+ * Detect OOR direction relative to position range.
+ * Returns "ABOVE" if price moved above upper_bin, "BELOW" if below lower_bin, null otherwise.
+ * For bid_ask single-sided SOL: ABOVE = position never activated (still SOL),
+ * BELOW = position fully traversed (now token).
+ */
+export function getOorDirection(p) {
+  if (!p || p.in_range !== false) return null;
+  if (p.active_bin == null || p.upper_bin == null || p.lower_bin == null) return null;
+  if (p.active_bin > p.upper_bin) return "ABOVE";
+  if (p.active_bin < p.lower_bin) return "BELOW";
+  return null;
+}
+
+/**
+ * Returns true if position was observed OOR ABOVE within the given window.
+ * Used by Rule 8 (rapid dump) and Rule 9 (sell streak) to skip emergency exits
+ * while a bid_ask position is still in its entry phase after a recent OOR ABOVE state.
+ */
+export function wasRecentlyOorAbove(position_address, windowMs) {
+  const state = load();
+  const pos = state.positions[position_address];
+  if (!pos || !pos.last_oor_above_at) return false;
+  return (Date.now() - new Date(pos.last_oor_above_at).getTime()) < windowMs;
+}
+
+/**
+ * Track when a position's active bin first exits the entry-grace zone (depth >= graceDepth).
+ * Clears the timestamp when price returns to the grace zone (wick recovery).
+ * Used by Rule 9 to require a sustained confirmation before firing — prevents premature
+ * closes on brief wicks that cross the grace boundary and immediately recover.
+ */
+export function updateR9GraceZone(position_address, depth_pct, graceDepth) {
+  const state = load();
+  const pos = state.positions[position_address];
+  if (!pos) return;
+  let changed = false;
+  if (depth_pct < graceDepth) {
+    // Still within (or returned to) grace zone — clear timer so a future breach restarts fresh
+    if (pos.r9_grace_exited_at != null) {
+      pos.r9_grace_exited_at = null;
+      changed = true;
+    }
+  } else {
+    // Breached grace zone — start timer only if not already running
+    if (pos.r9_grace_exited_at == null) {
+      pos.r9_grace_exited_at = new Date().toISOString();
+      changed = true;
+    }
+  }
+  if (changed) save(state);
+}
+
+/**
+ * Layer B: resolve the effective stop-loss % for a position, honoring an LLM-set
+ * override but clamping it between the loosest (floor) and tightest bounds so a bad
+ * override can neither remove the safety net nor make it fire on normal oscillation.
+ */
+export function effectiveStopLossPct(tracked, mgmtConfig, regime = "healthy") {
+  const floor = mgmtConfig.stopLossFloorPct ?? -50;     // most negative allowed
+  let tightest = mgmtConfig.stopLossTightestPct ?? -10; // least negative allowed
+  let raw = (mgmtConfig.allowLlmRiskParams && tracked?.sl_pct_override != null)
+    ? tracked.sl_pct_override
+    : mgmtConfig.stopLossPct;
+  if (raw == null) return mgmtConfig.stopLossPct;
+  // Regime-aware tightening: shrink the SL magnitude toward zero when the broad market is
+  // caution/bearish, so existing positions get defended faster during a downturn — not just
+  // new deploys throttled. Scale BOTH raw and the tightest clamp by the same multiplier —
+  // scaling raw alone would have no effect on positions already at the tightest bound (e.g.
+  // the low-vol auto-SL tier, -8%, which equals the default stopLossTightestPct and was the
+  // most common overshoot tier in observed data), since raw*mult ends up less negative than
+  // an unscaled tightest and gets clamped straight back to it.
+  if (regime === "bearish") {
+    raw *= mgmtConfig.marketRegimeBearishSlMult ?? 0.7;
+    tightest *= mgmtConfig.marketRegimeBearishSlMult ?? 0.7;
+  } else if (regime === "caution") {
+    raw *= mgmtConfig.marketRegimeCautionSlMult ?? 0.85;
+    tightest *= mgmtConfig.marketRegimeCautionSlMult ?? 0.85;
+  }
+  // clamp into [floor, tightest], e.g. [-50, -10]
+  return Math.min(tightest, Math.max(floor, raw));
+}
+
+/**
+ * Layer A: record that the MANAGER LLM chose to HOLD a triggered trailing take-profit.
+ * Stores the peak at veto time so a later new high can refund the veto budget.
+ * Returns the new veto count.
+ */
+export function recordTpVeto(position_address, peakPnlPct) {
+  const state = load();
+  const pos = state.positions[position_address];
+  if (!pos) return 0;
+  pos.tp_veto_count = (pos.tp_veto_count ?? 0) + 1;
+  pos.tp_veto_peak = peakPnlPct ?? pos.peak_pnl_pct ?? null;
+  save(state);
+  return pos.tp_veto_count;
+}
+
+/**
+ * Layer A: reset the trailing-TP veto budget (e.g. after a new peak made the hold pay off).
+ */
+export function resetTpVeto(position_address) {
+  const state = load();
+  const pos = state.positions[position_address];
+  if (!pos || (pos.tp_veto_count ?? 0) === 0) return;
+  pos.tp_veto_count = 0;
+  pos.tp_veto_peak = null;
+  save(state);
+}
+
+/**
  * Update market data fields for multiple positions in a single disk write.
  * Migrates existing positions that predate these fields.
  *
@@ -183,6 +313,27 @@ export function batchUpdateMarketData(updates) {
       if (pos.volume_history.length > 5) pos.volume_history.shift();
     }
     pos.last_market_data_at = md.fetched_at ?? now;
+  }
+  save(state);
+}
+
+/**
+ * Update live_volatility for all positions in a pool.
+ * Called once per management cycle per unique pool.
+ * Keyed by pool_address → volatility number.
+ *
+ * @param {Map<string, number>} updates  pool_address → live volatility value
+ */
+export function batchUpdateLiveVolatility(updates) {
+  if (!updates || updates.size === 0) return;
+  const state = load();
+  for (const pos of Object.values(state.positions)) {
+    if (pos.closed) continue;
+    const v = updates.get(pos.pool);
+    if (v != null && Number.isFinite(v) && v > 0) {
+      pos.live_volatility = v;
+      pos.live_volatility_at = new Date().toISOString();
+    }
   }
   save(state);
 }
@@ -227,6 +378,54 @@ export function recordClose(position_address, reason) {
 }
 
 /**
+ * Flag that a TA-driven exit (RSI overbought) triggered for this position.
+ * Stored so recordPerformance can include it even after state is closed.
+ */
+export function markTaExitTriggered(position_address) {
+  const state = load();
+  const pos = state.positions[position_address];
+  if (!pos || pos.closed) return;
+  pos.ta_exit_triggered = true;
+  save(state);
+}
+
+/**
+ * Record a partial scale-out. Accumulates the % and USD locked in, stamps the
+ * peak at which it was taken, and tightens the remainder's trailing stop via the
+ * existing Layer B trailing_drop_override. Resets the TP veto budget — a partial
+ * is an exit decision, not a hold, so the remainder starts a fresh trailing leg.
+ *
+ * @param {string} position_address
+ * @param {object} info
+ * @param {number} info.pct            - % of remaining liquidity taken this round
+ * @param {number} info.usd            - USD value pulled out this round
+ * @param {number} info.peak_pnl_pct   - peak PnL at the moment of partial
+ * @param {number} info.tightenDropPct - new (tighter) trailing drop for remainder
+ */
+export function markPartialExit(position_address, { pct, usd, peak_pnl_pct, tightenDropPct } = {}) {
+  const state = load();
+  const pos = state.positions[position_address];
+  if (!pos || pos.closed) return false;
+  pos.partial_taken_count = (pos.partial_taken_count ?? 0) + 1;
+  pos.partial_taken_pct   = (pos.partial_taken_pct ?? 0) + (pct ?? 0);
+  pos.partial_taken_usd   = (pos.partial_taken_usd ?? 0) + (usd ?? 0);
+  pos.partial_taken_at    = new Date().toISOString();
+  if (peak_pnl_pct != null) pos.partial_peak_at_exit = peak_pnl_pct;
+  // Tighten the remainder's trailing stop (Layer B override; keep the tightest of the two).
+  if (tightenDropPct != null) {
+    pos.trailing_drop_override = pos.trailing_drop_override != null
+      ? Math.min(pos.trailing_drop_override, tightenDropPct)
+      : tightenDropPct;
+  }
+  // A partial is an exit, not a hold — start the remainder on a clean veto budget.
+  pos.tp_veto_count = 0;
+  pos.tp_veto_peak = null;
+  save(state);
+  log("state", `Position ${position_address} partial exit #${pos.partial_taken_count}: took ${pct}% ($${(usd ?? 0).toFixed(2)}), remainder trailing drop tightened to ${tightenDropPct}%`);
+  return true;
+}
+
+/**
  * Set a persistent instruction for a position (e.g. "hold until 5% profit").
  * Overwrites any previous instruction. Pass null to clear.
  */
@@ -251,6 +450,7 @@ export function queuePeakConfirmation(position_address, candidatePnlPct, options
 
   if (options.immediate) {
     pos.peak_pnl_pct = candidatePnlPct;
+    pos.peak_pnl_at = new Date().toISOString();
     pos.pending_peak_pnl_pct = null;
     pos.pending_peak_started_at = null;
     save(state);
@@ -281,7 +481,12 @@ export function resolvePendingPeak(position_address, currentPnlPct, toleranceRat
   pos.pending_peak_started_at = null;
 
   if (currentPnlPct != null && currentPnlPct >= pendingPeak * toleranceRatio) {
-    pos.peak_pnl_pct = Math.max(pos.peak_pnl_pct ?? 0, pendingPeak, currentPnlPct);
+    const prevPeak = pos.peak_pnl_pct ?? 0;
+    const newPeak = Math.max(prevPeak, pendingPeak, currentPnlPct);
+    // Stamp the time only when the peak actually advances, so peak_pnl_at marks
+    // when the all-time high was set (used by trailing TP to detect stale peaks).
+    if (newPeak > prevPeak || pos.peak_pnl_at == null) pos.peak_pnl_at = new Date().toISOString();
+    pos.peak_pnl_pct = newPeak;
     save(state);
     log("state", `Position ${position_address} peak PnL confirmed at ${pos.peak_pnl_pct.toFixed(2)}% after recheck`);
     return { confirmed: true, peak: pos.peak_pnl_pct };
@@ -292,10 +497,10 @@ export function resolvePendingPeak(position_address, currentPnlPct, toleranceRat
   return { confirmed: false, rejected: true, pendingPeak };
 }
 
-export function queueTrailingDropConfirmation(position_address, peakPnlPct, currentPnlPct, trailingDropPct) {
-  if (peakPnlPct == null || currentPnlPct == null || trailingDropPct == null) return false;
+export function queueTrailingDropConfirmation(position_address, peakPnlPct, currentPnlPct, effectiveDropPct) {
+  if (peakPnlPct == null || currentPnlPct == null || effectiveDropPct == null) return false;
   const dropFromPeak = peakPnlPct - currentPnlPct;
-  if (dropFromPeak < trailingDropPct) return false;
+  if (dropFromPeak < effectiveDropPct) return false;
 
   const state = load();
   const pos = state.positions[position_address];
@@ -311,6 +516,9 @@ export function queueTrailingDropConfirmation(position_address, peakPnlPct, curr
   pos.pending_trailing_peak_pnl_pct = peakPnlPct;
   pos.pending_trailing_current_pnl_pct = currentPnlPct;
   pos.pending_trailing_drop_pct = dropFromPeak;
+  // Store the trigger's effective drop so the 15s recheck applies the SAME threshold (givebackDivisor,
+  // Layer-B override floor, stale-peak widening) instead of recomputing a divergent one.
+  pos.pending_trailing_effective_drop_pct = effectiveDropPct;
   pos.pending_trailing_started_at = new Date().toISOString();
   save(state);
   log("state", `Position ${position_address} trailing drop candidate queued: peak ${peakPnlPct.toFixed(2)}% -> current ${currentPnlPct.toFixed(2)}%`);
@@ -327,17 +535,22 @@ export function resolvePendingTrailingDrop(position_address, currentPnlPct, trai
   const pendingCurrent = pos.pending_trailing_current_pnl_pct;
   const pendingPeak = pos.pending_trailing_peak_pnl_pct;
   const pendingDrop = pos.pending_trailing_drop_pct ?? (pendingPeak - pendingCurrent);
+  // Reuse the trigger's stored effective drop so the recheck applies the identical threshold
+  // (givebackDivisor, Layer-B override floor, stale-peak widening). Fall back to the old
+  // proportional formula for positions queued before this field existed.
+  const effectiveDrop = pos.pending_trailing_effective_drop_pct ?? Math.max(trailingDropPct, pendingPeak / 3);
 
   pos.pending_trailing_current_pnl_pct = null;
   pos.pending_trailing_peak_pnl_pct = null;
   pos.pending_trailing_drop_pct = null;
+  pos.pending_trailing_effective_drop_pct = null;
   pos.pending_trailing_started_at = null;
 
   const stillNearCrash = currentPnlPct != null && currentPnlPct <= pendingCurrent + tolerancePct;
-  const stillDroppedEnough = currentPnlPct != null && (pendingPeak - currentPnlPct) >= trailingDropPct;
+  const stillDroppedEnough = currentPnlPct != null && (pendingPeak - currentPnlPct) >= effectiveDrop;
 
   if (stillNearCrash && stillDroppedEnough) {
-    const reason = `Trailing TP: peak ${pendingPeak.toFixed(2)}% → current ${currentPnlPct.toFixed(2)}% (dropped ${(pendingPeak - currentPnlPct).toFixed(2)}% >= ${trailingDropPct}%)`;
+    const reason = `Trailing TP: peak ${pendingPeak.toFixed(2)}% → current ${currentPnlPct.toFixed(2)}% (dropped ${(pendingPeak - currentPnlPct).toFixed(2)}% >= ${effectiveDrop.toFixed(2)}%)`;
     pos.confirmed_trailing_exit_reason = reason;
     pos.confirmed_trailing_exit_until = new Date(Date.now() + 30_000).toISOString();
     save(state);
@@ -406,14 +619,31 @@ export function getStateSummary() {
  * @param {object} mgmtConfig
  * Returns { action, reason } or null if no exit needed.
  */
-export function updatePnlAndCheckExits(position_address, positionData, mgmtConfig) {
-  const { pnl_pct: currentPnlPct, pnl_pct_suspicious, in_range, fee_per_tvl_24h } = positionData;
+export function updatePnlAndCheckExits(position_address, positionData, mgmtConfig, regime = "healthy") {
+  const {
+    pnl_pct: currentPnlPct,
+    pnl_pct_suspicious,
+    in_range,
+    fee_per_tvl_24h,
+    unclaimed_fees_usd,
+    collected_fees_usd,
+    total_value_usd,
+  } = positionData;
   const state = load();
   const pos = state.positions[position_address];
   if (!pos || pos.closed) return null;
 
   if (pos.confirmed_trailing_exit_until) {
     if (new Date(pos.confirmed_trailing_exit_until).getTime() > Date.now() && pos.confirmed_trailing_exit_reason) {
+      // If position is back in range since confirmation was queued, cancel the exit —
+      // fee collection is still active and the trailing signal is no longer valid.
+      if (in_range === true) {
+        log("state", `Trailing TP confirmed exit cancelled for ${position_address} — back in range`);
+        pos.confirmed_trailing_exit_reason = null;
+        pos.confirmed_trailing_exit_until = null;
+        save(state);
+        return null;
+      }
       const reason = pos.confirmed_trailing_exit_reason;
       pos.confirmed_trailing_exit_reason = null;
       pos.confirmed_trailing_exit_until = null;
@@ -426,15 +656,26 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
 
   let changed = false;
 
+  // Layer B: per-position trailing overrides (clamped to sane minimums)
+  const effTrailingTrigger = (mgmtConfig.allowLlmRiskParams && pos.trailing_trigger_override != null)
+    ? Math.max(1, pos.trailing_trigger_override)
+    : mgmtConfig.trailingTriggerPct;
+  const effTrailingDropFloor = (mgmtConfig.allowLlmRiskParams && pos.trailing_drop_override != null)
+    ? Math.max(0.5, pos.trailing_drop_override)
+    : mgmtConfig.trailingDropPct;
+
   // Activate trailing TP once trigger threshold is reached
-  if (mgmtConfig.trailingTakeProfit && !pos.trailing_active && (pos.peak_pnl_pct ?? 0) >= mgmtConfig.trailingTriggerPct) {
+  if (mgmtConfig.trailingTakeProfit && !pos.trailing_active && (pos.peak_pnl_pct ?? 0) >= effTrailingTrigger) {
     pos.trailing_active = true;
     changed = true;
     log("state", `Position ${position_address} trailing TP activated (confirmed peak: ${pos.peak_pnl_pct}%)`);
   }
 
-  // Activate break-even stop once peak reaches breakEvenTriggerPct
-  if (!pos.break_even_active && (pos.peak_pnl_pct ?? 0) >= (mgmtConfig.breakEvenTriggerPct ?? 1)) {
+  // Activate break-even stop once peak reaches breakEvenTriggerPct.
+  // Skip when OOR ABOVE (position is idle SOL, never entered range) — break-even has no meaning
+  // while the position hasn't activated yet and a natural dip would immediately close it.
+  const oorDirForBreakEven = getOorDirection(positionData);
+  if (!pos.break_even_active && (pos.peak_pnl_pct ?? 0) >= (mgmtConfig.breakEvenTriggerPct ?? 1) && oorDirForBreakEven !== "ABOVE") {
     pos.break_even_active = true;
     changed = true;
     log("state", `Position ${position_address} break-even stop activated (confirmed peak: ${pos.peak_pnl_pct}%)`);
@@ -451,71 +692,179 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
     log("state", `Position ${position_address} back in range`);
   }
 
+  // Track most recent OOR ABOVE moment — used by Rule 8/9 to grant a grace period
+  // after a bid_ask position transitions from OOR ABOVE back to in-range. The dump
+  // that brings price into our range IS the intended entry signal; continued dumping
+  // right after entry should not immediately trigger emergency exits.
+  if (in_range === false && getOorDirection(positionData) === "ABOVE") {
+    pos.last_oor_above_at = new Date().toISOString();
+    changed = true;
+  }
+
   if (changed) save(state);
 
   // ── Break-even stop ───────────────────────────────────────────
-  // Once peak was profitable enough, never let PnL fall back to 0% or below
+  // Once peak was profitable enough, never let PnL fall back to 0% or below.
+  // While in-range, defer briefly — price oscillation during active fee earning is normal.
+  // Deferral is bounded: if PnL stays negative in-range for longer than breakEvenInRangeDeferMin
+  // (default 60m), break-even fires anyway. This prevents slow in-range bleeds (Magpie/SLAB pattern).
   if (!pnl_pct_suspicious && pos.break_even_active && currentPnlPct != null && currentPnlPct <= 0) {
-    return {
-      action: "BREAK_EVEN",
-      reason: `Break-even stop: peak was ${(pos.peak_pnl_pct ?? 0).toFixed(2)}%, now ${currentPnlPct.toFixed(2)}%`,
-    };
+    if (in_range === true) {
+      if (!pos.break_even_in_range_since) {
+        pos.break_even_in_range_since = new Date().toISOString();
+        save(state);
+      }
+      const deferMin = mgmtConfig.breakEvenInRangeDeferMin ?? 60;
+      const elapsedMin = (Date.now() - new Date(pos.break_even_in_range_since).getTime()) / 60_000;
+      if (elapsedMin >= deferMin) {
+        return {
+          action: "BREAK_EVEN",
+          reason: `Break-even stop: peak was ${(pos.peak_pnl_pct ?? 0).toFixed(2)}%, now ${currentPnlPct.toFixed(2)}% (in-range grace expired: ${Math.round(elapsedMin)}m)`,
+        };
+      }
+      log("state", `Break-even deferred for ${position_address}: in-range, pnl=${currentPnlPct.toFixed(2)}%, deferral ${Math.round(elapsedMin)}/${deferMin}m`);
+    } else {
+      if (pos.break_even_in_range_since) {
+        pos.break_even_in_range_since = null;
+        save(state);
+      }
+      return {
+        action: "BREAK_EVEN",
+        reason: `Break-even stop: peak was ${(pos.peak_pnl_pct ?? 0).toFixed(2)}%, now ${currentPnlPct.toFixed(2)}%`,
+      };
+    }
+  } else if (pos.break_even_in_range_since && (currentPnlPct == null || currentPnlPct > 0)) {
+    // PnL recovered above 0 — reset the deferral timer
+    pos.break_even_in_range_since = null;
+    save(state);
   }
 
   // ── Stop loss ──────────────────────────────────────────────────
   const { age_minutes: slAgeMin } = positionData;
   const minAgeForStopLoss = mgmtConfig.minAgeBeforeStopLoss ?? 15;
+  const effSL = effectiveStopLossPct(pos, mgmtConfig, regime);
+  // Early-dump override: if loss already exceeds earlyDumpOverridePct (default -10%),
+  // bypass the age gate entirely. A fast or sustained dump in the first 15 minutes is
+  // real and should be cut — the age gate exists to avoid wick noise, not -10% bleeds.
+  const earlyDumpThreshold = mgmtConfig.earlyDumpOverridePct ?? -10;
+  const ageGatePassed = slAgeMin == null || slAgeMin >= minAgeForStopLoss;
+  const earlyDumpOverride = !ageGatePassed &&
+    currentPnlPct != null &&
+    currentPnlPct <= earlyDumpThreshold;
   if (
     !pnl_pct_suspicious &&
     currentPnlPct != null &&
-    mgmtConfig.stopLossPct != null &&
-    currentPnlPct <= mgmtConfig.stopLossPct &&
-    (slAgeMin == null || slAgeMin >= minAgeForStopLoss)
+    effSL != null &&
+    currentPnlPct <= effSL &&
+    (ageGatePassed || earlyDumpOverride)
   ) {
+    const slTag = pos.sl_pct_override != null && mgmtConfig.allowLlmRiskParams ? " [per-position]" : "";
+    const earlyTag = earlyDumpOverride ? " [early-dump override]" : "";
     return {
       action: "STOP_LOSS",
-      reason: `Stop loss: PnL ${currentPnlPct.toFixed(2)}% <= ${mgmtConfig.stopLossPct}% (age: ${slAgeMin ?? "?"}m)`,
+      reason: `Stop loss: PnL ${currentPnlPct.toFixed(2)}% <= ${effSL}%${slTag}${earlyTag} (age: ${slAgeMin ?? "?"}m)`,
     };
   }
 
   // ── Trailing TP ────────────────────────────────────────────────
+  // While in-range, defer briefly — a temporary dip while actively earning fees is normal.
+  // Deferral is bounded: if the trailing trigger stays fired for longer than
+  // trailingInRangeDeferMin (default 90m), the TP fires anyway to lock in remaining gains.
+  // Timer resets when drop recovers or position goes OOR.
   if (!pnl_pct_suspicious && pos.trailing_active) {
     const dropFromPeak = pos.peak_pnl_pct - currentPnlPct;
-    if (dropFromPeak >= mgmtConfig.trailingDropPct) {
-      return {
-        action: "TRAILING_TP",
-        reason: `Trailing TP: peak ${pos.peak_pnl_pct.toFixed(2)}% → current ${currentPnlPct.toFixed(2)}% (dropped ${dropFromPeak.toFixed(2)}% >= ${mgmtConfig.trailingDropPct}%)`,
-        needs_confirmation: true,
-        peak_pnl_pct: pos.peak_pnl_pct,
-        current_pnl_pct: currentPnlPct,
-        drop_from_peak_pct: dropFromPeak,
-      };
+    // Widen drop tolerance proportionally at higher peaks: give back at most 1/N of gains.
+    // trailingGivebackDivisor (default 3) controls N; trailingDropPct acts as floor.
+    const givebackDivisor = mgmtConfig.trailingGivebackDivisor ?? 3;
+    let effectiveDrop = Math.max(effTrailingDropFloor, pos.peak_pnl_pct / givebackDivisor);
+    // Regime-aware profit-taking: shrink the allowed give-back when the broad market is
+    // caution/bearish, locking in gains sooner before a downturn erases them. Applied before
+    // stale-peak widening below, which still gets the last word on the final tolerance.
+    if (regime === "bearish") effectiveDrop *= mgmtConfig.marketRegimeBearishTrailMult ?? 0.6;
+    else if (regime === "caution") effectiveDrop *= mgmtConfig.marketRegimeCautionTrailMult ?? 0.8;
+    // Stale-peak widening: if the all-time peak was set long ago and price has since settled
+    // lower, the trailing stop is measuring against a high that no longer reflects reality.
+    // Widen tolerance so a stabilized position is not force-exited against an outdated peak.
+    let stalePeak = false;
+    const stalePeakMin = mgmtConfig.trailingStalePeakMinutes;
+    if (stalePeakMin != null && pos.peak_pnl_at) {
+      const peakAgeMin = (Date.now() - new Date(pos.peak_pnl_at).getTime()) / 60_000;
+      if (peakAgeMin >= stalePeakMin) {
+        effectiveDrop *= (mgmtConfig.trailingStalePeakDropMult ?? 1.75);
+        stalePeak = true;
+      }
     }
-  }
-
-  // ── Out of range too long ──────────────────────────────────────
-  if (pos.out_of_range_since) {
-    const minutesOOR = Math.floor((Date.now() - new Date(pos.out_of_range_since).getTime()) / 60000);
-    if (minutesOOR >= mgmtConfig.outOfRangeWaitMinutes) {
-      return {
-        action: "OUT_OF_RANGE",
-        reason: `Out of range for ${minutesOOR}m (limit: ${mgmtConfig.outOfRangeWaitMinutes}m)`,
-      };
+    if (dropFromPeak >= effectiveDrop) {
+      if (in_range === true) {
+        // Start deferral timer on first trigger while in-range
+        if (!pos.trailing_in_range_since) {
+          pos.trailing_in_range_since = new Date().toISOString();
+          save(state);
+        }
+        const deferMin = mgmtConfig.trailingInRangeDeferMin ?? 90;
+        const elapsedMin = (Date.now() - new Date(pos.trailing_in_range_since).getTime()) / 60_000;
+        if (elapsedMin >= deferMin) {
+          return {
+            action: "TRAILING_TP",
+            reason: `Trailing TP: peak ${pos.peak_pnl_pct.toFixed(2)}% → current ${currentPnlPct.toFixed(2)}% (dropped ${dropFromPeak.toFixed(2)}% >= ${effectiveDrop.toFixed(2)}%${stalePeak ? ", stale-peak widened" : ""}, in-range grace expired: ${Math.round(elapsedMin)}m)`,
+            needs_confirmation: true,
+            peak_pnl_pct: pos.peak_pnl_pct,
+            current_pnl_pct: currentPnlPct,
+            drop_from_peak_pct: dropFromPeak,
+            effective_drop_pct: effectiveDrop,
+          };
+        }
+        log("state", `Trailing TP deferred for ${position_address}: in-range, drop=${dropFromPeak.toFixed(2)}% >= ${effectiveDrop.toFixed(2)}%, deferral ${Math.round(elapsedMin)}/${deferMin}m`);
+      } else {
+        if (pos.trailing_in_range_since) {
+          pos.trailing_in_range_since = null;
+          save(state);
+        }
+        return {
+          action: "TRAILING_TP",
+          reason: `Trailing TP: peak ${pos.peak_pnl_pct.toFixed(2)}% → current ${currentPnlPct.toFixed(2)}% (dropped ${dropFromPeak.toFixed(2)}% >= ${effectiveDrop.toFixed(2)}%${stalePeak ? ", stale-peak widened" : ""})`,
+          needs_confirmation: true,
+          peak_pnl_pct: pos.peak_pnl_pct,
+          current_pnl_pct: currentPnlPct,
+          drop_from_peak_pct: dropFromPeak,
+          effective_drop_pct: effectiveDrop,
+        };
+      }
+    } else if (pos.trailing_in_range_since) {
+      // Drop recovered below threshold — reset deferral timer
+      pos.trailing_in_range_since = null;
+      save(state);
     }
   }
 
   // ── Low yield (only after position has had time to accumulate fees) ───
+  // Note: OOR timeout decision is handled in getDeterministicCloseRule (index.js Rule 4)
+  // where market data (buy/sell pressure) is available for the recovery-signal guard.
   const minAgeForYieldCheck = mgmtConfig.minAgeBeforeYieldCheck ?? 60;
-  if (
-    fee_per_tvl_24h != null &&
-    mgmtConfig.minFeePerTvl24h != null &&
-    fee_per_tvl_24h < mgmtConfig.minFeePerTvl24h &&
-    (slAgeMin == null || slAgeMin >= minAgeForYieldCheck)
-  ) {
-    return {
-      action: "LOW_YIELD",
-      reason: `Low yield: fee/TVL ${fee_per_tvl_24h.toFixed(2)}% < min ${mgmtConfig.minFeePerTvl24h}% (age: ${slAgeMin ?? "?"}m)`,
-    };
+  const minAgeForPositionMetric = minAgeForYieldCheck; // switch to position-actual at the same age Rule 5 can fire
+  if (mgmtConfig.minFeePerTvl24h != null && (slAgeMin == null || slAgeMin >= minAgeForYieldCheck)) {
+    // Position-level fee rate: actual fees earned (claimed + unclaimed) extrapolated to 24h.
+    // More accurate than the pool's 24h rolling average which is dominated by pre-deploy history.
+    // Only trusted after minAgeForPositionMetric minutes; falls back to pool metric while too young.
+    let effectiveFeeRate = fee_per_tvl_24h; // fallback: pool 24h metric
+    let metricSource = "pool_24h";
+    if (
+      slAgeMin >= minAgeForPositionMetric &&
+      total_value_usd > 0
+    ) {
+      const totalFeesEarned = (collected_fees_usd ?? 0) + (unclaimed_fees_usd ?? 0);
+      const positionFeeRate24h = (totalFeesEarned / total_value_usd) * (1440 / slAgeMin) * 100;
+      if (Number.isFinite(positionFeeRate24h)) {
+        effectiveFeeRate = positionFeeRate24h;
+        metricSource = "position_actual";
+      }
+    }
+    if (effectiveFeeRate != null && effectiveFeeRate < mgmtConfig.minFeePerTvl24h) {
+      return {
+        action: "LOW_YIELD",
+        reason: `Low yield: fee/TVL ${effectiveFeeRate.toFixed(2)}% < min ${mgmtConfig.minFeePerTvl24h}% [${metricSource}] (age: ${slAgeMin ?? "?"}m)`,
+      };
+    }
   }
 
   return null;
