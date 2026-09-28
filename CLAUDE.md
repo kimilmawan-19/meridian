@@ -390,6 +390,7 @@ Break-even and trailing TP are **not** suppressed indefinitely while `in_range=t
 - Mirror logic with `trailing_in_range_since` timestamp
 - Timer only runs while `dropFromPeak >= effectiveDrop` and `in_range=true`
 - Resets if drop recovers or position goes OOR
+- **Give-back floor**: deferral stops once `dropFromPeak >= peak_pnl_pct / tpVetoFloorDivisor` (default 2 → half the peak) and TRAILING_TP fires immediately; the veto layer then force-closes it (same floor). Previously the deferral had no floor — live data showed break-even closes averaging peak +7.33% → −0.96% (30d, 33 closes, 0 vetos): positions slid from their peak all the way to break-even while deferred.
 
 **Trailing giveback divisor (`trailingGivebackDivisor`, default 3):**
 ```js

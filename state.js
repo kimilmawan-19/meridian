@@ -839,7 +839,12 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
       }
     }
     if (dropFromPeak >= effectiveDrop) {
-      if (in_range === true) {
+      // The in-range deferral had no give-back floor: positions peaking ~7% slid all the way
+      // to break-even (0%) while deferred. Once half the peak is gone, stop deferring — the
+      // same floor the TP veto layer (index.js) already enforces.
+      const givebackFloor = pos.peak_pnl_pct / (mgmtConfig.tpVetoFloorDivisor ?? 2);
+      const floorHit = dropFromPeak >= givebackFloor;
+      if (in_range === true && !floorHit) {
         // Start deferral timer on first trigger while in-range
         if (!pos.trailing_in_range_since) {
           pos.trailing_in_range_since = new Date().toISOString();
@@ -866,7 +871,7 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
         }
         return {
           action: "TRAILING_TP",
-          reason: `Trailing TP: peak ${pos.peak_pnl_pct.toFixed(2)}% → current ${currentPnlPct.toFixed(2)}% (dropped ${dropFromPeak.toFixed(2)}% >= ${effectiveDrop.toFixed(2)}%${stalePeak ? ", stale-peak widened" : ""})`,
+          reason: `Trailing TP: peak ${pos.peak_pnl_pct.toFixed(2)}% → current ${currentPnlPct.toFixed(2)}% (dropped ${dropFromPeak.toFixed(2)}% >= ${effectiveDrop.toFixed(2)}%${stalePeak ? ", stale-peak widened" : ""}${in_range === true ? `, in-range give-back floor ${givebackFloor.toFixed(2)}% hit` : ""})`,
           needs_confirmation: true,
           peak_pnl_pct: pos.peak_pnl_pct,
           current_pnl_pct: currentPnlPct,
