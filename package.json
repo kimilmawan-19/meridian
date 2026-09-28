@@ -23,6 +23,7 @@
     "test:sol-quote": "node test/test-sol-quote-filter.mjs",
     "test:entry-flow": "node test/test-entry-flow-filter.mjs",
     "test:regime-risk": "node test/test-regime-risk.mjs",
+    "test:liquidity-collapse": "node test/test-liquidity-collapse.mjs",
     "test:agent": "DRY_RUN=true node test/test-agent.js",
     "postinstall": "node scripts/patch-anchor.js"
   },

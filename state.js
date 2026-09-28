@@ -122,6 +122,8 @@ export function trackPosition({
     peak_volume_5m_usd: null,
     last_market_data_at: null,
     volume_history: [],
+    peak_liquidity_usd: null,
+    liquidity_history: [],
     // Partial exit (scale-out) tracking
     partial_taken_count: 0,
     partial_taken_pct: 0,
@@ -301,6 +303,8 @@ export function batchUpdateMarketData(updates) {
     // Migrate fields if missing (existing positions pre-patch)
     if (pos.peak_volume_5m_usd === undefined) pos.peak_volume_5m_usd = null;
     if (!Array.isArray(pos.volume_history)) pos.volume_history = [];
+    if (pos.peak_liquidity_usd === undefined) pos.peak_liquidity_usd = null;
+    if (!Array.isArray(pos.liquidity_history)) pos.liquidity_history = [];
 
     const vol5m = md.volume_5m ?? null;
     // Update peak
@@ -311,6 +315,18 @@ export function batchUpdateMarketData(updates) {
     if (vol5m != null) {
       pos.volume_history.push({ ts: md.fetched_at ?? now, volume_5m: vol5m });
       if (pos.volume_history.length > 5) pos.volume_history.shift();
+    }
+
+    // Same tracking for pool liquidity — used by Rule 11 (liquidity collapse) to detect a
+    // classic rug signature (LP pulled) independent of volume/sell-pressure, which can stay
+    // near-zero during a direct liquidity removal (no swap activity needed to rug an LP).
+    const liq = md.liquidity_usd ?? null;
+    if (liq != null && (pos.peak_liquidity_usd == null || liq > pos.peak_liquidity_usd)) {
+      pos.peak_liquidity_usd = liq;
+    }
+    if (liq != null) {
+      pos.liquidity_history.push({ ts: md.fetched_at ?? now, liquidity_usd: liq });
+      if (pos.liquidity_history.length > 5) pos.liquidity_history.shift();
     }
     pos.last_market_data_at = md.fetched_at ?? now;
   }

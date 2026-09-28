@@ -394,6 +394,20 @@ Both `effectiveStopLossPct` and `updatePnlAndCheckExits` take `regime` as an opt
 
 ---
 
+## Rule 11 — Liquidity Collapse (index.js `getDeterministicCloseRule`)
+
+Sibling of Rule 7 (volume collapse), gated by `config.emergencyExits.liquidityCollapse.enabled` (default true). Targets a different failure mode: a token whose price-based signals (auto-SL, Rule 9) can't react fast enough because the dump is a genuine rug — liquidity pulled directly from the pool, sometimes with almost no swap activity at all (e.g. e/acc-SOL closed at -26.95% via Rule 1, ~19 points past its auto-SL tier — a violent dump no threshold recalibration alone would have caught).
+
+Unlike Rule 7, Rule 11 does **not** require sell-pressure confirmation (`sells > buys × ratio`): a direct LP removal doesn't need to show up as swap activity, so requiring buys/sells would blind the rule to exactly the fastest, most dangerous rugs. A sharp drop in `liquidity_usd` from its recent peak is sufficient on its own.
+
+- Tracks `peak_liquidity_usd` and a 5-entry `liquidity_history` per position (`state.js` `batchUpdateMarketData`, mirroring the existing `peak_volume_5m_usd`/`volume_history` — same rolling-window-over-all-time-peak preference to avoid pinning to a stale early spike).
+- Fires when `liquidity_usd < minPeakLiquidityUsd`-qualified peak `× dropThresholdPct/100` (default 40%), position age ≥ `minPositionAgeMin` (default 5 — shorter than `volumeCollapse`'s 10, since LP pulls can happen fast), and peak liquidity was ≥ `minPeakLiquidityUsd` (default $1000, avoids noise on dust pools).
+- Same skip conditions as Rule 7/8/9: OOR ABOVE (idle SOL, no capital at risk), in-range AND PnL ≥ 0 (still earning), and the depth-aware entry-accumulation grace zone.
+- Only updated by the management cycle's `batchUpdateMarketData` (every `managementIntervalMin`, default 10m) — the 30s poll path doesn't call it, so `peak_liquidity_usd` can be up to one management cycle stale there. Same existing staleness as Rule 7's volume peak in the poll path, not a regression.
+- Not added to `update_config`'s `CONFIG_MAP` — consistent with its siblings `volumeCollapse`/`rapidPriceDrop`/`sellPressureStreak`, which are also tuned via `user-config.json` + restart, not runtime `update_config`.
+
+---
+
 ## In-Range Dump Cooldown (pool-memory.js)
 
 `recordPoolDeploy()` already cools pools/tokens for low-yield, emergency-exit ("rapid dump"/"volume collapse"), repeated-OOR, and repeat-fee-generating closes. The **in-range dump** trigger covers the token-quality failure pattern those miss: a token that fell *within* our bin range and closed via stop-loss/sell-pressure.

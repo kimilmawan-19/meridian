@@ -513,8 +513,8 @@ export async function runManagementCycle({ silent = false } = {}) {
       const closeRule = getDeterministicCloseRule(p, config.management, p._marketData, volumeWindow, solPriceUsd, config.marketRegime?._activeRegime ?? "healthy");
       if (closeRule) {
         actionMap.set(p.position, closeRule);
-        if (closeRule.rule === 7 || closeRule.rule === 8) {
-          log("market_data", `[mgmt_cycle] Emergency rule ${closeRule.rule} (${closeRule.reason}) triggered for ${p.pair} — price5m=${p._marketData?.price_change_5m ?? "?"}% vol5m=$${p._marketData?.volume_5m ?? "?"}`);
+        if (closeRule.rule === 7 || closeRule.rule === 8 || closeRule.rule === 11) {
+          log("market_data", `[mgmt_cycle] Emergency rule ${closeRule.rule} (${closeRule.reason}) triggered for ${p.pair} — price5m=${p._marketData?.price_change_5m ?? "?"}% vol5m=$${p._marketData?.volume_5m ?? "?"} liq=$${p._marketData?.liquidity_usd ?? "?"}`);
           const tracked = getTrackedPosition(p.position);
           appendDecision({
             type: "emergency_exit",
@@ -532,10 +532,13 @@ export async function runManagementCycle({ silent = false } = {}) {
               txn_buys_5m: p._marketData?.txn_buys_5m,
               txn_sells_5m: p._marketData?.txn_sells_5m,
               liquidity_usd: p._marketData?.liquidity_usd,
+              peak_liquidity_usd: tracked?.peak_liquidity_usd,
               pnl_pct: p.pnl_pct,
               age_minutes: p.age_minutes,
               thresholds: closeRule.rule === 7
                 ? { dropThresholdPct: config.emergencyExits.volumeCollapse.dropThresholdPct, sellPressureRatio: config.emergencyExits.volumeCollapse.sellPressureRatio, minPeakVolumeUsd: config.emergencyExits.volumeCollapse.minPeakVolumeUsd }
+                : closeRule.rule === 11
+                ? { dropThresholdPct: config.emergencyExits.liquidityCollapse.dropThresholdPct, minPeakLiquidityUsd: config.emergencyExits.liquidityCollapse.minPeakLiquidityUsd }
                 : { dropPct5m: config.emergencyExits.rapidPriceDrop.dropPct5m, requireNegativePnl: config.emergencyExits.rapidPriceDrop.requireNegativePnl },
             },
           });
@@ -547,6 +550,8 @@ export async function runManagementCycle({ silent = false } = {}) {
             priceChange5m: p._marketData?.price_change_5m,
             txnBuys5m: p._marketData?.txn_buys_5m,
             txnSells5m: p._marketData?.txn_sells_5m,
+            liquidityUsd: p._marketData?.liquidity_usd,
+            peakLiquidityUsd: tracked?.peak_liquidity_usd,
             pnlPct: p.pnl_pct,
           });
         } else if (closeRule.rule === 9) {
@@ -1529,7 +1534,7 @@ Summarize the current portfolio health, total fees earned, and performance of al
         const pollVolumeWindow = getVolumeWindow(p.pool, config.emergencyExits.sellPressureStreak?.windowMin ?? 30);
         const closeRule = getDeterministicCloseRule(p, config.management, pollMd, pollVolumeWindow, _cachedSolPrice, config.marketRegime?._activeRegime ?? "healthy");
         if (closeRule) {
-          const isEmergency = closeRule.rule === 7 || closeRule.rule === 8;
+          const isEmergency = closeRule.rule === 7 || closeRule.rule === 8 || closeRule.rule === 11;
           if (isEmergency) {
             log("market_data", `[pnl_poll] Emergency rule ${closeRule.rule} (${closeRule.reason}) triggered for ${p.pair} — price5m=${pollMd?.price_change_5m ?? "?"}% vol5m=$${pollMd?.volume_5m ?? "?"}`);
           }
@@ -1941,6 +1946,65 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
         sells != null && buys != null && (sells + buys) >= minTxns7 && sells > buys * effectiveSellRatio7
       ) {
         return { action: "CLOSE", rule: 7, reason: `volume collapse (sells>${effectiveSellRatio7.toFixed(2)}× buys, vol=${r7Vol}×${volMult7.toFixed(2)} depth=${depthPct7.toFixed(0)}% strat=${deployStrategy7})` };
+      }
+    }
+  }
+
+  // Rule 11: liquidity collapse — pool liquidity pulled sharply (classic rug signature).
+  // Unlike Rule 7, does NOT require sell-pressure confirmation: a genuine LP pull can happen
+  // via direct liquidity removal with near-zero swap activity, so requiring buys/sells would
+  // blind us to exactly the fastest, most dangerous rugs. A sharp drop from the recent peak is
+  // sufficient on its own. Skip conditions mirror Rule 7/8/9 (OOR ABOVE, in-range and green,
+  // entry accumulation grace).
+  if (marketData) {
+    const lcCfg = config.emergencyExits.liquidityCollapse;
+    if (lcCfg?.enabled) {
+      const lc11tracked = getTrackedPosition(position.position);
+      const ageMin11 = position.age_minutes ?? 0;
+      const liqHist11 = Array.isArray(lc11tracked?.liquidity_history) ? lc11tracked.liquidity_history : [];
+      const recentLiq11 = liqHist11.map((v) => v?.liquidity_usd).filter((v) => v != null);
+      const peakLiq11 = recentLiq11.length >= 3
+        ? Math.max(...recentLiq11)
+        : (lc11tracked?.peak_liquidity_usd ?? 0);
+      const curLiq11 = marketData.liquidity_usd;
+      const oorDir11 = getOorDirection(position);
+      const inRangeAndGreen11 = position.in_range !== false && (position.pnl_pct ?? 0) >= 0;
+
+      const binsKnown11 = position.active_bin != null && position.upper_bin != null && position.lower_bin != null;
+      const rangeTotal11 = binsKnown11 ? (position.upper_bin - position.lower_bin) : 0;
+      const depthPct11 = binsKnown11 && rangeTotal11 > 0
+        ? ((position.upper_bin - position.active_bin) / rangeTotal11) * 100
+        : 0;
+      const deployStrategy11 = (lc11tracked?.strategy ?? config.strategy.strategy ?? "curve").toLowerCase();
+      const graceDepth11 = deployStrategy11 === "bid_ask"
+        ? (managementConfig.bidAskEntryGraceDepthPct ?? 80)
+        : (managementConfig.curveEntryGraceDepthPct ?? 50);
+      const confirmMs11 = (managementConfig.entryGraceConfirmMinutes ?? 15) * 60_000;
+      const graceExitedAt11 = lc11tracked?.r9_grace_exited_at;
+      const inEntryAccumulation11 =
+        !binsKnown11 ||
+        (position.in_range !== false && (
+          depthPct11 < graceDepth11 ||
+          graceExitedAt11 == null ||
+          (Date.now() - new Date(graceExitedAt11).getTime()) < confirmMs11
+        ));
+
+      if (inEntryAccumulation11) {
+        const why11 = !binsKnown11
+          ? "bin data unavailable (fail-safe)"
+          : `depth=${depthPct11.toFixed(1)}% < ${graceDepth11}% or confirm pending`;
+        log("market_data", `Rule 11 skipped for ${position.pair}: entry grace active (${why11}, strategy=${deployStrategy11})`);
+      }
+
+      if (
+        oorDir11 !== "ABOVE" &&
+        !inRangeAndGreen11 &&
+        !inEntryAccumulation11 &&
+        ageMin11 >= (lcCfg.minPositionAgeMin ?? 5) &&
+        peakLiq11 >= (lcCfg.minPeakLiquidityUsd ?? 1000) &&
+        curLiq11 != null && curLiq11 < peakLiq11 * (lcCfg.dropThresholdPct / 100)
+      ) {
+        return { action: "CLOSE", rule: 11, reason: `liquidity collapse ($${curLiq11.toFixed(0)} < ${lcCfg.dropThresholdPct}% of peak $${peakLiq11.toFixed(0)}, depth=${depthPct11.toFixed(0)}% strat=${deployStrategy11})` };
       }
     }
   }

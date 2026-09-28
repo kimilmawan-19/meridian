@@ -229,6 +229,17 @@ export const config = {
       sellPressureRatio:  u.emergencyExits?.volumeCollapse?.sellPressureRatio  ?? 2,
       minSellConfirmTxns: u.emergencyExits?.volumeCollapse?.minSellConfirmTxns ?? 5,   // min total txns before sell/buy ratio is trusted
     },
+    // Rule 11: liquidity collapse — pool liquidity pulled sharply (classic rug signature).
+    // Unlike volumeCollapse, does NOT require sell-pressure confirmation: a genuine LP pull
+    // can happen with near-zero swap activity, so requiring buys/sells would blind us to
+    // exactly the fastest, most dangerous rugs (e.g. e/acc-SOL -26.95%, ~19pt overshoot past
+    // its auto-SL tier — a violent dump no threshold recalibration alone would have caught).
+    liquidityCollapse: {
+      enabled:            u.emergencyExits?.liquidityCollapse?.enabled            ?? true,
+      dropThresholdPct:   u.emergencyExits?.liquidityCollapse?.dropThresholdPct   ?? 40,   // trigger when current liquidity < this % of recent peak
+      minPositionAgeMin:  u.emergencyExits?.liquidityCollapse?.minPositionAgeMin  ?? 5,    // shorter than volumeCollapse — LP pulls can happen fast
+      minPeakLiquidityUsd: u.emergencyExits?.liquidityCollapse?.minPeakLiquidityUsd ?? 1000, // avoid triggering on dust pools with naturally noisy liquidity
+    },
     rapidPriceDrop: {
       enabled:               u.emergencyExits?.rapidPriceDrop?.enabled               ?? true,
       dropPct5m:             u.emergencyExits?.rapidPriceDrop?.dropPct5m             ?? -8,
