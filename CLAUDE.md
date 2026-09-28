@@ -126,6 +126,8 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 | marketRegime.cautionPositionSizeMult | marketRegime | 0.75 |
 | marketRegime.bearishScoreThreshold | marketRegime | 3.7 |
 | marketRegime.cautionScoreThreshold | marketRegime | 1.8 |
+| marketRegime.cautionMinTokenAgeHours | marketRegime | 72 |
+| marketRegime.cautionMinMcapMult | marketRegime | 2 |
 | marketRegimeCautionSlMult | management | 0.85 |
 | marketRegimeBearishSlMult | management | 0.7 |
 | marketRegimeCautionTrailMult | management | 0.8 |
@@ -375,6 +377,8 @@ When `marketRegime.enabled=true` (default), the screener checks regime before ea
 - **bearish** (score ≥ 3.7): screening skipped entirely
 
 Caution threshold elevation is stored in `_cautionOrigFeeRatio`/`_cautionOrigOrganic` before modification and restored in the `finally` block to prevent compounding across cycles.
+
+**Maturity bias (caution only):** the same elevation block also raises `minTokenAgeHours` to `marketRegime.cautionMinTokenAgeHours` (default 72h, via `Math.max` with the existing value — never loosens a stricter user setting) and `minMcap` by `marketRegime.cautionMinMcapMult` (default 2×). Intent: when the broad market is under stress, prefer tokens that have survived past the newest/most dump-prone phase and have more established liquidity, so fee-earning is less likely to get erased by price drop — **without** leaving the bot's memecoin/trending universe. Shifting to true blue-chip majors was considered and rejected: this bot's edge (`fee_active_tvl_ratio`/organic screening on volatile pools) doesn't transfer to efficient blue-chip markets, where fee/TVL is much thinner — it would likely make the low-fee-day problem worse, not better. Saved into `_cautionOrigMinTokenAgeHours`/`_cautionOrigMinMcap` and restored in the same `finally` block; these use `undefined` as the "was raised this cycle" sentinel (not `!= null`) since `minTokenAgeHours` legitimately defaults to `null`, and a `!= null` restore check would skip restoring it back to `null`.
 
 The assessed regime is also written to runtime `config.marketRegime._activeRegime` (set right after `assessMarketRegime`, or forced to `"healthy"` when `marketRegime.enabled=false`). This is the **only** channel `computeDeployAmount` (config.js) and the deploy guard (executor.js) use to apply caution size modulation — they don't import `_lastRegime`. `deployAmount` is computed **after** the regime block in `runScreeningCycle` so the current cycle's regime modulates size; the executor guard reads the same value, keeping prompt and guard consistent (15% tolerance absorbs position-value drift).
 

@@ -114,6 +114,10 @@ const _pollTriggeredAt = new Map(); // position_address → epoch ms; per-positi
 let _cachedSolPrice = null; // updated each management cycle, reused by PnL poll for Rule 6 grace check
 let _cautionOrigFeeRatio = null; // saved before caution raise, restored in screening cycle finally
 let _cautionOrigOrganic  = null;
+// undefined = not currently raised this cycle (the sentinel, since the underlying config
+// value can itself legitimately be null — minTokenAgeHours defaults to null/"no minimum").
+let _cautionOrigMinTokenAgeHours;
+let _cautionOrigMinMcap;
 let _lastRegime = "healthy"; // most recent market regime assessment — drives caution screening slowdown
 const _peakConfirmTimers = new Map();
 const _trailingDropConfirmTimers = new Map();
@@ -890,7 +894,18 @@ export async function runScreeningCycle({ silent = false } = {}) {
         _cautionOrigOrganic  = config.screening.minOrganic;
         config.screening.minFeeActiveTvlRatio = +(_cautionOrigFeeRatio * 1.4).toFixed(4);
         config.screening.minOrganic = Math.min(85, _cautionOrigOrganic + 10);
-        log("market_regime", `Caution regime — quality bar raised for this cycle (minFeeActiveTvlRatio=${config.screening.minFeeActiveTvlRatio} minOrganic=${config.screening.minOrganic}), capacity ${prePositions.total_positions}/${cautionCap}`);
+        // Maturity bias: during caution, prefer tokens that have survived past the newest,
+        // most dump-prone phase (age floor) and have more established liquidity (mcap floor).
+        // Math.max with the existing value means this only ever raises the bar, never loosens
+        // a stricter user-set floor. Restored in the finally block same as the two above —
+        // without restore, repeated caution cycles would compound indefinitely.
+        _cautionOrigMinTokenAgeHours = config.screening.minTokenAgeHours;
+        _cautionOrigMinMcap = config.screening.minMcap;
+        const ageFloor = config.marketRegime.cautionMinTokenAgeHours ?? 72;
+        config.screening.minTokenAgeHours = Math.max(config.screening.minTokenAgeHours ?? 0, ageFloor);
+        const mcapMult = config.marketRegime.cautionMinMcapMult ?? 2;
+        config.screening.minMcap = Math.max(config.screening.minMcap, config.screening.minMcap * mcapMult);
+        log("market_regime", `Caution regime — quality bar raised for this cycle (minFeeActiveTvlRatio=${config.screening.minFeeActiveTvlRatio} minOrganic=${config.screening.minOrganic} minTokenAgeHours=${config.screening.minTokenAgeHours} minMcap=${config.screening.minMcap}), capacity ${prePositions.total_positions}/${cautionCap}`);
       }
     } else {
       config.marketRegime._activeRegime = "healthy"; // regime detection off — never modulate deploy size
@@ -1407,6 +1422,14 @@ IMPORTANT:
     if (_cautionOrigOrganic != null) {
       config.screening.minOrganic = _cautionOrigOrganic;
       _cautionOrigOrganic = null;
+    }
+    if (_cautionOrigMinTokenAgeHours !== undefined) {
+      config.screening.minTokenAgeHours = _cautionOrigMinTokenAgeHours;
+      _cautionOrigMinTokenAgeHours = undefined;
+    }
+    if (_cautionOrigMinMcap !== undefined) {
+      config.screening.minMcap = _cautionOrigMinMcap;
+      _cautionOrigMinMcap = undefined;
     }
     _screeningBusy = false;
     if (!silent && telegramEnabled()) {
