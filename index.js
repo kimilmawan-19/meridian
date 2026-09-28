@@ -643,10 +643,34 @@ export async function runManagementCycle({ silent = false } = {}) {
     mgmtReport = reportLines.join("\n\n") +
       `\n\nSummary: 💼 ${positions.length} positions | ${cur}${totalValue.toFixed(4)} | fees: ${cur}${totalUnclaimed.toFixed(4)} | ${actionSummary}`;
 
-    // ── Call LLM only if action needed ──────────────────────────────
+    // ── Execute deterministic closes directly (no LLM round-trip) ────
+    // Routing CLOSE through the LLM agent loop (up to 5m timeout + fallback retry, then a
+    // 10m poll cooldown on failure) let break-even decisions slide to stop-loss: live data
+    // showed positions flagged for close up to 11 times still ending at -10%+.
+    const directCloseLines = [];
+    for (const p of positionData) {
+      const act = actionMap.get(p.position);
+      if (act?.action !== "CLOSE") continue;
+      const reason = act.rule === "exit" ? act.reason : `Rule ${act.rule}: ${act.reason}`;
+      try {
+        const res = await executeTool("close_position", { position_address: p.position, reason });
+        if (!res || res.error || res.blocked || res.success === false) {
+          throw new Error(res?.error || res?.reason || "close failed");
+        }
+        directCloseLines.push(`${p.pair}: closed — ${reason}`);
+      } catch (e) {
+        // Let the 30s poll retry this position right away instead of waiting out its cooldown.
+        _pollTriggeredAt.delete(p.position);
+        log("cron_error", `Direct close failed for ${p.pair}: ${e.message}`);
+        directCloseLines.push(`${p.pair}: close FAILED (${e.message}) — will retry`);
+      }
+    }
+    if (directCloseLines.length > 0) mgmtReport += `\n\n${directCloseLines.join("\n")}`;
+
+    // ── Call LLM only for judgment calls (TP_PROPOSAL / INSTRUCTION / CLAIM) ──
     const actionPositions = positionData.filter(p => {
       const a = actionMap.get(p.position);
-      return a.action !== "STAY";
+      return a.action !== "STAY" && a.action !== "CLOSE";
     });
 
     if (actionPositions.length > 0) {
@@ -720,7 +744,7 @@ After executing, write a brief one-line result per position.
 
       mgmtReport += `\n\n${content}`;
     } else {
-      log("cron", "Management: all positions STAY — skipping LLM");
+      log("cron", "Management: no judgment calls needed — skipping LLM");
       await liveMessage?.note("No tool actions needed.");
     }
 
@@ -1489,7 +1513,9 @@ Summarize the current portfolio health, total fees earned, and performance of al
   // Lightweight 30s PnL poller — updates trailing TP state between management cycles, no LLM
   let _pnlPollBusy = false;
   const pnlPollInterval = setInterval(async () => {
-    if (_managementBusy || _screeningBusy || _pnlPollBusy) return;
+    // Not gated on _screeningBusy: screening is a multi-minute LLM loop, and pausing the poll
+    // for it left open positions unwatched (the cron management cycle already runs alongside it).
+    if (_managementBusy || _pnlPollBusy) return;
     if (getTrackedPositions(true).length === 0) return;
     _pnlPollBusy = true;
     try {

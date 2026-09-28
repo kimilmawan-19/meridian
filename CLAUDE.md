@@ -259,6 +259,24 @@ emergency-close condition before the next scheduled cycle. The trigger cooldown 
 This was added to cut left-tail in-range-dump overshoot: multiple positions dumping in the same
 10-minute window previously had only the first one exit promptly.
 
+The poll is **not** paused while screening runs (only while management or a previous poll tick
+is busy). Screening is a multi-minute LLM loop; pausing for it left open positions unwatched.
+
+## Direct Deterministic Closes (index.js `runManagementCycle`)
+
+Every `CLOSE` action in `actionMap` (Rules 1–11, state.js exits, forced trailing TP) is executed
+directly via `executeTool("close_position", { position_address, reason })` — the same path the
+LLM used, so notifications, auto-swap and `recordPerformance` still run. The LLM is called only
+for judgment calls: `TP_PROPOSAL`, `INSTRUCTION`, `CLAIM`. On a failed close the position's
+`_pollTriggeredAt` entry is cleared so the 30s poll retries immediately.
+
+Why: live data (last 30d) had 45 stop-loss closes on positions that had peaked ≥1% (break-even
+armed). 13 of them had break-even close decisions in the logs (one was flagged 11 times) and
+still ended at −10.7% on average — the decision was made, but execution waited on the LLM loop
+(5m timeout + fallback retry, then a 10m poll cooldown). Close reasons are now the rule's own
+text (e.g. `Rule 1: break-even stop`) instead of LLM free text, which also fixes mislabeled
+closes (7 of those 45 "stop loss" closes actually ended in profit).
+
 ---
 
 ## Capacity-Aware Screening Cadence (index.js)

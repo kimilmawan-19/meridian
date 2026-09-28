@@ -27,6 +27,7 @@
     "test:security-hardening": "node test/test-security-hardening.mjs",
     "test:fee-revenue": "node test/test-fee-revenue.mjs",
     "test:trailing-floor": "node test/test-trailing-floor.mjs",
+    "test:direct-close": "node test/test-direct-close.mjs",
     "test:agent": "DRY_RUN=true node test/test-agent.js",
     "postinstall": "node scripts/patch-anchor.js"
   },
