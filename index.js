@@ -5,7 +5,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { agentLoop } from "./agent.js";
 import { log } from "./logger.js";
-import { getMyPositions, closePosition, getActiveBin } from "./tools/dlmm.js";
+import { getMyPositions, getActiveBin } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates, fetchPoolVolatility } from "./tools/screening.js";
 import { assessMarketRegime } from "./market-regime.js";
@@ -110,6 +110,8 @@ let _managementBusy = false; // prevents overlapping management cycles
 let _screeningBusy = false;  // prevents overlapping screening cycles
 let _screeningLastTriggered = 0; // epoch ms — prevents management from spamming screening
 let _noDeployStreak = 0; // consecutive screening cycles that ended without a deploy — drives backoff
+let _entriesPaused = false; // Telegram /pause: skip screening (no new deploys); management + poll keep running
+const _oorNotified = new Set(); // positions already alerted for the current out-of-range episode
 const _pollTriggeredAt = new Map(); // position_address → epoch ms; per-position poll-trigger cooldown (a dump on one position no longer blocks exits on others)
 let _cachedSolPrice = null; // updated each management cycle, reused by PnL poll for Rule 6 grace check
 let _cautionOrigFeeRatio = null; // saved before caution raise, restored in screening cycle finally
@@ -271,12 +273,13 @@ export async function runManagementCycle({ silent = false } = {}) {
   let mgmtReport = null;
   let positions = [];
   let liveMessage = null;
+  let mgmtFailed = false;
+  let stillOpen = null; // Set of position addresses open after this cycle's actions
   const emergencyExits = [];
 
   try {
-    if (!silent && telegramEnabled()) {
-      liveMessage = await createLiveMessage("🔄 Management Cycle", "Evaluating positions...");
-    }
+    // No Telegram message up front: idle cycles (all STAY) stay silent. The live message is
+    // created only once there is something to act on (see below), or a failure is reported.
     const livePositions = await getMyPositions({ force: true }).catch(() => null);
     positions = livePositions?.positions || [];
 
@@ -643,6 +646,10 @@ export async function runManagementCycle({ silent = false } = {}) {
     mgmtReport = reportLines.join("\n\n") +
       `\n\nSummary: 💼 ${positions.length} positions | ${cur}${totalValue.toFixed(4)} | fees: ${cur}${totalUnclaimed.toFixed(4)} | ${actionSummary}`;
 
+    if (needsAction.length > 0 && !silent && telegramEnabled()) {
+      liveMessage = await createLiveMessage("🔄 Management Cycle", "Executing actions...");
+    }
+
     // ── Execute deterministic closes directly (no LLM round-trip) ────
     // Routing CLOSE through the LLM agent loop (up to 5m timeout + fallback retry, then a
     // 10m poll cooldown on failure) let break-even decisions slide to stop-loss: live data
@@ -751,6 +758,7 @@ After executing, write a brief one-line result per position.
     // Trigger screening after management
     const afterPositions = await getMyPositions({ force: true }).catch(() => null);
     const afterCount = afterPositions?.positions?.length ?? 0;
+    if (afterPositions?.positions) stillOpen = new Set(afterPositions.positions.map((p) => p.position));
 
     // Layer A: reconcile trailing-TP proposals — any still-open proposal means the LLM
     // chose to HOLD, so spend a veto. Closed ones were taken (no veto, position is gone).
@@ -758,8 +766,7 @@ After executing, write a brief one-line result per position.
     // design — that is an exit decision, not a hold, and markPartialExit already reset the
     // veto budget. Detect it via a fresh partial_taken_at timestamp and skip the veto.
     const tpProposals = [...actionMap.entries()].filter(([, a]) => a.action === "TP_PROPOSAL");
-    if (tpProposals.length > 0) {
-      const stillOpen = new Set((afterPositions?.positions ?? []).map((p) => p.position));
+    if (tpProposals.length > 0 && stillOpen) {
       const cycleStartMs = Date.now() - 5 * 60 * 1000; // partial counts as "this cycle" if within 5m
       for (const [addr, act] of tpProposals) {
         if (!stillOpen.has(addr)) continue;
@@ -781,20 +788,20 @@ After executing, write a brief one-line result per position.
   } catch (error) {
     log("cron_error", `Management cycle failed: ${error.message}`);
     mgmtReport = `Management cycle failed: ${error.message}`;
+    mgmtFailed = true;
   } finally {
     _managementBusy = false;
     if (!silent && telegramEnabled()) {
-      if (mgmtReport) {
+      // Report only cycles where something happened (actions ran or the cycle failed).
+      if (mgmtReport && (liveMessage || mgmtFailed)) {
         if (liveMessage) await liveMessage.finalize(stripThink(mgmtReport)).catch(() => { });
         else sendMessage(`🔄 Management Cycle\n\n${stripThink(mgmtReport)}`).catch(() => { });
       }
       for (const exit of emergencyExits) {
         notifyEmergencyExit(exit).catch(() => { });
       }
-      for (const p of positions) {
-        if (!p.in_range && p.minutes_out_of_range >= config.management.outOfRangeWaitMinutes) {
-          notifyOutOfRange({ pair: p.pair, minutesOOR: p.minutes_out_of_range, direction: getOorDirection(p) }).catch(() => { });
-        }
+      for (const p of collectOorAlerts(positions, stillOpen, config.management.outOfRangeWaitMinutes, _oorNotified)) {
+        notifyOutOfRange({ pair: p.pair, minutesOOR: p.minutes_out_of_range, direction: getOorDirection(p) }).catch(() => { });
       }
     }
     drainTelegramQueue().catch(() => { });
@@ -802,7 +809,30 @@ After executing, write a brief one-line result per position.
   return mgmtReport;
 }
 
+// OOR alerts fire once per out-of-range episode (they used to repeat every management cycle,
+// including for positions closed in that same cycle). `notified` is mutated: a position is
+// re-armed when it comes back in range or is closed. openSet=null (fetch failed) → assume open.
+function collectOorAlerts(positions, openSet, waitMin, notified) {
+  const alerts = [];
+  const seen = new Set();
+  for (const p of positions) {
+    seen.add(p.position);
+    const open = !openSet || openSet.has(p.position);
+    if (!open || p.in_range) { notified.delete(p.position); continue; }
+    if (p.minutes_out_of_range >= waitMin && !notified.has(p.position)) {
+      notified.add(p.position);
+      alerts.push(p);
+    }
+  }
+  for (const addr of notified) if (!seen.has(addr)) notified.delete(addr);
+  return alerts;
+}
+
 export async function runScreeningCycle({ silent = false } = {}) {
+  if (_entriesPaused) {
+    log("cron", "Screening skipped — deploys paused via /pause");
+    return null;
+  }
   if (_screeningBusy) {
     log("cron", "Screening skipped — previous cycle still running");
     return null;
@@ -812,8 +842,9 @@ export async function runScreeningCycle({ silent = false } = {}) {
 
   // Hard guards — don't even run the agent if preconditions aren't met
   let prePositions, preBalance;
-  let liveMessage = null;
   let screenReport = null;
+  let screenFailed = false;
+  let deployAttempted = false; // function scope: the finally block reports only cycles that tried to deploy
   try {
     [prePositions, preBalance] = await Promise.all([getMyPositions({ force: true }), getWalletBalances()]);
     if (prePositions.total_positions >= config.risk.maxPositions) {
@@ -851,9 +882,8 @@ export async function runScreeningCycle({ silent = false } = {}) {
     _screeningBusy = false;
     return screenReport;
   }
-  if (!silent && telegramEnabled()) {
-    liveMessage = await createLiveMessage("🔍 Screening Cycle", "Scanning candidates...");
-  }
+  // No live Telegram message: a screening cycle that ends in NO DEPLOY is silent (it used to post
+  // every cycle). Deploys still notify via notifyDeploy; the report follows only if a deploy was tried.
   timers.screeningLastRun = Date.now();
   log("cron", `Starting screening cycle [model: ${config.llm.screeningModel}]`);
   try {
@@ -1331,7 +1361,6 @@ export async function runScreeningCycle({ silent = false } = {}) {
 
     const weightsSummary = config.darwin?.enabled ? getWeightsSummary() : null;
 
-    let deployAttempted = false;
     let deploySucceeded = false;
     const { content } = await agentLoop(`
 SCREENING CYCLE
@@ -1404,14 +1433,12 @@ IMPORTANT:
       `, config.llm.maxSteps, [], "SCREENER", config.llm.screeningModel, 4096, {
       onToolStart: async ({ name }) => {
         if (name === "deploy_position") deployAttempted = true;
-        await liveMessage?.toolStart(name);
       },
       onToolFinish: async ({ name, result, success }) => {
         if (name === "deploy_position") {
           deployAttempted = true;
           deploySucceeded = Boolean(success && result?.success !== false && !result?.error && !result?.blocked);
         }
-        await liveMessage?.toolFinish(name, result, success);
       },
     });
     screenReport = content;
@@ -1442,6 +1469,7 @@ IMPORTANT:
   } catch (error) {
     log("cron_error", `Screening cycle failed: ${error.message}`);
     screenReport = `Screening cycle failed: ${error.message}`;
+    screenFailed = true;
   } finally {
     // Restore caution-raised thresholds so they don't compound across cycles
     if (_cautionOrigFeeRatio != null) {
@@ -1462,9 +1490,8 @@ IMPORTANT:
     }
     _screeningBusy = false;
     if (!silent && telegramEnabled()) {
-      if (screenReport) {
-        if (liveMessage) await liveMessage.finalize(stripThink(screenReport)).catch(() => { });
-        else sendMessage(`🔍 Screening Cycle\n\n${stripThink(screenReport)}`).catch(() => { });
+      if (screenReport && (deployAttempted || screenFailed)) {
+        sendMessage(`🔍 Screening Cycle\n\n${stripThink(screenReport)}`).catch(() => { });
       }
     }
     drainTelegramQueue().catch(() => { });
@@ -2521,7 +2548,7 @@ function formatHelpText() {
     "/positions — list open positions",
     "/pool <n> — detailed info for one open position",
     "/close <n> — close one position by index",
-    "/closeall — close all open positions",
+    "/closeall confirm — close all open positions",
     "/set <n> <note> — set note/instruction on position",
     "/config — show important runtime config",
     "/settings — button menu for common config",
@@ -2536,12 +2563,15 @@ function formatHelpText() {
     "/learn [pool] — study top LPers (specific pool or top candidates)",
     "/hive — HiveMind sync status",
     "/hive pull — manual HiveMind pull now",
-    "/test-emergency-exit <n> — simulate emergency exit check for position n (dry run, no close)",
-    "/test-pnl-poll <n> — simulate 30s PnL poll for position n including Rules 7 & 8",
-    "/pause — stop cron cycles",
-    "/resume — start cron cycles again",
-    "/stop — shut down agent",
+    "/check <n> — simulate exit checks for position n (trailing/SL + Rules 1-11, no close)",
+    "/pause — stop new deploys (open positions are still managed)",
+    "/resume — resume deploys",
   ].join("\n");
+}
+
+// Same failure predicate as the management direct-close loop.
+function manualCloseFailed(res) {
+  return !res || !!res.error || !!res.blocked || res.success === false;
 }
 
 async function runDeterministicScreen(limit = 5) {
@@ -2740,42 +2770,9 @@ async function telegramHandler(msg) {
     return;
   }
 
-  const emergencyTestMatch = text.match(/^\/test-emergency-exit\s+(\d+)$/i);
-  if (emergencyTestMatch) {
-    try {
-      const idx = parseInt(emergencyTestMatch[1]) - 1;
-      const { positions } = await getMyPositions({ force: true });
-      if (idx < 0 || idx >= positions.length) { await sendMessage("Invalid number. Use /positions first."); return; }
-      const pos = positions[idx];
-      const md = await fetchPoolMarketData(pos.pool);
-      if (!md) { await sendMessage(`⚠️ DexScreener returned no data for ${pos.pair} (${pos.pool.slice(0, 8)})`); return; }
-      const tracked = getTrackedPosition(pos.position);
-      const rule = getDeterministicCloseRule(pos, config.management, md, [], null, config.marketRegime?._activeRegime ?? "healthy");
-      const cur = config.management.solMode ? "◎" : "$";
-      const lines = [
-        `🧪 Emergency Exit Simulation: ${pos.pair}`,
-        ``,
-        `Market Data (DexScreener):`,
-        `  vol_5m: ${cur}${md.volume_5m ?? "?"}`,
-        `  price_5m: ${md.price_change_5m != null ? `${md.price_change_5m > 0 ? "+" : ""}${md.price_change_5m}%` : "?"}`,
-        `  buys/sells (5m): ${md.txn_buys_5m ?? "?"}/${md.txn_sells_5m ?? "?"}`,
-        `  liquidity: ${cur}${md.liquidity_usd ?? "?"}`,
-        ``,
-        `Position State:`,
-        `  peak_vol_5m: ${cur}${tracked?.peak_volume_5m_usd ?? "none (first cycle)"}`,
-        `  age: ${pos.age_minutes ?? "?"}m`,
-        `  pnl: ${pos.pnl_pct ?? "?"}%`,
-        ``,
-        rule ? `🔴 WOULD CLOSE — Rule ${rule.rule}: ${rule.reason}` : `🟢 No emergency exit triggered`,
-      ];
-      await sendMessage(lines.join("\n"));
-    } catch (e) {
-      await sendMessage(`Error: ${e.message}`).catch(() => { });
-    }
-    return;
-  }
-
-  const pnlPollTestMatch = text.match(/^\/test-pnl-poll\s+(\d+)$/i);
+  // /check <n>: one simulation for all exit checks. Old names kept as silent aliases
+  // (/test-emergency-exit was a subset of this — Rules 7/8 run inside getDeterministicCloseRule).
+  const pnlPollTestMatch = text.match(/^\/(?:check|test-pnl-poll|test-emergency-exit)\s+(\d+)$/i);
   if (pnlPollTestMatch) {
     try {
       const idx = parseInt(pnlPollTestMatch[1]) - 1;
@@ -2834,28 +2831,35 @@ async function telegramHandler(msg) {
       if (idx < 0 || idx >= positions.length) { await sendMessage("Invalid number. Use /positions first."); return; }
       const pos = positions[idx];
       await sendMessage(`Closing ${pos.pair}...`);
-      const result = await closePosition({ position_address: pos.position });
-      if (result.success) {
+      // Same path as the agent (executeTool) so auto-swap to SOL, close notification and a real
+      // close reason all apply — calling closePosition() directly skipped all three.
+      const result = await executeTool("close_position", { position_address: pos.position, reason: "manual close (Telegram /close)" });
+      if (!manualCloseFailed(result)) {
         const closeTxs = result.close_txs?.length ? result.close_txs : result.txs;
-        const claimNote = result.claim_txs?.length ? `\nClaim txs: ${result.claim_txs.join(", ")}` : "";
-        await sendMessage(`✅ Closed ${pos.pair}\nPnL: ${config.management.solMode ? "◎" : "$"}${result.pnl_usd ?? "?"} | close txs: ${closeTxs?.join(", ") || "n/a"}${claimNote}`);
+        const swapNote = result.auto_swap_failed ? "\n⚠️ Auto-swap to SOL failed — token still in wallet" : result.auto_swapped ? "\nToken swapped back to SOL" : "";
+        await sendMessage(`✅ Closed ${pos.pair} | close txs: ${closeTxs?.join(", ") || "n/a"}${swapNote}`);
       } else {
-        await sendMessage(`❌ Close failed: ${JSON.stringify(result)}`);
+        await sendMessage(`❌ Close failed: ${result?.error || result?.reason || JSON.stringify(result)}`);
       }
     } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => { }); }
     return;
   }
 
-  if (text === "/closeall") {
+  const closeAllMatch = text.match(/^\/closeall(\s+confirm)?$/i);
+  if (closeAllMatch) {
     try {
       const { positions } = await getMyPositions({ force: true });
       if (!positions.length) { await sendMessage("No open positions."); return; }
+      if (!closeAllMatch[1]) {
+        await sendMessage(`Ketik /closeall confirm untuk menutup ${positions.length} posisi.`);
+        return;
+      }
       await sendMessage(`Closing ${positions.length} position(s)...`);
       const results = [];
       for (const pos of positions) {
         try {
-          const result = await closePosition({ position_address: pos.position });
-          results.push(`${pos.pair}: ${result.success ? "closed" : `failed (${result.error || "unknown"})`}`);
+          const result = await executeTool("close_position", { position_address: pos.position, reason: "manual close (Telegram /closeall)" });
+          results.push(`${pos.pair}: ${!manualCloseFailed(result) ? "closed" : `failed (${result?.error || result?.reason || "unknown"})`}`);
         } catch (error) {
           results.push(`${pos.pair}: failed (${error.message})`);
         }
@@ -2937,14 +2941,17 @@ async function telegramHandler(msg) {
     return;
   }
 
+  // /pause stops new entries only. It used to stop every cron job including the 30s PnL poll,
+  // which left open positions with no stop-loss / trailing / emergency exits while paused.
   if (text === "/pause") {
-    stopCronJobs();
-    cronStarted = false;
-    await sendMessage("⏸ Paused autonomous cycles. Telegram control still works. Use /resume to start again.").catch(() => { });
+    _entriesPaused = true;
+    await sendMessage("⏸ New deploys paused. Open positions are still managed (SL, trailing, exits). Use /resume to deploy again.").catch(() => { });
     return;
   }
 
   if (text === "/resume") {
+    const wasPaused = _entriesPaused;
+    _entriesPaused = false;
     if (!cronStarted) {
       cronStarted = true;
       timers.managementLastRun = Date.now();
@@ -2952,7 +2959,7 @@ async function telegramHandler(msg) {
       startCronJobs();
       await sendMessage("▶️ Autonomous cycles resumed.").catch(() => { });
     } else {
-      await sendMessage("Autonomous cycles are already running.").catch(() => { });
+      await sendMessage(wasPaused ? "▶️ Deploys resumed." : "Autonomous cycles are already running.").catch(() => { });
     }
     return;
   }
@@ -3113,6 +3120,12 @@ async function telegramHandler(msg) {
       }
     }
     await sendMessage(lines.join("\n")).catch(() => { });
+    return;
+  }
+
+  // Unmatched slash commands (typos, /stop, removed commands) must not start an LLM loop.
+  if (text.startsWith("/")) {
+    await sendMessage(`Unknown command: ${text.split(/\s+/)[0]} — see /help`).catch(() => { });
     return;
   }
 

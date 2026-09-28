@@ -508,6 +508,16 @@ export async function notifyEmergencyExit({ pair, reason, volume5m, peakVolume5m
   );
 }
 
+// Not suppressed by an active live message: a failed swap leaves the base token in the wallet,
+// so the next deploy sizes down (or fails minSolToOpen) until it is swapped manually.
+export async function notifyAutoSwapFailed({ pair, mint, error }) {
+  await sendHTML(
+    `⚠️ <b>Auto-swap gagal</b> ${pair ?? ""}\n` +
+    `Token <code>${String(mint ?? "?").slice(0, 8)}...</code> masih di wallet — deploy berikutnya bisa undersized.\n` +
+    `Error: ${String(error ?? "unknown").replace(/[<>&]/g, "").slice(0, 200)}`
+  );
+}
+
 export async function notifyOutOfRange({ pair, minutesOOR, direction = null }) {
   if (hasActiveLiveMessage()) return;
   const dirLabel = direction === "ABOVE"

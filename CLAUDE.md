@@ -229,9 +229,22 @@ Handled directly in `index.js` (bypass LLM):
 |---------|--------|
 | `/positions` | List open positions with progress bar |
 | `/close <n>` | Close position by list index |
+| `/closeall confirm` | Close all positions (bare `/closeall` only asks for confirmation) |
 | `/set <n> <note>` | Set note on position by list index |
+| `/check <n>` | Simulate exit checks for position n (aliases: `/test-pnl-poll`, `/test-emergency-exit`) |
+| `/pause` / `/resume` | Stop / resume **new deploys** only |
+
+Full list: `formatHelpText()` in index.js.
 
 Progress bar format: `[████████░░░░░░░░░░░░] 40%` (no bin numbers, no arrows)
+
+**Behavior rules:**
+- `/close` and `/closeall` go through `executeTool("close_position", { reason: "manual close (Telegram …)" })`, the same path as the agent. They used to call `closePosition()` directly, which skipped the auto-swap to SOL, the close notification and `logAction`, and recorded the close reason as "agent decision".
+- `/pause` sets `_entriesPaused`, which makes `runScreeningCycle` return immediately. Management, the 30s PnL poll and manual `/deploy` keep running. It used to call `stopCronJobs()`, which also stopped the poll and left open positions with no SL/trailing/emergency exits. The flag is in-memory, so a restart resumes deploys.
+- An unmatched `/…` command replies "Unknown command" instead of falling through to the LLM agent loop. This includes `/stop`: shutdown is server-side only.
+- **Event-only cycle reports.** The management report is sent only when a cycle had a non-STAY action; the live message is created lazily right before execution. The screening report is sent only when a deploy was attempted. Both are also sent when the cycle failed. Idle cycles are silent; they used to post roughly 150–300 messages a day. A position with a `/set` note is an INSTRUCTION every cycle, so it still reports each cycle.
+- **OOR alerts fire once per out-of-range episode** (`collectOorAlerts`, `_oorNotified`). A position is re-armed when it returns in range. Positions closed in the same cycle are skipped.
+- **Auto-swap after close or partial close.** `swapToken` returns `{ success:false, error }` instead of throwing, so the executor now checks the result. A failure sends `notifyAutoSwapFailed`, which is never suppressed by a live message. Previously a failed swap was marked `auto_swapped: true`, and the failure branch never ran.
 
 ---
 
@@ -448,7 +461,7 @@ Caution threshold elevation is stored in `_cautionOrigFeeRatio`/`_cautionOrigOrg
 
 The assessed regime is also written to runtime `config.marketRegime._activeRegime` (set right after `assessMarketRegime`, or forced to `"healthy"` when `marketRegime.enabled=false`). This is the **only** channel `computeDeployAmount` (config.js) and the deploy guard (executor.js) use to apply caution size modulation — they don't import `_lastRegime`. `deployAmount` is computed **after** the regime block in `runScreeningCycle` so the current cycle's regime modulates size; the executor guard reads the same value, keeping prompt and guard consistent (15% tolerance absorbs position-value drift).
 
-**Live message safety:** the screener wraps its execution in a `try/finally` that calls `liveMessage.finalize()`. All early-returns inside the `try` block must assign `screenReport` before returning — a bare `return "string"` bypasses `finalize()` and leaves `_liveMessageDepth > 0`, which permanently suppresses all Telegram notifications (`notifyClose`, `notifyDeploy`, etc.) until process restart.
+**Live message safety:** the screener no longer opens a live message; its report is a plain `sendMessage` sent only when a deploy was attempted or the cycle failed. The management cycle still opens one, but only once it has actions to execute, and always finalizes it in `finally`. Any new live message must be finalized on every path. An unfinalized one leaves `_liveMessageDepth > 0`, which permanently suppresses all Telegram notifications (`notifyClose`, `notifyDeploy`, etc.) until process restart. All early returns inside the screener `try` block should still assign `screenReport` before returning.
 
 **Regime protection on EXISTING positions (not just new deploys):** previously regime only gated entry (skip screening on bearish, shrink new deploy size on caution) — a position opened during a healthy market kept its original SL/trailing tolerance even if the market turned caution/bearish while it was still open. Four things now also react to `config.marketRegime._activeRegime`:
 - **SL tightening** (`state.js` `effectiveStopLossPct`): the per-position `sl_pct_override` **and** the `stopLossTightestPct` clamp are both scaled by `marketRegimeCautionSlMult` (0.85) / `marketRegimeBearishSlMult` (0.7) — a mid-vol-tier `-12%` SL becomes `-10.2%` in caution, `-8.4%` in bearish. Scaling the clamp too matters for the low-vol tier (`-8%`, equal to the default tightest bound): scaling `raw` alone would have no effect there (`-8×0.7=-5.6` is less negative than the unscaled `-8` clamp and would get pulled straight back to it) — this was the most common overshoot tier in observed data (CATWIF, reptilecoin, febu).

@@ -44,7 +44,7 @@ const TIMEFRAME_MINUTES = {
   "24h": 1440,
 };
 import { log, logAction } from "../logger.js";
-import { notifyDeploy, notifyClose, notifyPartialClose, notifySwap } from "../telegram.js";
+import { notifyDeploy, notifyClose, notifyPartialClose, notifySwap, notifyAutoSwapFailed } from "../telegram.js";
 
 function numberOrNull(value) {
   const n = Number(value);
@@ -727,6 +727,8 @@ export async function executeTool(name, args) {
             if (token && token.usd >= 0.10) {
               log("executor", `Auto-swapping ${token.symbol || result.base_mint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to SOL`);
               const swapResult = await swapToken({ input_mint: result.base_mint, output_mint: "SOL", amount: token.balance });
+              // swapToken reports failure as { success:false, error } rather than throwing.
+              if (!swapResult || swapResult.success === false || swapResult.error) throw new Error(swapResult?.error || "swap returned no result");
               // Tell the model the swap already happened so it doesn't call swap_token again
               result.auto_swapped = true;
               result.auto_swap_note = `Base token already auto-swapped back to SOL (${token.symbol || result.base_mint.slice(0, 8)} → SOL). Do NOT call swap_token again.`;
@@ -737,6 +739,7 @@ export async function executeTool(name, args) {
             // so the next deploy would see an understated SOL balance and size down (or fail
             // minSolToOpen). Tell the agent to recover the SOL with a manual swap.
             log("executor_warn", `Auto-swap after close failed: ${e.message}`);
+            notifyAutoSwapFailed({ pair: result.pool_name || args.position_address?.slice(0, 8), mint: result.base_mint, error: e.message }).catch(() => {});
             result.auto_swapped = false;
             result.auto_swap_failed = true;
             result.auto_swap_note = `Auto-swap of base token (${result.base_mint.slice(0, 8)}) back to SOL FAILED: ${e.message}. The base token is still in the wallet — call swap_token (input_mint=base_mint, output_mint=SOL) to recover SOL before deploying again.`;
@@ -751,12 +754,14 @@ export async function executeTool(name, args) {
             const token = balances.tokens?.find(t => t.mint === result.base_mint);
             if (token && token.usd >= 0.10) {
               log("executor", `Auto-swapping partial scale-out ${token.symbol || result.base_mint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to SOL`);
-              await swapToken({ input_mint: result.base_mint, output_mint: "SOL", amount: token.balance });
+              const swapResult = await swapToken({ input_mint: result.base_mint, output_mint: "SOL", amount: token.balance });
+              if (!swapResult || swapResult.success === false || swapResult.error) throw new Error(swapResult?.error || "swap returned no result");
               result.auto_swapped = true;
               result.auto_swap_note = `Scaled-out base token already auto-swapped back to SOL. Do NOT call swap_token again. The runner (remaining position) is still open with a tightened trailing stop.`;
             }
           } catch (e) {
             log("executor_warn", `Auto-swap after partial close failed: ${e.message}`);
+            notifyAutoSwapFailed({ pair: result.pool_name || args.position_address?.slice(0, 8), mint: result.base_mint, error: e.message }).catch(() => {});
             result.auto_swap_failed = true;
             result.auto_swap_note = `Auto-swap of scaled-out base token FAILED: ${e.message}. Call swap_token (input_mint=base_mint, output_mint=SOL) to recover SOL.`;
           }
