@@ -553,6 +553,7 @@ export function evolveThresholds(perfData, config) {
   userConfig._positionsAtEvolution = perfData.length;
 
   fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify(userConfig, null, 2));
+  try { fs.chmodSync(USER_CONFIG_PATH, 0o600); } catch (_) { /* best-effort on non-POSIX FS */ }
 
   // Apply to live config object immediately
   const s = config.screening;

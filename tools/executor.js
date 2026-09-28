@@ -446,6 +446,8 @@ const toolMap = {
       // risk
       maxPositions: ["risk", "maxPositions"],
       maxDeployAmount: ["risk", "maxDeployAmount"],
+      maxSwapAmount: ["risk", "maxSwapAmount"],
+      swapSlippageBps: ["risk", "swapSlippageBps"],
       // market regime
       cautionMaxPositions: ["marketRegime", "cautionMaxPositions"],
       cautionScreeningMult: ["marketRegime", "cautionScreeningMult"],
@@ -591,6 +593,7 @@ const toolMap = {
     }
     userConfig._lastAgentTune = new Date().toISOString();
     fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify(userConfig, null, 2));
+    try { fs.chmodSync(USER_CONFIG_PATH, 0o600); } catch (_) { /* best-effort on non-POSIX FS */ }
 
     // Restart cron jobs if intervals changed
     const intervalChanged = applied.managementIntervalMin != null || applied.screeningIntervalMin != null;
@@ -973,8 +976,19 @@ async function runSafetyChecks(name, args) {
     }
 
     case "swap_token": {
-      // Basic check — prevent swapping when DRY_RUN is true
-      // (handled inside swapToken itself, but belt-and-suspenders)
+      if (!(args.amount > 0)) {
+        return { pass: false, reason: "swap_token amount must be a positive number." };
+      }
+      const solMint = config.tokens.SOL;
+      const inputIsSol = args.input_mint === solMint || args.input_mint === "SOL";
+      // Only cap when SOL is leaving the wallet — swapping a stray base token back to SOL
+      // (the auto-swap-after-close path) is bounded by the actual token balance already.
+      if (inputIsSol && args.amount > config.risk.maxSwapAmount) {
+        return {
+          pass: false,
+          reason: `Swap amount ${args.amount} SOL exceeds maximum allowed per swap (${config.risk.maxSwapAmount}).`,
+        };
+      }
       return { pass: true };
     }
 

@@ -41,6 +41,7 @@ function saveChatId(id) {
       : {};
     cfg.telegramChatId = id;
     fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify(cfg, null, 2));
+    try { fs.chmodSync(USER_CONFIG_PATH, 0o600); } catch (_) { /* best-effort on non-POSIX FS */ }
   } catch (e) {
     log("telegram_error", `Failed to persist chatId: ${e.message}`);
   }

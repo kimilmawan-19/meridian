@@ -57,6 +57,8 @@ export const config = {
   risk: {
     maxPositions:    u.maxPositions    ?? 3,
     maxDeployAmount: u.maxDeployAmount ?? 50,
+    maxSwapAmount:   u.maxSwapAmount   ?? 50,   // cap SOL-denominated swap_token amount (mirrors maxDeployAmount)
+    swapSlippageBps: u.swapSlippageBps ?? 500,  // 5% — explicit floor instead of relying on Jupiter's default
   },
 
   // ─── Pool Screening Thresholds ───────────

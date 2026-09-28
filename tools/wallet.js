@@ -177,6 +177,7 @@ export async function swapToken({
       outputMint: output_mint,
       amount: amountStr,
       taker: wallet.publicKey.toString(),
+      slippageBps: String(config.risk.swapSlippageBps ?? 500),
     });
     const referralParams = getJupiterReferralParams();
     if (referralParams) {

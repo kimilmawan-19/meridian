@@ -90,6 +90,8 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 | blockedLaunchpads | screening | [] |
 | deployAmountSol | management | 0.5 |
 | maxDeployAmount | risk | 50 |
+| maxSwapAmount | risk | 50 |
+| swapSlippageBps | risk | 500 |
 | maxPositions | risk | 3 |
 | gasReserve | management | 0.2 |
 | positionSizePct | management | 0.35 |
@@ -314,6 +316,42 @@ const actualBaseFee = baseFactor > 0
 
 ---
 
+## Swap Safety (tools/executor.js, tools/wallet.js)
+
+Security-audit finding: `swap_token`'s `runSafetyChecks` case previously just returned
+`{ pass: true }` with a comment claiming DRY_RUN handling in `swapToken()` itself was
+"belt-and-suspenders" — it wasn't. Unlike `deploy_position`, which has hard-coded caps
+independent of LLM judgement (`maxDeployAmount`, duplicate-pool/mint guard, bin-range
+validation), `swap_token` had **no** cap on `amount` and Jupiter's Swap V2 `/order` request
+never set `slippageBps` (full reliance on Jupiter's own default). A manipulated or buggy
+tool call (e.g. from a prompt-injected token narrative — see `narrative_untrusted` in
+`prompt.js`) could have swapped an unbounded amount of SOL with no slippage floor.
+
+Fixed:
+- `runSafetyChecks("swap_token")` now rejects non-positive `amount`, and when `input_mint`
+  is SOL (i.e. SOL is leaving the wallet), rejects `amount > config.risk.maxSwapAmount`
+  (default 50, mirrors `maxDeployAmount`). Swapping a non-SOL base token back to SOL (the
+  auto-swap-after-close path) is **not** capped here — it's already bounded by the actual
+  token balance in the wallet, and requiring a cap there would block legitimate full-balance
+  cleanup swaps.
+- `swapToken()` now sends an explicit `slippageBps` (`config.risk.swapSlippageBps`, default
+  500 = 5%) on every Jupiter order request instead of relying on Jupiter's undocumented
+  default. If legitimate swaps start failing during high volatility, loosen via
+  `update_config swapSlippageBps=<value>`.
+
+## Secret File Permissions (setup.js, telegram.js, tools/executor.js, lessons.js)
+
+Security-audit finding: `.env` (contains `WALLET_PRIVATE_KEY` and all API keys) and
+`user-config.json` (contains `llmApiKey`) were written via plain `fs.writeFileSync` with no
+explicit `mode`, landing at the OS default (`0644`, world-readable) — any other local user
+on a shared host could read the wallet private key. Fixed: every write to these two files
+(`setup.js` initial write ×2, `telegram.js` `saveChatId`, `tools/executor.js`
+`update_config`, `lessons.js` `evolveThresholds`) is now followed by
+`fs.chmodSync(path, 0o600)` (best-effort, wrapped in try/catch for non-POSIX filesystems).
+This only hardens files written by code going forward — if `.env`/`user-config.json` already
+exist with looser permissions from before this patch, run `chmod 600 .env user-config.json`
+once manually after upgrading.
+
 ## Auto Stop-Loss (executor.js)
 
 Volatility-adaptive SL enforced at deploy time when `autoSlEnabled=true`:
@@ -460,3 +498,8 @@ Agent Meridian HiveMind sync is handled by `hivemind.js`. It uses built-in Agent
 - Rule 6 (max age, `index.js`) is a **soft cap with earning-grace**: past `maxPositionAgeMinutes` the position closes only if it has stopped earning. While PnL still drifts up (or unclaimed fees accrue ≥ `feeGrowthMinSol` over `feeGrowthLookbackMinutes`), the close is deferred up to `maxAgeExtensions` blocks of `ageExtensionMinutes` (hard ceiling = `maxPositionAgeMinutes + maxAgeExtensions * ageExtensionMinutes`). Earning is judged from pool-memory position snapshots via `getSnapshotWindow()`. Fixed: `maxPositionAgeMinutes` is now mapped in `config.js` management block (previously absent → writes to user-config.json silently had no effect; only the hardcoded `?? 2880` fallback applied).
 - Rule 9 (sell pressure): `streakCount` default lowered 3 → 2 (fixed). 4 days of data showed Rule 9 confirming AFTER positions already overshot their auto-SL tier by 1-6% (e.g. yep -18.12% vs -12% tier, ok-SOL -14.37% vs -12% tier) — the 3-window confirm was too slow for fast bleeds. Cadence validation in `startCronJobs` (`maxSnapshots = windowMin/managementIntervalMin`) still holds at defaults (30/10=3 ≥ 2).
 - `curveMaxVolatility` (strategy block): default shifted from 3 → 3.5 to avoid premature maxBinsBelow on mid-volatility tokens.
+- **Security audit findings not yet patched** (surfaced 2026-09-28, deferred by user choice — swap-cap and secret-file-permission fixes were prioritized instead):
+  - `envcrypt.js` "encryption" (`scripts/envrypt.js` / `envcrypt.js`) is a repeating-key XOR cipher, not real encryption — key length is recoverable via known-plaintext (e.g. the `sk-or-` OpenRouter prefix), giving false confidence that `.env` is protected at rest. Should be replaced with authenticated encryption (e.g. AES-256-GCM with a KDF like scrypt) if this feature is kept.
+  - `telegram.js` builds request URLs with the bot token embedded (`https://api.telegram.org/bot${TOKEN}`); thrown fetch errors are logged via `logger.js` and could carry the full URL (with token) into log files. Should redact the token before logging any error containing the request URL.
+  - `hivemind.js`'s inbound `rule` text (`getSharedLessonsForPrompt`) is only sanitized for angle-brackets/backticks/control chars, not for instruction-like content, before being injected into the LLM prompt as a `[HIVEMIND ...]` line. `prompt.js` labels it untrusted (advisory to the LLM only) — a compromised `HIVE_MIND_URL` endpoint could still attempt prompt injection to bias trading decisions. No hard-coded guard exists beyond the advisory label.
+  - `package.json` pins `@meteora-ag/dlmm` exactly but leaves `@solana/web3.js`, `bs58`, `bn.js` (wallet/crypto-adjacent) on caret ranges — a compromised patch/minor release of any of these would be auto-pulled on `npm install`. Consider exact-pinning these three specifically, or auditing regularly via `npm audit`.
