@@ -25,6 +25,7 @@
     "test:regime-risk": "node test/test-regime-risk.mjs",
     "test:liquidity-collapse": "node test/test-liquidity-collapse.mjs",
     "test:security-hardening": "node test/test-security-hardening.mjs",
+    "test:fee-revenue": "node test/test-fee-revenue.mjs",
     "test:agent": "DRY_RUN=true node test/test-agent.js",
     "postinstall": "node scripts/patch-anchor.js"
   },

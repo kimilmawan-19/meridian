@@ -30,12 +30,13 @@ function normalizeSymbol(symbol) {
   return String(symbol || "").trim().toUpperCase();
 }
 
+// Fee yield drives the ranking; organic is a mild multiplier (it's already hard-gated by
+// minOrganic). The old additive formula let ~20 organic points cancel a 3x fee-yield gap.
+// Multiplicative form is also timeframe-invariant (5m vs 1h fee magnitudes differ ~12x).
 function scoreCandidate(pool) {
   const feeTvl = Number(pool.fee_active_tvl_ratio || 0);
   const organic = Number(pool.organic_score || 0);
-  const volume = Number(pool.volume_window || 0);
-  const holders = Number(pool.holders || 0);
-  return feeTvl * 1000 + organic * 10 + volume / 100 + holders / 100;
+  return feeTvl * (organic / 100);
 }
 
 function numeric(value) {
@@ -573,7 +574,10 @@ export async function getTopCandidates({ limit = 10 } = {}) {
       return true;
     })
     .sort((a, b) => scoreCandidate(b) - scoreCandidate(a))
-    .slice(0, limit);
+    // Over-fetch so pools dropped by the enrichment filters below (PVP, wash, bundle, rugpull,
+    // ATH, volume, dev, indicators) are backfilled by the next-best candidates instead of
+    // shrinking the list. Capped at 2x because each pool costs ~4 OKX calls.
+    .slice(0, limit * 2);
 
   if (config.screening.avoidPvpSymbols && eligible.length > 0) {
     await enrichPvpRisk(eligible);
@@ -779,7 +783,7 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   }
 
   return {
-    candidates: eligible,
+    candidates: eligible.slice(0, limit),
     total_screened: pools.length,
     filtered_examples: filteredOut.slice(0, 3),
   };

@@ -28,7 +28,7 @@ import {
   createLiveMessage,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop, batchUpdateMarketData, batchUpdateLiveVolatility, getOorDirection, wasRecentlyOorAbove, updateR9GraceZone, effectiveStopLossPct, recordTpVeto, resetTpVeto, markTaExitTriggered } from "./state.js";
+import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop, batchUpdateMarketData, batchUpdateLiveVolatility, getOorDirection, wasRecentlyOorAbove, updateR9GraceZone, isInEntryAccumulation, effectiveStopLossPct, recordTpVeto, resetTpVeto, markTaExitTriggered } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote, addVolumeSnapshot, getVolumeWindow, getSnapshotWindow } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
@@ -1820,24 +1820,13 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
     // until price breaches the grace depth and the breach persists past confirm window.
     // FAIL-SAFE: keep grace active when bin data is unavailable.
     const r5tracked = getTrackedPosition(position.position);
-    const binsKnown5 = position.active_bin != null && position.upper_bin != null && position.lower_bin != null;
-    const rangeTotal5 = binsKnown5 ? (position.upper_bin - position.lower_bin) : 0;
-    const depthPct5 = binsKnown5 && rangeTotal5 > 0
-      ? ((position.upper_bin - position.active_bin) / rangeTotal5) * 100
-      : 0;
-    const deployStrategy5 = (r5tracked?.strategy ?? config.strategy.strategy ?? "curve").toLowerCase();
-    const graceDepth5 = deployStrategy5 === "bid_ask"
-      ? (managementConfig.bidAskEntryGraceDepthPct ?? 80)
-      : (managementConfig.curveEntryGraceDepthPct ?? 50);
-    const confirmMs5 = (managementConfig.entryGraceConfirmMinutes ?? 15) * 60_000;
-    const graceExitedAt5 = r5tracked?.r9_grace_exited_at;
-    const inEntryAccumulation5 =
-      !binsKnown5 ||
-      (position.in_range !== false && (
-        depthPct5 < graceDepth5 ||
-        graceExitedAt5 == null ||
-        (Date.now() - new Date(graceExitedAt5).getTime()) < confirmMs5
-      ));
+    const {
+      active: inEntryAccumulation5,
+      binsKnown: binsKnown5,
+      depthPct: depthPct5,
+      graceDepth: graceDepth5,
+      strategy: deployStrategy5,
+    } = isInEntryAccumulation(r5tracked, position, managementConfig, config.strategy.strategy);
     if (inEntryAccumulation5) {
       const why5 = !binsKnown5
         ? "bin data unavailable (fail-safe)"

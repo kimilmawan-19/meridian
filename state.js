@@ -10,6 +10,7 @@
 
 import fs from "fs";
 import { log } from "./logger.js";
+import { config } from "./config.js";
 
 const STATE_FILE = "./state.json";
 
@@ -227,6 +228,33 @@ export function updateR9GraceZone(position_address, depth_pct, graceDepth) {
     }
   }
   if (changed) save(state);
+}
+
+/**
+ * Depth-aware entry-accumulation grace shared by the low-yield exit (updatePnlAndCheckExits)
+ * and Rule 5 (index.js). A single-sided SOL position earns ~nothing until price trades down
+ * into its range, so low yield while still in the SOL-rich top of the range is expected.
+ * Fail-safe: grace stays active when bin data is unavailable.
+ */
+export function isInEntryAccumulation(tracked, positionData, mgmtConfig, fallbackStrategy = "curve") {
+  const { active_bin, upper_bin, lower_bin, in_range } = positionData;
+  const binsKnown = active_bin != null && upper_bin != null && lower_bin != null;
+  const rangeTotal = binsKnown ? upper_bin - lower_bin : 0;
+  const depthPct = binsKnown && rangeTotal > 0 ? ((upper_bin - active_bin) / rangeTotal) * 100 : 0;
+  const strategy = (tracked?.strategy ?? fallbackStrategy ?? "curve").toLowerCase();
+  const graceDepth = strategy === "bid_ask"
+    ? (mgmtConfig.bidAskEntryGraceDepthPct ?? 80)
+    : (mgmtConfig.curveEntryGraceDepthPct ?? 50);
+  const confirmMs = (mgmtConfig.entryGraceConfirmMinutes ?? 15) * 60_000;
+  const exitedAt = tracked?.r9_grace_exited_at;
+  const active =
+    !binsKnown ||
+    (in_range !== false && (
+      depthPct < graceDepth ||
+      exitedAt == null ||
+      (Date.now() - new Date(exitedAt).getTime()) < confirmMs
+    ));
+  return { active, binsKnown, depthPct, graceDepth, strategy };
 }
 
 /**
@@ -876,10 +904,15 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
       }
     }
     if (effectiveFeeRate != null && effectiveFeeRate < mgmtConfig.minFeePerTvl24h) {
-      return {
-        action: "LOW_YIELD",
-        reason: `Low yield: fee/TVL ${effectiveFeeRate.toFixed(2)}% < min ${mgmtConfig.minFeePerTvl24h}% [${metricSource}] (age: ${slAgeMin ?? "?"}m)`,
-      };
+      // This check runs before Rule 5 in index.js, so without the same grace it pre-empted
+      // Rule 5's entry-accumulation guard and closed positions before price reached their liquidity.
+      const grace = isInEntryAccumulation(pos, positionData, mgmtConfig, config.strategy?.strategy);
+      if (!grace.active) {
+        return {
+          action: "LOW_YIELD",
+          reason: `Low yield: fee/TVL ${effectiveFeeRate.toFixed(2)}% < min ${mgmtConfig.minFeePerTvl24h}% [${metricSource}] (age: ${slAgeMin ?? "?"}m, depth=${grace.depthPct.toFixed(0)}% strat=${grace.strategy})`,
+        };
+      }
     }
   }
 

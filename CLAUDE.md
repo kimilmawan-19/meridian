@@ -186,6 +186,11 @@ Applied in order during `passing = allCandidates.filter(...)` (index.js) and `ge
 - **`entryFlowFilterEnabled`** (default true): drops candidates whose multi-timeframe flow consensus (`computeCandidateFlow` — DexScreener price_change + volume ratio over 5m/1h/6h) is in `entryFlowBlockRegimes` (default `["DISTRIBUTION"]` — active selling into bids, the precursor to in-range dumps like NEIL −16%). Smart-wallet presence overrides (`entryFlowFilterSmartMoneyOverride`, accumulation can absorb selling). Missing market data → NEUTRAL → not blocked (fail-safe). Hardens the soft guidance in `prompt.js` (DISTRIBUTION/CAPITULATION = skip). Shares `computeCandidateFlow` with the Last Pool Standing guard. Conservative default (DISTRIBUTION only, not CAPITULATION) to avoid over-restriction on top of auto-evolved `minFeeActiveTvlRatio`.
 - `minPoolAgeHours`, `maxTop10Pct`, `minTokenFeesSol`, `maxBundlersPct`, `maxBotHoldersPct`, `blockedLaunchpads`, rugpull/PVP flags — all applied before LLM prompt is built.
 
+## Candidate Ranking & Over-fetch (tools/screening.js `getTopCandidates`)
+
+- **Ranking** (`scoreCandidate`): `fee_active_tvl_ratio × (organic_score / 100)`. Fee yield drives the order; organic is a mild multiplier (already hard-gated by `minOrganic`). The old additive formula (`feeTvl×1000 + organic×10 + volume/100 + holders/100`) let ~20 organic points cancel a 3× fee-yield gap at 5m magnitudes. The multiplicative form is also timeframe-invariant.
+- **Over-fetch**: after the cheap filters (occupied pool/mint, cooldowns) the list is cut to `limit × 2`, not `limit`, before the enrichment filters (PVP, wash, bundle, rugpull, ATH, volume collapse, dev blocklist, indicators). The final `limit` is taken **after** those filters, so dropped pools are backfilled by the next-best candidates instead of shrinking the list the LLM sees. Capped at 2× because each pool costs ~4 OKX calls.
+
 ## Last Pool Standing Guard (index.js — after hard filters, before LLM)
 
 Runs after `passing` is finalized (and after single-candidate `getLoneCandidateSkipReason` check).
@@ -393,6 +398,10 @@ effectiveDrop = max(effTrailingDropFloor, peak_pnl_pct / trailingGivebackDivisor
 Higher divisor = tighter stop relative to peak.
 
 ---
+
+## Low-Yield Exit Entry Grace (state.js)
+
+`updatePnlAndCheckExits`' `LOW_YIELD` exit (position fees extrapolated to 24h < `minFeePerTvl24h`, after `minAgeBeforeYieldCheck`) runs **before** `getDeterministicCloseRule` in the management cycle, so it used to pre-empt Rule 5 (low yield) — including Rule 5's depth-aware entry grace. A single-sided SOL position earns ~nothing until price trades down into its range, so it was being closed at 60m before its liquidity was ever active. Both now share `isInEntryAccumulation(tracked, positionData, mgmtConfig, fallbackStrategy)` (state.js): grace holds while in range and depth < `curveEntryGraceDepthPct` (50) / `bidAskEntryGraceDepthPct` (80), or until the breach has persisted `entryGraceConfirmMinutes` (15); fail-safe active when bin data is missing; no grace when out of range.
 
 ## Early-Dump SL Override (state.js)
 
