@@ -533,6 +533,12 @@ Examples: -7% curve → 12h; -14% bid_ask → 48h; -22.9% curve (WOC) → 48h; -
 
 Agent Meridian HiveMind sync is handled by `hivemind.js`. It uses built-in Agent Meridian defaults unless overridden by config or env.
 
+**Shared lessons are not injected into the LLM prompt by default.**
+- `getSharedLessonsForPrompt` returns null unless `user-config.json` has `hiveMindLessonsInPrompt: true`.
+- Registration, heartbeat, the lesson/preset pull into `hivemind-cache.json`, and performance push still run.
+- Why: the live cache (2026-09-29) held 12 lessons that were all test data (`TEST-SOL … Reason: test close`, `Tok3-SOL`, `undefined` fields). They appeared in the prompt next to the bot's own lessons with no untrusted label, and the text is unvetted input from an external server (prompt-injection surface).
+- The key is deliberately not in `update_config`'s `CONFIG_MAP`, so the LLM cannot re-enable it. Test: `test:hivemind-prompt`.
+
 ---
 
 ## Environment Variables
@@ -566,11 +572,11 @@ Agent Meridian HiveMind sync is handled by `hivemind.js`. It uses built-in Agent
   - Its entry metrics looked clean: age 90h, mcap $1.6M, top10 15%, no rugpull/wash flag. No exit rule could react inside one 30s poll.
   - The executor deploy guard enforces the cap on every deploy, and `evolveThresholds` never changes it. Re-check by grouping `lessons.json` performance by bin_step after about 4 weeks.
 - **Security audit findings not yet patched** (surfaced 2026-09-28, deferred by user choice — swap-cap and secret-file-permission fixes were prioritized instead):
-  - `envcrypt.js` "encryption" (`scripts/envrypt.js` / `envcrypt.js`) is a repeating-key XOR cipher, not real encryption — key length is recoverable via known-plaintext (e.g. the `sk-or-` OpenRouter prefix), giving false confidence that `.env` is protected at rest. Should be replaced with authenticated encryption (e.g. AES-256-GCM with a KDF like scrypt) if this feature is kept.
+  - `envcrypt.js` "encryption" is a repeating-key XOR cipher, not real encryption. **Left as is (re-checked 2026-09-29):** the key (`.envrypt` / `ENVRYPT_KEY`) lives on the same host as `.env`, so authenticated encryption would add little. The real protection is `chmod 600` on `.env` / `user-config.json` (see Secret File Permissions).
   - ~~Telegram token leaking into logs.~~ **Downgraded to low risk (re-checked 2026-09-29).**
     - `telegram.js` embeds the bot token in request URLs, but every error log writes only `e.message` or the Telegram response body, never the URL.
     - Node's fetch network error message is just `fetch failed`; the URL lives in `e.cause`, which is not logged.
     - A grep of the live `logs/` and `~/.pm2/logs/` for the token pattern found nothing.
     - Only revisit this if a log line ever includes `e.cause` or a request URL.
-  - `hivemind.js`'s inbound `rule` text (`getSharedLessonsForPrompt`) is only sanitized for angle-brackets/backticks/control chars, not for instruction-like content, before being injected into the LLM prompt as a `[HIVEMIND ...]` line. `prompt.js` labels it untrusted (advisory to the LLM only) — a compromised `HIVE_MIND_URL` endpoint could still attempt prompt injection to bias trading decisions. No hard-coded guard exists beyond the advisory label.
-  - `package.json` pins `@meteora-ag/dlmm` exactly but leaves `@solana/web3.js`, `bs58`, `bn.js` (wallet/crypto-adjacent) on caret ranges — a compromised patch/minor release of any of these would be auto-pulled on `npm install`. Consider exact-pinning these three specifically, or auditing regularly via `npm audit`.
+  - ~~HiveMind prompt injection.~~ **Fixed 2026-09-29:** shared lessons are off by default (see HiveMind section).
+  - ~~Caret ranges on wallet deps.~~ **Fixed 2026-09-29:** `@solana/web3.js` 1.98.4, `bn.js` 5.2.3 and `bs58` 5.0.0 are exact-pinned in `package.json` and the lockfile root, matching the versions already installed.

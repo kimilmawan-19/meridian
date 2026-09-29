@@ -343,6 +343,8 @@ export const config = {
     apiKey: nonEmptyString(u.hiveMindApiKey, process.env.HIVEMIND_API_KEY, DEFAULT_HIVEMIND_API_KEY),
     agentId: u.agentId ?? null,
     pullMode: u.hiveMindPullMode ?? "auto",
+    // Shared lessons are unvetted external text; live pulls were test data. Opt-in only.
+    lessonsInPrompt: u.hiveMindLessonsInPrompt === true,
   },
 
   api: {
