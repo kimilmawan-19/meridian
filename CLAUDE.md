@@ -361,6 +361,21 @@ const actualBaseFee = baseFactor > 0
 - `range_efficiency <= 50`: +0.10
 - Otherwise: +0.05 (ambiguous)
 
+**Live audit (2026-09-29): no bug that affects trading. Most of this system is inert or advisory. Do not re-audit without new data.**
+- **`evolveThresholds` has been frozen since 2026-07-05** (position 1275; live `minFeeActiveTvlRatio` 0.09, `minOrganic` 55).
+  - With about 250 winners in a 14-day window, the minimum winner fee/TVL sits at the floor, so the raise never fires.
+  - Relax requires fewer than 10 positions in the window, so it never fires either.
+  - The raise logic is weak anyway: it raises because winners had high fee/TVL, not because low-fee pools lost. The 60-day data shows no fee/TVL bucket underperforming.
+  - Left as is on purpose.
+- **Manual lessons are never pruned and are prioritized in the SCREENER role slots.**
+  - Two May study lessons ("avg hold time of top LPers", "fee_pct_of_capital") headed every screening prompt.
+  - `sanitizeLessonText` had stripped their `<`/`>` characters, so "≥10%" read as "= 10%".
+  - The user removed them directly from `lessons.json`, with a backup.
+  - Do not remove lessons through the chat `clear_lessons` tool: its `performance` mode wipes all closed-position records, which every analysis depends on.
+- **Aggregate lesson bucket "100-125" is actually `bin_step > 100`**, so it includes 200+ pools. This resolves itself once pre-`maxBinStep 125` data leaves the 14-day window.
+- **The MANAGER prompt receives screening lessons** (aggregates, per-pool PREFER). Low impact: since direct closes, the manager LLM only handles TP proposals, claims and notes.
+- **Darwin signal weights are saturated at their caps.** fee_tvl, mcap and volatility sit at 2.5; organic and holder_count at 0.3. The multiplicative 1.05/0.95 step every 5 closes saturates quickly. The weights are prompt text for the screener only, not used in candidate ranking. Their direction matches the 60-day data (organic ≥80 was no better than 70–79).
+
 ---
 
 ## Swap Safety (tools/executor.js, tools/wallet.js)
