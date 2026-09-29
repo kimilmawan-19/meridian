@@ -2,6 +2,7 @@
 // executed via executeTool("close_position") in code instead of being handed to the LLM.
 // [1] real executeTool round-trip in DRY_RUN — result shape is recognised as success.
 // [2] failure-detection predicate + LLM routing filter (mirrors index.js, which is not importable).
+// CLAIM is executed directly as well (claim_fees); via the LLM it cost ~59 calls/day.
 process.env.DRY_RUN = "true";
 process.env.LLM_API_KEY ||= "test-key";
 process.env.OPENROUTER_API_KEY ||= "test-key";
@@ -15,7 +16,7 @@ function check(name, cond, detail = "") {
 // Same predicate as index.js direct-close loop.
 const closeFailed = (res) => !res || !!res.error || !!res.blocked || res.success === false;
 // Same filter as index.js: LLM only gets judgment calls.
-const sentToLlm = (a) => a.action !== "STAY" && a.action !== "CLOSE";
+const sentToLlm = (a) => a.action !== "STAY" && a.action !== "CLOSE" && a.action !== "CLAIM";
 
 try {
   const { executeTool } = await import("../tools/executor.js");
@@ -40,7 +41,14 @@ try {
   check("STAY is not sent to the LLM", sentToLlm({ action: "STAY" }) === false);
   check("TP_PROPOSAL still goes to the LLM", sentToLlm({ action: "TP_PROPOSAL" }) === true);
   check("INSTRUCTION still goes to the LLM", sentToLlm({ action: "INSTRUCTION" }) === true);
-  check("CLAIM still goes to the LLM", sentToLlm({ action: "CLAIM" }) === true);
+  check("CLAIM is not sent to the LLM", sentToLlm({ action: "CLAIM" }) === false);
+
+  console.log("\n[4] direct claim");
+  const claim = await executeTool("claim_fees", { position_address: "DirectClaim1111111111111111111111111111111" });
+  check("DRY_RUN claim_fees is treated as success", closeFailed(claim) === false, `(got ${JSON.stringify(claim)})`);
+  const src = (await import("fs")).readFileSync(new URL("../index.js", import.meta.url), "utf8");
+  check("index.js filter matches this test", src.includes('return a.action !== "STAY" && a.action !== "CLOSE" && a.action !== "CLAIM";'));
+  check("index.js executes claim_fees directly", src.includes('await executeTool("claim_fees", { position_address: p.position })'));
 
 } catch (e) {
   fail++;

@@ -84,6 +84,15 @@ function getToolsForRole(agentType, goal = "") {
   if (matched.size === 0) return tools.filter(t => !GENERAL_INTENT_ONLY_TOOLS.has(t.function.name));
   return tools.filter(t => matched.has(t.function.name));
 }
+
+// Optional per-call narrowing of the role's tools (e.g. the screening cycle, whose candidates
+// already carry pool memory, smart wallets, active bin and balance).
+export function selectTools(agentType, goal, allowedTools = null) {
+  const roleTools = getToolsForRole(agentType, goal);
+  if (!allowedTools) return roleTools;
+  const allow = new Set(allowedTools);
+  return roleTools.filter(t => allow.has(t.function.name));
+}
 import { getWalletBalances } from "./tools/wallet.js";
 import { getMyPositions } from "./tools/dlmm.js";
 import { log } from "./logger.js";
@@ -160,7 +169,9 @@ function isToolChoiceRequiredError(error) {
  * @returns {string} - The agent's final text response
  */
 export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHistory = [], agentType = "GENERAL", model = null, maxOutputTokens = null, options = {}) {
-  const { interactive = false, onToolStart = null, onToolFinish = null } = options;
+  // requireToolUse: null = infer from the goal; false = a text-only answer (e.g. NO DEPLOY) is valid.
+  const { interactive = false, onToolStart = null, onToolFinish = null, allowedTools = null, requireToolUse = null } = options;
+  const callTools = selectTools(agentType, goal, allowedTools);
   // Build dynamic system prompt with current portfolio state
   const [portfolio, positions] = await Promise.all([getWalletBalances(), getMyPositions()]);
   const stateSummary = getStateSummary();
@@ -186,7 +197,7 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
   // These lock after first attempt regardless of success — retrying them is always wrong
   const NO_RETRY_TOOLS = new Set(["deploy_position"]);
   const firedOnce = new Set();
-  const mustUseRealTool = shouldRequireRealToolUse(goal, agentType, interactive);
+  const mustUseRealTool = requireToolUse ?? shouldRequireRealToolUse(goal, agentType, interactive);
   let sawToolCall = false;
   let noToolRetryCount = 0;
 
@@ -206,14 +217,14 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
       let usedModel = activeModel;
       // Force a tool call on step 0 for action intents — prevents the model from inventing deploy/close outcomes
       const ACTION_INTENTS = /\b(deploy|open|add liquidity|close|exit|withdraw|claim|swap|block|unblock)\b/i;
-      let toolChoice = (step === 0 && (ACTION_INTENTS.test(goal) || mustUseRealTool)) ? "required" : "auto";
+      let toolChoice = (step === 0 && (requireToolUse ?? (ACTION_INTENTS.test(goal) || mustUseRealTool))) ? "required" : "auto";
 
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
           response = await client.chat.completions.create({
             model: usedModel,
             messages,
-            tools: getToolsForRole(agentType, goal),
+            tools: callTools,
             tool_choice: toolChoice,
             temperature: config.llm.temperature,
             max_tokens: maxOutputTokens ?? config.llm.maxTokens,

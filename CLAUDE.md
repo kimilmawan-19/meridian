@@ -284,8 +284,10 @@ is busy). Screening is a multi-minute LLM loop; pausing for it left open positio
 
 Every `CLOSE` action in `actionMap` (Rules 1–11, state.js exits, forced trailing TP) is executed
 directly via `executeTool("close_position", { position_address, reason })` — the same path the
-LLM used, so notifications, auto-swap and `recordPerformance` still run. The LLM is called only
-for judgment calls: `TP_PROPOSAL`, `INSTRUCTION`, `CLAIM`. On a failed close the position's
+LLM used, so notifications, auto-swap and `recordPerformance` still run. `CLAIM` (unclaimed ≥
+`minClaimAmount`) is also executed directly via `executeTool("claim_fees")`; through the LLM it
+cost about 59 calls/day (2026-09-29). The LLM is called only for judgment calls: `TP_PROPOSAL`
+(0 occurrences in 92 days of logs) and `INSTRUCTION` (`/set` notes). On a failed close the position's
 `_pollTriggeredAt` entry is cleared so the 30s poll retries immediately.
 
 **Close-reason matching:** anything that parses `close_reason` must use a case-insensitive pattern, never string equality.
@@ -340,8 +342,16 @@ const actualBaseFee = baseFactor > 0
   - `Provider timed out` (or code 408/504) is retried once. Each timeout already costs about 140–175s.
   - Live logs (3 days, 2026-09-29) had 12 timeouts, none retried, which failed 4 management and 2 screening cycles. Direct closes run before the LLM, so only TP_PROPOSAL/CLAIM/INSTRUCTION decisions were lost. Test: `test:llm-retry`.
 - **The "fallback model" is not a different model.** It is `screeningModel` / `managementModel`, which is already the model passed in. The old `stepfun` fallback no longer exists.
-- **Empty responses:** 180 of 637 LLM calls (28%) came back with no content and no tool call. Each costs one extra call. The log line now includes `finish_reason`, `completion_tokens` and reasoning length. Suspected cause: a reasoning model (live: `xiaomi/mimo-v2.5`) spending the management cap of 2048 output tokens on reasoning. Confirm from the logs before changing anything.
+- **Empty responses:** 180 of 637 LLM calls (28%) came back with no content and no tool call. Each costs one extra call. The log line now includes `finish_reason`, `completion_tokens` and reasoning length. Almost all of them are in screening (see below), so the cause is not the management token cap. Check `finish_reason` in the logs before changing anything.
 - **The hourly health check (`healthTask`) never runs.** Management is scheduled `*/10` and also fires at minute :00, sets `_managementBusy` first, and the health check returns. If it ever runs (for example, after a `managementIntervalMin` change), it blocks management and the 30s poll while the LLM works, and its output is discarded.
+- **Screening-cycle tool list** (`SCREENING_CYCLE_TOOLS`, index.js): `deploy_position` and the three token tools (holders, narrative, info). The call passes `allowedTools` and `requireToolUse: false` to `agentLoop`.
+  - Why: the candidate blocks already carry pool memory, smart wallets, active bin and balance. Live logs (3 days) showed `get_pool_memory` called 93× and `check_smart_wallets_on_pool` 21×. Every tool call is another full-conversation LLM round-trip.
+  - The goal contains "deploy", so `tool_choice=required` used to be forced on step 1. That made a `NO DEPLOY` answer cost at least 2 calls, and it was sometimes rejected outright.
+  - Chat and REPL deploys (also the SCREENER role) keep the full role tools, because they need `get_top_candidates` and `get_active_bin`. Test: `test:llm-calls`.
+- **LLM call volume before these changes** (3 days, 2026-09-27..29):
+  - Management: 78 runs, 178 steps. Screening: 87 runs, 464 steps (median 4, 16 runs at 8+).
+  - System prompt size is not the cost driver: about 3k tokens for SCREENER and 1.3k for MANAGER. Call count is.
+  - 179 of the 180 empty responses were in screening (39% of screening steps). So the 2048-token management cap is not the cause.
 - Per-role models: `managementModel`, `screeningModel`, `generalModel` in user-config.json
 - LM Studio: set `LLM_BASE_URL=http://localhost:1234/v1` and `LLM_API_KEY=lm-studio`
 - `maxOutputTokens` minimum: 2048 (free models may have lower limits causing empty responses)

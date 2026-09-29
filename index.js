@@ -111,6 +111,7 @@ let _cronTasks = [];
 let _managementBusy = false; // prevents overlapping management cycles
 let _screeningBusy = false;  // prevents overlapping screening cycles
 let _screeningLastTriggered = 0; // epoch ms — prevents management from spamming screening
+const SCREENING_CYCLE_TOOLS = ["deploy_position", "get_token_holders", "get_token_narrative", "get_token_info"];
 let _noDeployStreak = 0; // consecutive screening cycles that ended without a deploy — drives backoff
 let _entriesPaused = false; // Telegram /pause: skip screening (no new deploys); management + poll keep running
 const _oorNotified = new Set(); // positions already alerted for the current out-of-range episode
@@ -675,12 +676,20 @@ export async function runManagementCycle({ silent = false } = {}) {
         directCloseLines.push(`${p.pair}: close FAILED (${e.message}) — will retry`);
       }
     }
+    // CLAIM is mechanical too (unclaimed >= minClaimAmount). Via the LLM it cost ~59 calls/day.
+    for (const p of positionData) {
+      if (actionMap.get(p.position)?.action !== "CLAIM") continue;
+      const res = await executeTool("claim_fees", { position_address: p.position });
+      const failed = !res || res.error || res.blocked || res.success === false;
+      if (failed) log("cron_error", `Direct claim failed for ${p.pair}: ${res?.error || res?.reason || "claim failed"}`);
+      directCloseLines.push(`${p.pair}: ${failed ? `claim FAILED (${res?.error || res?.reason || "claim failed"})` : "fees claimed"}`);
+    }
     if (directCloseLines.length > 0) mgmtReport += `\n\n${directCloseLines.join("\n")}`;
 
-    // ── Call LLM only for judgment calls (TP_PROPOSAL / INSTRUCTION / CLAIM) ──
+    // ── Call LLM only for judgment calls (TP_PROPOSAL / INSTRUCTION) ──
     const actionPositions = positionData.filter(p => {
       const a = actionMap.get(p.position);
-      return a.action !== "STAY" && a.action !== "CLOSE";
+      return a.action !== "STAY" && a.action !== "CLOSE" && a.action !== "CLAIM";
     });
 
     if (actionPositions.length > 0) {
@@ -740,12 +749,11 @@ ${actionBlocks}
 
 RULES:
 - CLOSE: call close_position only — it handles fee claiming internally, do NOT call claim_fees first
-- CLAIM: call claim_fees with position address
 - INSTRUCTION: evaluate the instruction condition. If met → close_position. If not → HOLD, do nothing.
 - TP_PROPOSAL: this is a JUDGMENT call, the only one where you decide. Follow the per-position DECISION/GUIDANCE lines. If a partial_close_position option is offered, it is a valid middle path — scale out part and keep a protected runner. To hold, simply do nothing for that position. Holds are budget-limited and force-close eventually.
 - ⚡ exit alerts: close immediately, no exceptions
 
-Execute the required actions. Do NOT re-evaluate CLOSE/CLAIM — rules already applied. TP_PROPOSAL is the only decision to make. Just execute.
+Execute the required actions. Do NOT re-evaluate CLOSE — rules already applied. TP_PROPOSAL is the only decision to make. Just execute.
 After executing, write a brief one-line result per position.
       `, config.llm.maxSteps, [], "MANAGER", config.llm.managementModel, 2048, {
         onToolStart: async ({ name }) => { await liveMessage?.toolStart(name); },
@@ -755,7 +763,7 @@ After executing, write a brief one-line result per position.
       mgmtReport += `\n\n${content}`;
     } else {
       log("cron", "Management: no judgment calls needed — skipping LLM");
-      await liveMessage?.note("No tool actions needed.");
+      await liveMessage?.note("No LLM judgment needed.");
     }
 
     // Trigger screening after management
@@ -1459,6 +1467,11 @@ IMPORTANT:
 - Never write "unknown" for OKX. Use real values, omit missing fields, or write exactly "OKX: unavailable".
 - Keep the whole report compact and highly scannable for Telegram.
       `, config.llm.maxSteps, [], "SCREENER", config.llm.screeningModel, 4096, {
+      // Candidates already carry pool memory, smart wallets, active bin and balance: tools for
+      // those only added LLM round-trips (live: get_pool_memory 93×, smart wallets 21× in 3 days).
+      // NO DEPLOY is a valid text-only answer, so no forced tool call on step 1.
+      allowedTools: SCREENING_CYCLE_TOOLS,
+      requireToolUse: false,
       onToolStart: async ({ name }) => {
         if (name === "deploy_position") deployAttempted = true;
       },
