@@ -335,7 +335,13 @@ const actualBaseFee = baseFactor > 0
 ## Model Configuration
 
 - Default model: `process.env.LLM_MODEL` or `openrouter/healer-alpha`
-- Fallback on 502/503/529: `stepfun/step-3.5-flash:free` (2nd attempt), then retry
+- Provider errors returned as a 200 body with no choices (`isTransientProviderError`, agent.js):
+  - 502/503/529 are retried up to 3 attempts.
+  - `Provider timed out` (or code 408/504) is retried once. Each timeout already costs about 140–175s.
+  - Live logs (3 days, 2026-09-29) had 12 timeouts, none retried, which failed 4 management and 2 screening cycles. Direct closes run before the LLM, so only TP_PROPOSAL/CLAIM/INSTRUCTION decisions were lost. Test: `test:llm-retry`.
+- **The "fallback model" is not a different model.** It is `screeningModel` / `managementModel`, which is already the model passed in. The old `stepfun` fallback no longer exists.
+- **Empty responses:** 180 of 637 LLM calls (28%) came back with no content and no tool call. Each costs one extra call. The log line now includes `finish_reason`, `completion_tokens` and reasoning length. Suspected cause: a reasoning model (live: `xiaomi/mimo-v2.5`) spending the management cap of 2048 output tokens on reasoning. Confirm from the logs before changing anything.
+- **The hourly health check (`healthTask`) never runs.** Management is scheduled `*/10` and also fires at minute :00, sets `_managementBusy` first, and the health check returns. If it ever runs (for example, after a `managementIntervalMin` change), it blocks management and the 30s poll while the LLM works, and its output is discarded.
 - Per-role models: `managementModel`, `screeningModel`, `generalModel` in user-config.json
 - LM Studio: set `LLM_BASE_URL=http://localhost:1234/v1` and `LLM_API_KEY=lm-studio`
 - `maxOutputTokens` minimum: 2048 (free models may have lower limits causing empty responses)

@@ -33,6 +33,7 @@
     "test:pool-cooldown": "node test/test-pool-cooldown-reasons.mjs",
     "test:hivemind-prompt": "node test/test-hivemind-prompt.mjs",
     "test:swap-retry": "node test/test-swap-retry.mjs",
+    "test:llm-retry": "node test/test-llm-retry.mjs",
     "test:agent": "DRY_RUN=true node test/test-agent.js",
     "postinstall": "node scripts/patch-anchor.js"
   },

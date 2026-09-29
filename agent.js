@@ -138,6 +138,15 @@ function isSystemRoleError(error) {
   return /invalid message role:\s*system/i.test(message);
 }
 
+// OpenRouter reports some provider failures as a 200 body with no choices. "Provider timed out"
+// (~140-175s) is transient but was not retried: 12 in 3 days failed 4 management + 2 screening cycles.
+export function isTransientProviderError(response, attempt) {
+  const code = response?.error?.code;
+  if (code === 502 || code === 503 || code === 529) return true;
+  const isTimeout = code === 408 || code === 504 || /timed out/i.test(String(response?.error?.message || ""));
+  return isTimeout && attempt === 0; // one retry only: each timeout already cost minutes
+}
+
 function isToolChoiceRequiredError(error) {
   const message = String(error?.message || error?.error?.message || error || "");
   return /tool_choice/i.test(message) && /required/i.test(message);
@@ -226,8 +235,8 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
           throw error;
         }
         if (response.choices?.length) break;
-        const errCode = response.error?.code;
-        if (errCode === 502 || errCode === 503 || errCode === 529) {
+        const errCode = response.error?.code ?? String(response.error?.message || "?").slice(0, 60);
+        if (isTransientProviderError(response, attempt)) {
           const wait = (attempt + 1) * 5000;
           if (attempt === 1 && usedModel !== FALLBACK_MODEL) {
             usedModel = FALLBACK_MODEL;
@@ -274,7 +283,8 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
         // Hermes sometimes returns null content — pop the empty message and retry once
         if (!msg.content) {
           messages.pop(); // remove the empty assistant message
-          log("agent", "Empty response, retrying...");
+          const reasoningLen = String(msg.reasoning ?? msg.reasoning_content ?? "").length;
+          log("agent", `Empty response (finish_reason=${response.choices[0].finish_reason ?? "?"}, completion_tokens=${response.usage?.completion_tokens ?? "?"}, reasoning_chars=${reasoningLen}), retrying...`);
           continue;
         }
         if (mustUseRealTool && !sawToolCall) {
