@@ -644,6 +644,12 @@ Agent Meridian HiveMind sync is handled by `hivemind.js`. It uses built-in Agent
     - The floor would have closed them around +3.5%, roughly $250–300 over 60 days.
   - Risk of fixing: in-range dips that later recover (max-age closes: peak 10.1% → 8.7%) could be cut earlier. This can't be quantified, because the rule has never fired.
   - Proposed fix: tag exits from the in-range branches (e.g. `in_range_exit: true`), carry the tag through `queueTrailingDropConfirmation` / `resolvePendingTrailingDrop`, and skip the in-range cancellation for tagged exits. Revisit at the 2026-10-16 evaluation.
+- **Exit data freshness: checked 2026-09-29, no change needed.**
+  - Position PnL, bins and in-range state are force-fetched on every 30s poll and again by the management cycle it triggers. DexScreener data is cached for 60s. Live volatility refreshes each cycle.
+  - Decision-to-realized gap (`diag-exit-gap.mjs`, 30 days): regime trim n=9, median +0.01%, worst −0.27%. The stop losses matched their decision PnL, apart from AMERICA (−59% → −68%, a rug that crossed the whole range in about 15s).
+  - Only 12 of 797 close reasons carried a decision PnL. Older ones are LLM free text, and break-even, max age, OOR and low yield don't print one.
+  - Re-check with more data on 2026-10-16. Don't add pre-close refetches, on-chain PnL checks or a priority fee for freshness without new evidence.
+  - The stop-loss reason now prints a rounded threshold (`Number(effSL.toFixed(2))`). Regime scaling used to produce labels like `<= -8.399999999999999%`. Test: `test:trailing-floor`.
 - **Close tx expiry (observed 2026-09-29, not changed).** 6 of about 75 close attempts in 3 days failed with `block height exceeded`, 6–30s after the tx was built. The retry landed within 3–60s every time. The bot sets no priority fee, and neither does the DLMM SDK. e/acc-SOL (a rug) expired twice and took about 90s to close. Revisit (priority fee or a resend loop) only if expiries grow or start costing measurable PnL.
 - **Security audit findings not yet patched** (surfaced 2026-09-28, deferred by user choice — swap-cap and secret-file-permission fixes were prioritized instead):
   - `envcrypt.js` "encryption" is a repeating-key XOR cipher, not real encryption. **Left as is (re-checked 2026-09-29):** the key (`.envrypt` / `ENVRYPT_KEY`) lives on the same host as `.env`, so authenticated encryption would add little. The real protection is `chmod 600` on `.env` / `user-config.json` (see Secret File Permissions).

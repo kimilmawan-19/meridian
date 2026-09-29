@@ -1,6 +1,7 @@
 // Verifies the trailing-TP in-range give-back floor (state.js updatePnlAndCheckExits).
 // Live data: break-even closes averaged peak +7.33% → −0.96% because the in-range trailing
 // deferral had no floor. Now deferral stops once give-back >= peak / tpVetoFloorDivisor (2).
+// Also: the stop-loss reason prints a rounded threshold (regime scaling produced -8.399999999999999%).
 // Real module round-trip; backs up + restores state.json.
 process.env.DRY_RUN = "true";
 process.env.LLM_API_KEY ||= "test-key";
@@ -67,6 +68,18 @@ try {
   open(C);
   const r4 = state.updatePnlAndCheckExits(C, data(6.5, true), mgmt);
   check("PnL 6.5% (drop 1.5 < effectiveDrop) → no exit", r4 == null, `(got ${JSON.stringify(r4)})`);
+
+  console.log("\n[4] stop-loss reason label is rounded (was \"<= -8.399999999999999%\")");
+  const D = "FloorPosD1111111111111111111111111111111111";
+  state.trackPosition({
+    position: D, pool: `Pool-${D}`, pool_name: "SL-SOL", strategy: "curve",
+    bin_range: { min: 100, max: 200 }, amount_sol: 1, active_bin: 150, sl_pct_override: -12,
+    bin_step: 100, volatility: 2, fee_tvl_ratio: 2, organic_score: 80, initial_value_usd: 100,
+  });
+  const slMgmt = { ...mgmt, allowLlmRiskParams: true, minAgeBeforeStopLoss: 0 };
+  const r5 = state.updatePnlAndCheckExits(D, data(-9, true), slMgmt, "bearish"); // -12 × 0.7 = -8.399999999999999
+  check("bearish SL fires with a rounded threshold", r5?.action === "STOP_LOSS" && /<= -8\.4%/.test(r5?.reason ?? ""), `(got ${r5?.reason})`);
+  check("no long float in reason", !/\d\.\d{5,}/.test(r5?.reason ?? ""));
 
 } catch (e) {
   fail++;

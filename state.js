@@ -806,7 +806,7 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
     const earlyTag = earlyDumpOverride ? " [early-dump override]" : "";
     return {
       action: "STOP_LOSS",
-      reason: `Stop loss: PnL ${currentPnlPct.toFixed(2)}% <= ${effSL}%${slTag}${earlyTag} (age: ${slAgeMin ?? "?"}m)`,
+      reason: `Stop loss: PnL ${currentPnlPct.toFixed(2)}% <= ${Number(effSL.toFixed(2))}%${slTag}${earlyTag} (age: ${slAgeMin ?? "?"}m)`,
     };
   }
 
