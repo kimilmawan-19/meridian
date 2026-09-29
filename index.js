@@ -26,6 +26,7 @@ import {
   notifyEmergencyExit,
   isEnabled as telegramEnabled,
   createLiveMessage,
+  setDeployNotifyMuted,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
 import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop, batchUpdateMarketData, batchUpdateLiveVolatility, getOorDirection, wasRecentlyOorAbove, updateR9GraceZone, isInEntryAccumulation, effectiveStopLossPct, recordTpVeto, resetTpVeto, markTaExitTriggered } from "./state.js";
@@ -1362,6 +1363,8 @@ export async function runScreeningCycle({ silent = false } = {}) {
     const weightsSummary = config.darwin?.enabled ? getWeightsSummary() : null;
 
     let deploySucceeded = false;
+    // The screening report (sent whenever a deploy was attempted) replaces notifyDeploy here.
+    if (!silent && telegramEnabled()) setDeployNotifyMuted(true);
     const { content } = await agentLoop(`
 SCREENING CYCLE
 ${strategyBlock}
@@ -1471,6 +1474,7 @@ IMPORTANT:
     screenReport = `Screening cycle failed: ${error.message}`;
     screenFailed = true;
   } finally {
+    setDeployNotifyMuted(false);
     // Restore caution-raised thresholds so they don't compound across cycles
     if (_cautionOrigFeeRatio != null) {
       config.screening.minFeeActiveTvlRatio = _cautionOrigFeeRatio;

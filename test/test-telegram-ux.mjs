@@ -93,6 +93,25 @@ try {
   try { await tg.notifyAutoSwapFailed({ pair: "X-SOL", mint: "Mint1111", error: "slippage <exceeded>" }); } catch { threw = true; }
   check("no-op without bot token (does not throw)", !threw);
 
+  console.log("\n[5b] no duplicate Deployed message during screening");
+  // Separate process: telegram.js reads the bot token at import time, and this process already
+  // imported it without one. fetch is stubbed, so nothing leaves the machine.
+  const { execFileSync } = await import("child_process");
+  const probe = `
+    let sends = 0;
+    globalThis.fetch = async () => { sends++; return { ok: true, json: async () => ({ ok: true, result: { message_id: 1 } }), text: async () => "" }; };
+    const tg = await import(${JSON.stringify(new URL("../telegram.js", import.meta.url).href)});
+    const d = { pair: "X-SOL", amountSol: 1, position: "Pos1111", tx: "Tx1111" };
+    tg.setDeployNotifyMuted(true);  await tg.notifyDeploy(d); const muted = sends;
+    tg.setDeployNotifyMuted(false); await tg.notifyDeploy(d); const unmuted = sends - muted;
+    console.log(JSON.stringify({ muted, unmuted }));`;
+  const out = JSON.parse(execFileSync(process.execPath, ["--input-type=module", "-e", probe], {
+    env: { ...process.env, TELEGRAM_BOT_TOKEN: "123:fake", TELEGRAM_CHAT_ID: "1", DRY_RUN: "true" },
+    encoding: "utf8",
+  }).trim().split("\n").pop());
+  check("muted notifyDeploy sends nothing", out.muted === 0, `(got ${out.muted})`);
+  check("unmuted notifyDeploy sends once", out.unmuted === 1, `(got ${out.unmuted})`);
+
   console.log("\n[6] mirrors match index.js source");
   const fs = await import("fs");
   const src = fs.readFileSync(new URL("../index.js", import.meta.url), "utf8");
@@ -103,6 +122,10 @@ try {
   check("screening gating identical", src.includes("if (screenReport && (deployAttempted || screenFailed))"));
   check("unknown-slash guard present", src.includes('if (text.startsWith("/")) {'));
   check("/close no longer calls closePosition() directly", !/await closePosition\(/.test(src));
+  const muteAt = src.indexOf("setDeployNotifyMuted(true)");
+  const screenerLoopAt = src.indexOf("SCREENING CYCLE", muteAt);
+  check("deploy notify muted right before the screener agentLoop", muteAt > 0 && screenerLoopAt > muteAt && screenerLoopAt - muteAt < 300);
+  check("deploy notify unmuted in screening finally", /\} finally \{\n\s+setDeployNotifyMuted\(false\);/.test(src));
 } catch (e) {
   fail++;
   console.error("\nFATAL:", e.stack);
