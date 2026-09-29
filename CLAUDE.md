@@ -633,6 +633,17 @@ Agent Meridian HiveMind sync is handled by `hivemind.js`. It uses built-in Agent
   - Low-yield closes at 1–3h (n=437) were small net positives.
   - `TP_PROPOSAL` appeared 0 times in 92 days of logs, so the manager LLM makes almost no decisions.
   - Deploy hour and weekday showed no consistent loss pattern. The only `!!` block, 20–21 WIB, is explained by a single position, AMERICA (deployed 20:41 WIB). Don't add time-based rules without new evidence.
+- **In-range trailing TP never closes a position (confirmed 2026-09-29, fix deferred by user).**
+  - `updatePnlAndCheckExits` returns `TRAILING_TP` for an in-range position when the give-back floor (half the peak) is hit or the 90m in-range grace expires. Every trailing exit carries `needs_confirmation`, so it goes through the 30s recheck (`index.js` `scheduleTrailingDropConfirmation`).
+  - The confirmed exit is then cancelled by `state.js` (the `confirmed_trailing_exit_until` block) because the position is in range. That is exactly the condition that triggered it.
+  - Live logs showed 85 "Trailing TP confirmed exit cancelled … back in range" lines. OOR trailing exits work.
+  - This is also why `TP_PROPOSAL` never fires.
+  - 60-day impact, positions with peak ≥5%:
+    - 64 break-even closes: peak 7.3% → −0.90% (−$50).
+    - 17 stop losses: peak 7.1% → −0.48%.
+    - The floor would have closed them around +3.5%, roughly $250–300 over 60 days.
+  - Risk of fixing: in-range dips that later recover (max-age closes: peak 10.1% → 8.7%) could be cut earlier. This can't be quantified, because the rule has never fired.
+  - Proposed fix: tag exits from the in-range branches (e.g. `in_range_exit: true`), carry the tag through `queueTrailingDropConfirmation` / `resolvePendingTrailingDrop`, and skip the in-range cancellation for tagged exits. Revisit at the 2026-10-16 evaluation.
 - **Close tx expiry (observed 2026-09-29, not changed).** 6 of about 75 close attempts in 3 days failed with `block height exceeded`, 6–30s after the tx was built. The retry landed within 3–60s every time. The bot sets no priority fee, and neither does the DLMM SDK. e/acc-SOL (a rug) expired twice and took about 90s to close. Revisit (priority fee or a resend loop) only if expiries grow or start costing measurable PnL.
 - **Security audit findings not yet patched** (surfaced 2026-09-28, deferred by user choice — swap-cap and secret-file-permission fixes were prioritized instead):
   - `envcrypt.js` "encryption" is a repeating-key XOR cipher, not real encryption. **Left as is (re-checked 2026-09-29):** the key (`.envrypt` / `ENVRYPT_KEY`) lives on the same host as `.env`, so authenticated encryption would add little. The real protection is `chmod 600` on `.env` / `user-config.json` (see Secret File Permissions).
