@@ -172,18 +172,21 @@ export function recordPoolDeploy(poolAddress, deployData) {
     entry.base_mint = deployData.base_mint;
   }
 
-  // Set cooldown for low yield closes — pool wasn't profitable enough, don't redeploy soon
-  if (deploy.close_reason === "low yield") {
+  // Set cooldown for low yield closes — pool wasn't profitable enough, don't redeploy soon.
+  // Pattern match, not equality: since deterministic closes run in code, the reason is the
+  // rule's own text ("Low yield: fee/TVL 0.2% < min 1% …", "Rule 5: low yield (…)"), not the
+  // LLM's bare "low yield" — an exact match silently stopped this cooldown from ever firing.
+  if (/low.?yield/i.test(deploy.close_reason || "")) {
     const cooldownHours = 4;
     const cooldownUntil = setPoolCooldown(entry, cooldownHours, "low yield");
     log("pool-memory", `Cooldown set for ${entry.name} until ${cooldownUntil} (low yield close)`);
   }
 
-  // Set cooldown after emergency exits (Rule 7 volume collapse, Rule 8 rapid dump)
-  // Prevents immediate re-entry into a pool that just dumped — the main cause of cycling
-  const isEmergencyClose = ["rapid dump", "volume collapse"].some(
-    (s) => (deploy.close_reason || "").includes(s)
-  );
+  // Set cooldown after emergency exits (Rule 7 volume collapse, Rule 8 rapid dump,
+  // Rule 11 liquidity collapse). Prevents immediate re-entry into a pool that just dumped —
+  // the main cause of cycling. Rule 11 (LP pulled / rug) was missing, and its reason matches
+  // neither this list nor the in-range-dump regex, so a rug left the pool with no cooldown.
+  const isEmergencyClose = /rapid dump|volume collapse|liquidity collapse/i.test(deploy.close_reason || "");
   if (isEmergencyClose) {
     const hours = config.management.emergencyExitCooldownHours ?? 4;
     const cooldownUntil = setPoolCooldown(entry, hours, deploy.close_reason);

@@ -288,6 +288,12 @@ LLM used, so notifications, auto-swap and `recordPerformance` still run. The LLM
 for judgment calls: `TP_PROPOSAL`, `INSTRUCTION`, `CLAIM`. On a failed close the position's
 `_pollTriggeredAt` entry is cleared so the 30s poll retries immediately.
 
+**Close-reason matching:** anything that parses `close_reason` must use a case-insensitive pattern, never string equality.
+- Since direct closes, reasons are the rule's own text, for example `Low yield: fee/TVL … < min …`, `Rule 5: low yield (…)` or `Rule 11: liquidity collapse (…)`, not the LLM's old bare `low yield`.
+- `pool-memory.js` had `close_reason === "low yield"`, so the 4h low-yield pool cooldown silently stopped firing. It now uses `/low.?yield/i`.
+- The emergency cooldown list also lacked Rule 11 (liquidity collapse / rug). Such a close matched neither it nor the in-range-dump regex (`stop.?loss|sell.?pressure`), so a rugged pool got no cooldown at all. It is now `/rapid dump|volume collapse|liquidity collapse/i`.
+- Test: `test:pool-cooldown`.
+
 Why: live data (last 30d) had 45 stop-loss closes on positions that had peaked ≥1% (break-even
 armed). 13 of them had break-even close decisions in the logs (one was flagged 11 times) and
 still ended at −10.7% on average — the decision was made, but execution waited on the LLM loop

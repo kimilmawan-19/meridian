@@ -30,6 +30,7 @@
     "test:direct-close": "node test/test-direct-close.mjs",
     "test:telegram-ux": "node test/test-telegram-ux.mjs",
     "test:grace-log": "node test/test-grace-log.mjs",
+    "test:pool-cooldown": "node test/test-pool-cooldown-reasons.mjs",
     "test:agent": "DRY_RUN=true node test/test-agent.js",
     "postinstall": "node scripts/patch-anchor.js"
   },
