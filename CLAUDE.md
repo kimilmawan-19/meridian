@@ -348,6 +348,18 @@ const actualBaseFee = baseFactor > 0
   - Why: the candidate blocks already carry pool memory, smart wallets, active bin and balance. Live logs (3 days) showed `get_pool_memory` called 93× and `check_smart_wallets_on_pool` 21×. Every tool call is another full-conversation LLM round-trip.
   - The goal contains "deploy", so `tool_choice=required` used to be forced on step 1. That made a `NO DEPLOY` answer cost at least 2 calls, and it was sometimes rejected outright.
   - Chat and REPL deploys (also the SCREENER role) keep the full role tools, because they need `get_top_candidates` and `get_active_bin`. Test: `test:llm-calls`.
+- **Deploy strategy consistency (2026-09-29):**
+  - `deploy_position.strategy` enum is `["curve", "bid_ask"]`. It used to be `["bid_ask", "spot"]`: no `curve`, and the executor always rejects `spot`.
+  - The screening goal no longer injects the `strategy-library.json` active entry. That entry is "Custom Ratio Spot", which says LP spot, dual-sided and fixed `bins_above`, all of which contradict the executor and the DEPLOY RULES.
+  - Live logs had 836 `SAFETY_BLOCK`s in 30 days (mostly "volatility ≤ curveMaxVolatility → use curve") and 86 repaired-JSON deploys, each one an extra LLM round-trip.
+  - The strategy library is still used by the `/strategy` tools in GENERAL chat.
+- **Removed the per-candidate TA entry fetch** (`confirmIndicatorPreset` with `skipEnabledCheck: true`) and its `ta_entry` prompt line.
+  - It ran for every candidate even with `indicators.enabled=false`, and was advisory prompt text only, never validated.
+  - It shared the Jupiter rate limit with auto-swap: 662 indicator 429s in 30 days.
+  - The TA exit (`taExitEnabled`, off by default) is unchanged.
+- **LPAgent stops after a rejected key** (`tools/dlmm.js` `fetchLpAgentOpenPositions`). A 401/403 disables it until restart.
+  - Live: 92,696 `HTTP 401` in 30 days (about 3,000 a day). `.env` has no `LPAGENT_API_KEY`, so the process still carries a stale key, probably from the pm2 environment.
+  - Test: `test:llm-calls`.
 - **LLM call volume before these changes** (3 days, 2026-09-27..29):
   - Management: 78 runs, 178 steps. Screening: 87 runs, 464 steps (median 4, 16 runs at 8+).
   - System prompt size is not the cost driver: about 3k tokens for SCREENER and 1.3k for MANAGER. Call count is.

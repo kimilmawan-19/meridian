@@ -903,9 +903,11 @@ let _positionsCache = null;
 let _positionsCacheAt = 0;
 let _positionsInflight = null; // deduplicates concurrent calls
 const LPAGENT_API = "https://api.lpagent.io/open-api/v1";
+// A rejected key stays rejected: live logs had ~3,000 HTTP 401s a day from a stale key.
+let _lpAgentKeyRejected = false;
 
-async function fetchLpAgentOpenPositions(walletAddress) {
-  if (!process.env.LPAGENT_API_KEY) return {};
+export async function fetchLpAgentOpenPositions(walletAddress) {
+  if (!process.env.LPAGENT_API_KEY || _lpAgentKeyRejected) return {};
 
   const url = `${LPAGENT_API}/lp-positions/opening?owner=${walletAddress}`;
   try {
@@ -917,6 +919,10 @@ async function fetchLpAgentOpenPositions(walletAddress) {
     if (!res.ok) {
       const body = await res.text().catch(() => "");
       log("lpagent_api", `HTTP ${res.status} for owner ${walletAddress.slice(0, 8)}: ${body.slice(0, 160)}`);
+      if (res.status === 401 || res.status === 403) {
+        _lpAgentKeyRejected = true;
+        log("lpagent_api", "LPAGENT_API_KEY rejected — LPAgent calls disabled until restart");
+      }
       return {};
     }
     const data = await res.json();

@@ -167,8 +167,8 @@ WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
           },
           strategy: {
             type: "string",
-            enum: ["bid_ask", "spot"],
-            description: "DLMM strategy type. If user specifies, use exactly what they said. Otherwise use the active strategy's lp_strategy field."
+            enum: ["curve", "bid_ask"],
+            description: "DLMM strategy type. Follow the DEPLOY RULES: volatility <= curveMaxVolatility → curve; above → bid_ask. \"spot\" is not supported."
           },
           bins_below: {
             type: "number",
