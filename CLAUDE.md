@@ -597,6 +597,20 @@ Agent Meridian HiveMind sync is handled by `hivemind.js`. It uses built-in Agent
   - AMERICA-SOL (bid_ask, bin_step 200) fell more than 59% through its whole range in under 15s and realized −63% (1.77 → 0.65 SOL).
   - Its entry metrics looked clean: age 90h, mcap $1.6M, top10 15%, no rugpull/wash flag. No exit rule could react inside one 30s poll.
   - The executor deploy guard enforces the cap on every deploy, and `evolveThresholds` never changes it. Re-check by grouping `lessons.json` performance by bin_step after about 4 weeks.
+- **Live `maxPositionAgeMinutes` raised from 240 to 600 on 2026-09-29** (user edited `user-config.json`; backup at `user-config.json.bak-maxage`). With the default 3 × 45m grace, the hard ceiling moves from 375m (about 6.25h) to 735m (about 12.25h). The key is not in `CONFIG_MAP`, so change it by editing the file and restarting.
+  - Evidence, 60 days, 1456 positions. Median hold of max-age closes was 6.3h, meaning nearly all of them hit the hard ceiling while still earning. Only 4 of 246 closed as "no longer earning". The rest earned a median 0.67–0.75% of capital per hour at close, with an 85–87% win rate.
+  - By hold time: positions closed within 6h made −$623 in total, mostly stop losses. Positions held 6–12h made +$1064, with only 4 stop losses. Closing a proven position to open a new one trades it for the loss-prone first 6h.
+  - Risk: there was no data past about 6.3h before this change.
+  - Re-check on 2026-10-16 with `diag-explore2.mjs`. Look at PnL/fee in the 6–12h and 12h+ buckets, any stop losses past 6h, and whether "no longer earning" closes appear.
+  - Revert: `cp user-config.json.bak-maxage user-config.json` and restart.
+- **Other checks from the same exploration (2026-09-29), no action taken:**
+  - "Insufficient SOL" screening skips were 50% of cycles over 92 days, but only 17 in the last 14 days. The historical count predates fair-share sizing.
+  - The binding slot limit is now the caution cap, about 15 skips a day. Performance records don't store the regime at deploy, so the cap's value is unproven.
+  - Repeat deploys into the same pool did fine, including after a loss. A 6th+ deploy was the best group.
+  - Positions in the largest size quartile were weakest even within the same week. This is mostly driven by AMERICA; watch it.
+  - Low-yield closes at 1–3h (n=437) were small net positives.
+  - `TP_PROPOSAL` appeared 0 times in 92 days of logs, so the manager LLM makes almost no decisions.
+  - Deploy hour and weekday showed no consistent loss pattern. The only `!!` block, 20–21 WIB, is explained by a single position, AMERICA (deployed 20:41 WIB). Don't add time-based rules without new evidence.
 - **Close tx expiry (observed 2026-09-29, not changed).** 6 of about 75 close attempts in 3 days failed with `block height exceeded`, 6–30s after the tx was built. The retry landed within 3–60s every time. The bot sets no priority fee, and neither does the DLMM SDK. e/acc-SOL (a rug) expired twice and took about 90s to close. Revisit (priority fee or a resend loop) only if expiries grow or start costing measurable PnL.
 - **Security audit findings not yet patched** (surfaced 2026-09-28, deferred by user choice — swap-cap and secret-file-permission fixes were prioritized instead):
   - `envcrypt.js` "encryption" is a repeating-key XOR cipher, not real encryption. **Left as is (re-checked 2026-09-29):** the key (`.envrypt` / `ENVRYPT_KEY`) lives on the same host as `.env`, so authenticated encryption would add little. The real protection is `chmod 600` on `.env` / `user-config.json` (see Secret File Permissions).
