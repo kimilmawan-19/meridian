@@ -386,6 +386,11 @@ Fixed:
   default. If legitimate swaps start failing during high volatility, loosen via
   `update_config swapSlippageBps=<value>`.
 
+**Jupiter 429 retry (`tools/wallet.js` `fetchWithRateLimitRetry`):** the swap order request retries a 429 after 2s, 5s and 10s. Other statuses are not retried.
+- Live logs (3 days, 2026-09-27..29): 6 of 98 swaps failed with `429 Too many requests`. All 6 were the first order request of the auto-swap right after a close (CALI $110, e/acc $125, CAKE $88, COLLECT, WORLD), so the base token stayed in the wallet while the LLM reported "auto-swapped".
+- The default Jupiter key (`DEFAULT_JUPITER_API_KEY`) is shared by every install. A personal `JUPITER_API_KEY` in `.env` lowers the chance of 429s.
+- Test: `test:swap-retry`.
+
 ## Secret File Permissions (setup.js, telegram.js, tools/executor.js, lessons.js)
 
 Security-audit finding: `.env` (contains `WALLET_PRIVATE_KEY` and all API keys) and
@@ -571,6 +576,7 @@ Agent Meridian HiveMind sync is handled by `hivemind.js`. It uses built-in Agent
   - AMERICA-SOL (bid_ask, bin_step 200) fell more than 59% through its whole range in under 15s and realized −63% (1.77 → 0.65 SOL).
   - Its entry metrics looked clean: age 90h, mcap $1.6M, top10 15%, no rugpull/wash flag. No exit rule could react inside one 30s poll.
   - The executor deploy guard enforces the cap on every deploy, and `evolveThresholds` never changes it. Re-check by grouping `lessons.json` performance by bin_step after about 4 weeks.
+- **Close tx expiry (observed 2026-09-29, not changed).** 6 of about 75 close attempts in 3 days failed with `block height exceeded`, 6–30s after the tx was built. The retry landed within 3–60s every time. The bot sets no priority fee, and neither does the DLMM SDK. e/acc-SOL (a rug) expired twice and took about 90s to close. Revisit (priority fee or a resend loop) only if expiries grow or start costing measurable PnL.
 - **Security audit findings not yet patched** (surfaced 2026-09-28, deferred by user choice — swap-cap and secret-file-permission fixes were prioritized instead):
   - `envcrypt.js` "encryption" is a repeating-key XOR cipher, not real encryption. **Left as is (re-checked 2026-09-29):** the key (`.envrypt` / `ENVRYPT_KEY`) lives on the same host as `.env`, so authenticated encryption would add little. The real protection is `chmod 600` on `.env` / `user-config.json` (see Secret File Permissions).
   - ~~Telegram token leaking into logs.~~ **Downgraded to low risk (re-checked 2026-09-29).**

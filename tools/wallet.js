@@ -142,6 +142,19 @@ export function normalizeMint(mint) {
   return mint;
 }
 
+// Jupiter's shared API key is rate-limited; every 429 seen live was the first order request of an
+// auto-swap right after a close, which then left the base token stranded in the wallet.
+const RATE_LIMIT_RETRY_DELAYS_MS = [2000, 5000, 10000];
+
+export async function fetchWithRateLimitRetry(url, options, label, delays = RATE_LIMIT_RETRY_DELAYS_MS) {
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(url, options);
+    if (res.status !== 429 || attempt >= delays.length) return res;
+    log("swap_warn", `${label} rate-limited (429), retry ${attempt + 1}/${delays.length} in ${delays[attempt] / 1000}s`);
+    await new Promise((r) => setTimeout(r, delays[attempt]));
+  }
+}
+
 export async function swapToken({
   input_mint,
   output_mint,
@@ -187,9 +200,9 @@ export async function swapToken({
     const orderUrl = `${JUPITER_SWAP_V2_API}/order?${search.toString()}`;
     const jupiterApiKey = getJupiterApiKey();
 
-    const orderRes = await fetch(orderUrl, {
+    const orderRes = await fetchWithRateLimitRetry(orderUrl, {
       headers: jupiterApiKey ? { "x-api-key": jupiterApiKey } : {},
-    });
+    }, "Swap V2 order");
     if (!orderRes.ok) {
       const body = await orderRes.text();
       throw new Error(`Swap V2 order failed: ${orderRes.status} ${body}`);
