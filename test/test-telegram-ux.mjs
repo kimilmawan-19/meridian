@@ -112,6 +112,42 @@ try {
   check("muted notifyDeploy sends nothing", out.muted === 0, `(got ${out.muted})`);
   check("unmuted notifyDeploy sends once", out.unmuted === 1, `(got ${out.unmuted})`);
 
+  console.log("\n[5c] close notifications survive raw rule reasons, 400s and network drops");
+  // Stubbed fetch replays a script of responses: "ok" | "400" | "throw". Records every body sent.
+  const runProbe = (script, body) => JSON.parse(execFileSync(process.execPath, ["--input-type=module", "-e", `
+    const plan = ${JSON.stringify(script)}; const sent = [];
+    globalThis.fetch = async (url, opts) => {
+      const step = plan.shift() ?? "ok";
+      sent.push(JSON.parse(opts.body));
+      if (step === "throw") throw new Error("fetch failed");
+      if (step === "400") return { ok: false, status: 400, text: async () => "can't parse entities", json: async () => ({}) };
+      return { ok: true, json: async () => ({ ok: true, result: { message_id: 1 } }), text: async () => "" };
+    };
+    const tg = await import(${JSON.stringify(new URL("../telegram.js", import.meta.url).href)});
+    ${body}
+    console.log(JSON.stringify(sent.filter((b) => b.text !== undefined)));
+    process.exit(0); // a live message typing timer would keep the process alive`], {
+    env: { ...process.env, TELEGRAM_BOT_TOKEN: "123:fake", TELEGRAM_CHAT_ID: "1", DRY_RUN: "true" },
+    encoding: "utf8",
+    timeout: 30_000,
+  }).trim().split("\n").pop());
+  const closeCall = `await tg.notifyClose({ pair: "EL63-SOL", pnlUsd: -1, pnlPct: -9.98, reason: "Stop loss: PnL -11.21% <= -10.2% [per-position]" });`;
+
+  const esc = runProbe(["ok"], closeCall);
+  check("raw '<=' reason is escaped in the HTML body", esc.length === 1 && esc[0].parse_mode === "HTML" && esc[0].text.includes("&lt;= -10.2%") && !esc[0].text.includes("<= -10.2%"), `(got ${JSON.stringify(esc)})`);
+
+  const fb = runProbe(["400", "ok"], closeCall);
+  check("HTML 400 → one plain-text resend", fb.length === 2 && fb[1].parse_mode === undefined && fb[1].text.includes("<= -10.2%") && !fb[1].text.includes("<b>"), `(got ${JSON.stringify(fb)})`);
+
+  const net = runProbe(["throw", "ok"], closeCall);
+  check("network drop → retried and delivered", net.length === 2 && net[1].parse_mode === "HTML", `(got ${net.length} sends)`);
+
+  const muted = runProbe([], `tg.setCloseNotifyMuted(true); ${closeCall} tg.setCloseNotifyMuted(false);`);
+  check("close muted during management report → no send", muted.length === 0);
+
+  const chat = runProbe([], `await tg.createLiveMessage("🤖 Live Update", "chat"); ${closeCall}`);
+  check("chat live message open → close still notified", chat.some((b) => String(b.text).includes("Closed")), `(got ${JSON.stringify(chat.map((b) => b.text))})`);
+
   console.log("\n[6] mirrors match index.js source");
   const fs = await import("fs");
   const src = fs.readFileSync(new URL("../index.js", import.meta.url), "utf8");
@@ -126,6 +162,8 @@ try {
   const screenerLoopAt = src.indexOf("SCREENING CYCLE", muteAt);
   check("deploy notify muted right before the screener agentLoop", muteAt > 0 && screenerLoopAt > muteAt && screenerLoopAt - muteAt < 300);
   check("deploy notify unmuted in screening finally", /\} finally \{\n\s+setDeployNotifyMuted\(false\);/.test(src));
+  check("close notify muted only with the management live message", src.includes("if (liveMessage) setCloseNotifyMuted(true);"));
+  check("close notify unmuted in management finally", /_managementBusy = false;\n\s+if \(liveMessage\) setCloseNotifyMuted\(false\);/.test(src));
 } catch (e) {
   fail++;
   console.error("\nFATAL:", e.stack);

@@ -27,6 +27,7 @@ import {
   isEnabled as telegramEnabled,
   createLiveMessage,
   setDeployNotifyMuted,
+  setCloseNotifyMuted,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
 import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop, batchUpdateMarketData, batchUpdateLiveVolatility, getOorDirection, wasRecentlyOorAbove, updateR9GraceZone, isInEntryAccumulation, effectiveStopLossPct, recordTpVeto, resetTpVeto, markTaExitTriggered } from "./state.js";
@@ -649,6 +650,7 @@ export async function runManagementCycle({ silent = false } = {}) {
 
     if (needsAction.length > 0 && !silent && telegramEnabled()) {
       liveMessage = await createLiveMessage("🔄 Management Cycle", "Executing actions...");
+      if (liveMessage) setCloseNotifyMuted(true); // this report lists the closes; avoid a second "Closed" message
     }
 
     // ── Execute deterministic closes directly (no LLM round-trip) ────
@@ -792,6 +794,7 @@ After executing, write a brief one-line result per position.
     mgmtFailed = true;
   } finally {
     _managementBusy = false;
+    if (liveMessage) setCloseNotifyMuted(false);
     if (!silent && telegramEnabled()) {
       // Report only cycles where something happened (actions ran or the cycle failed).
       if (mgmtReport && (liveMessage || mgmtFailed)) {
