@@ -795,6 +795,7 @@ After executing, write a brief one-line result per position.
   } finally {
     _managementBusy = false;
     if (liveMessage) setCloseNotifyMuted(false);
+    pruneGraceLogged(positions);
     if (!silent && telegramEnabled()) {
       // Report only cycles where something happened (actions ran or the cycle failed).
       if (mgmtReport && (liveMessage || mgmtFailed)) {
@@ -811,6 +812,27 @@ After executing, write a brief one-line result per position.
     drainTelegramQueue().catch(() => { });
   }
   return mgmtReport;
+}
+
+// Entry-grace skip logs used to be written on every poll for every rule and position
+// (~20–35k lines/day; logs/ grew to 600 MB). Now a line is written only when a position
+// enters or leaves a rule's entry grace. Keys of closed positions are pruned each cycle.
+const _graceLogged = new Set(); // `${rule}:${position}` currently logged as in-grace
+function graceDetail(binsKnown, depthPct, graceDepth, strategy) {
+  return `${binsKnown ? `depth=${depthPct.toFixed(1)}% vs grace ${graceDepth}%` : "bin data unavailable (fail-safe)"}, strategy=${strategy}`;
+}
+function logGraceTransition(rule, position, inGrace, detail) {
+  const key = `${rule}:${position.position}`;
+  if (inGrace && !_graceLogged.has(key)) {
+    _graceLogged.add(key);
+    log("market_data", `Rule ${rule} skipped for ${position.pair}: entry grace active (${detail})`);
+  } else if (!inGrace && _graceLogged.delete(key)) {
+    log("market_data", `Rule ${rule} entry grace ended for ${position.pair} (${detail})`);
+  }
+}
+function pruneGraceLogged(openPositions) {
+  const open = new Set(openPositions.map((p) => p.position));
+  for (const key of _graceLogged) if (!open.has(key.slice(key.indexOf(":") + 1))) _graceLogged.delete(key);
 }
 
 // OOR alerts fire once per out-of-range episode (they used to repeat every management cycle,
@@ -1887,12 +1909,8 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
       graceDepth: graceDepth5,
       strategy: deployStrategy5,
     } = isInEntryAccumulation(r5tracked, position, managementConfig, config.strategy.strategy);
-    if (inEntryAccumulation5) {
-      const why5 = !binsKnown5
-        ? "bin data unavailable (fail-safe)"
-        : `depth=${depthPct5.toFixed(1)}% < ${graceDepth5}% or confirm pending`;
-      log("market_data", `Rule 5 skipped for ${position.pair}: entry grace active (${why5}, strategy=${deployStrategy5})`);
-    } else {
+    logGraceTransition(5, position, inEntryAccumulation5, graceDetail(binsKnown5, depthPct5, graceDepth5, deployStrategy5));
+    if (!inEntryAccumulation5) {
       return { action: "CLOSE", rule: 5, reason: `low yield (depth=${depthPct5.toFixed(0)}% strat=${deployStrategy5})` };
     }
   }
@@ -1975,12 +1993,7 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
           (Date.now() - new Date(graceExitedAt7).getTime()) < confirmMs7
         ));
 
-      if (inEntryAccumulation7) {
-        const why7 = !binsKnown7
-          ? "bin data unavailable (fail-safe)"
-          : `depth=${depthPct7.toFixed(1)}% < ${graceDepth7}% or confirm pending`;
-        log("market_data", `Rule 7 skipped for ${position.pair}: entry grace active (${why7}, strategy=${deployStrategy7})`);
-      }
+      logGraceTransition(7, position, inEntryAccumulation7, graceDetail(binsKnown7, depthPct7, graceDepth7, deployStrategy7));
 
       // Minimum absolute transaction floor: a sell/buy ratio is meaningless in a near-dead
       // window (e.g. 1 sell vs 0 buys). Require enough total txns to be a valid signal.
@@ -2038,12 +2051,7 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
           (Date.now() - new Date(graceExitedAt11).getTime()) < confirmMs11
         ));
 
-      if (inEntryAccumulation11) {
-        const why11 = !binsKnown11
-          ? "bin data unavailable (fail-safe)"
-          : `depth=${depthPct11.toFixed(1)}% < ${graceDepth11}% or confirm pending`;
-        log("market_data", `Rule 11 skipped for ${position.pair}: entry grace active (${why11}, strategy=${deployStrategy11})`);
-      }
+      logGraceTransition(11, position, inEntryAccumulation11, graceDetail(binsKnown11, depthPct11, graceDepth11, deployStrategy11));
 
       if (
         oorDir11 !== "ABOVE" &&
@@ -2094,12 +2102,7 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
           (Date.now() - new Date(graceExitedAt8).getTime()) < confirmMs8
         ));
 
-      if (inEntryAccumulation8) {
-        const why = !binsKnown8
-          ? "bin data unavailable (fail-safe)"
-          : `depth=${depthPct8.toFixed(1)}% < ${graceDepth8}% or confirm pending`;
-        log("market_data", `Rule 8 skipped for ${position.pair}: entry grace active (${why}, strategy=${deployStrategy8})`);
-      }
+      logGraceTransition(8, position, inEntryAccumulation8, graceDetail(binsKnown8, depthPct8, graceDepth8, deployStrategy8));
 
       if (oorDir8 !== "ABOVE" && !recentOorAbove8 && ageOk8 && !inEntryAccumulation8) {
         const priceChange5m = marketData.price_change_5m;
@@ -2193,12 +2196,7 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
       const pnlBelowSafety = (position.pnl_pct ?? 0) < safetyPnlPct;
       const priceFalling = (marketData.price_change_5m ?? 0) <= 0;
       const ageOk = (position.age_minutes ?? 0) >= minAgeMin;
-      if (inEntryAccumulation9) {
-        const why = !binsKnown9
-          ? "bin data unavailable (fail-safe)"
-          : `depth=${depthPct9.toFixed(1)}% < ${graceDepth9}% or confirm pending`;
-        log("market_data", `Rule 9 skipped for ${position.pair}: entry grace active (${why}, strategy=${deployStrategy9})`);
-      }
+      logGraceTransition(9, position, inEntryAccumulation9, graceDetail(binsKnown9, depthPct9, graceDepth9, deployStrategy9));
       if (!pnlSuspect && ageOk && !inEntryAccumulation9 && oorDir9 !== "ABOVE" && !recentOorAbove9 && pnlBelowSafety && priceFalling && volumeWindow.length >= streakNeeded) {
         let streak = 0;
         for (let i = volumeWindow.length - 1; i >= 0; i--) {

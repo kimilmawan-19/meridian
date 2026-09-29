@@ -440,6 +440,16 @@ Higher divisor = tighter stop relative to peak.
 
 `updatePnlAndCheckExits`' `LOW_YIELD` exit (position fees extrapolated to 24h < `minFeePerTvl24h`, after `minAgeBeforeYieldCheck`) runs **before** `getDeterministicCloseRule` in the management cycle, so it used to pre-empt Rule 5 (low yield) — including Rule 5's depth-aware entry grace. A single-sided SOL position earns ~nothing until price trades down into its range, so it was being closed at 60m before its liquidity was ever active. Both now share `isInEntryAccumulation(tracked, positionData, mgmtConfig, fallbackStrategy)` (state.js): grace holds while in range and depth < `curveEntryGraceDepthPct` (50) / `bidAskEntryGraceDepthPct` (80), or until the breach has persisted `entryGraceConfirmMinutes` (15); fail-safe active when bin data is missing; no grace when out of range.
 
+**Grace logging (index.js `logGraceTransition`):**
+- A `Rule N skipped … entry grace active` line is written only when a position **enters** a rule's grace, and `Rule N entry grace ended` only when it leaves (Rules 5, 7, 8, 9, 11).
+- It used to be written on every 30s poll for every rule and position: about 20–35k identical lines a day, and `logs/` reached 603 MB, enough that reading one day's log in Node ran out of memory.
+- `_graceLogged` is pruned against open positions at the end of every management cycle.
+
+**Live config note:** the live `user-config.json` has `bidAskEntryGraceDepthPct: 95` (it has been 95 since grace logging began, 2026-05-29) and a curve grace of 70.
+- At 95, Rules 7/8/9/11 and the low-yield exits practically never fire for an in-range bid_ask position.
+- It was left as is, because bid_ask is the best-performing strategy at this setting (60d: n=742, 65% win, +514).
+- Watch whether bid_ask capital now idles longer, since the low-yield exit shares this grace (commit 0ae1788).
+
 ## Early-Dump SL Override (state.js)
 
 Normally `minAgeBeforeStopLoss` (default 15m) suppresses SL in the first 15 minutes to avoid noise. The early-dump override bypasses this gate when the position is clearly dying:
