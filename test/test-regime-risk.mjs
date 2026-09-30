@@ -170,6 +170,20 @@ try {
   check("1 already CLOSE-flagged by another rule → projected count 3, no extra trim",
     computeTrimDecision(positions4, oneAlreadyClosing, true, "bearish", 3) === null);
 
+  console.log("\n[6] Rule 10 needs a confirmed regime (live: 67/104 trims on a one-assessment caution blip)");
+  const { isRegimeConfirmed } = await import("../market-regime.js");
+  check("healthy → caution (blip) is not confirmed", isRegimeConfirmed("healthy", "caution") === false);
+  check("caution → caution is confirmed", isRegimeConfirmed("caution", "caution") === true);
+  check("caution → bearish / bearish → caution are confirmed", isRegimeConfirmed("caution", "bearish") && isRegimeConfirmed("bearish", "caution"));
+  check("caution → healthy is not confirmed", isRegimeConfirmed("caution", "healthy") === false);
+  check("assessment error (unknown) never confirms", !isRegimeConfirmed("unknown", "caution") && !isRegimeConfirmed("caution", "unknown"));
+  const fs = await import("fs");
+  const index = fs.readFileSync(new URL("../index.js", import.meta.url), "utf8");
+  check("screening sets _regimeConfirmed from the previous regime before overwriting it",
+    /_regimeConfirmed = isRegimeConfirmed\(_lastRegime, regime\.regime\);[^\n]*\n\s*_lastRegime = regime\.regime;/.test(index));
+  check("Rule 10 is gated on _regimeConfirmed",
+    index.includes(`if (config.marketRegime?.enabled && activeRegime !== "healthy" && config.marketRegime._regimeConfirmed) {`));
+
 } catch (e) {
   fail++;
   console.error("\nFATAL:", e.stack);

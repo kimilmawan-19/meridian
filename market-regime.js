@@ -34,6 +34,17 @@ let _solPriceHistory = [];
  *   >= 1.8 → caution  → raise quality bar for this cycle
  *   <  1.8 → healthy  → proceed normally
  */
+/**
+ * Rule 10 (trim-to-cap) acts only on a confirmed non-healthy regime: this AND the previous
+ * assessment are caution/bearish. Live 60d: 67 of 104 trims fired on a one-assessment caution
+ * blip (healthy before and after). SL/trailing tightening and the deploy cap still use the raw
+ * regime. "unknown" (assessment error) never confirms.
+ */
+export function isRegimeConfirmed(prevRegime, regime) {
+  const nonHealthy = (r) => r === "caution" || r === "bearish";
+  return nonHealthy(prevRegime) && nonHealthy(regime);
+}
+
 export async function assessMarketRegime(candidates = [], solPriceUsd = null) {
   try {
     // Layer 1 + 2: fetch both timeframes from Meteora (unfiltered trending)

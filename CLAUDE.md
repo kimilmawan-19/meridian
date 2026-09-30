@@ -536,7 +536,11 @@ The assessed regime is also written to runtime `config.marketRegime._activeRegim
 - **SL tightening** (`state.js` `effectiveStopLossPct`): the per-position `sl_pct_override` **and** the `stopLossTightestPct` clamp are both scaled by `marketRegimeCautionSlMult` (0.85) / `marketRegimeBearishSlMult` (0.7) — a mid-vol-tier `-12%` SL becomes `-10.2%` in caution, `-8.4%` in bearish. Scaling the clamp too matters for the low-vol tier (`-8%`, equal to the default tightest bound): scaling `raw` alone would have no effect there (`-8×0.7=-5.6` is less negative than the unscaled `-8` clamp and would get pulled straight back to it) — this was the most common overshoot tier in observed data (CATWIF, reptilecoin, febu).
 - **Faster profit-taking** (`state.js` `updatePnlAndCheckExits`, trailing TP give-back): `effectiveDrop` is scaled by `marketRegimeCautionTrailMult` (0.8) / `marketRegimeBearishTrailMult` (0.6) before stale-peak widening, locking in gains sooner.
 - **SOL momentum signal** (`market-regime.js` Signal 4): self-samples `solPriceUsd` (already fetched each cycle, no extra API call) into a small in-memory ring buffer and scores a SOL-denominated dump (≥30m/60m windows) — almost every LP here is SOL-quoted, so a broad SOL move is systemic risk the token-breadth signals don't directly see. Raised the bearish/caution thresholds from the pre-signal 3.0/1.5 to 3.7/1.8 to absorb this signal's +1.0 max headroom (max score now 5.5).
-- **Rule 10 — trim-to-cap** (`index.js` `runManagementCycle`): when caution/bearish and open positions exceed `cautionMaxPositions` after other rules run, the single weakest-PnL still-open position is closed this cycle (rate-limited to 1/cycle to avoid dumping several at once — re-evaluated next cycle if still over cap).
+- **Rule 10 — trim-to-cap** (`index.js` `runManagementCycle`): when caution/bearish and open positions exceed `cautionMaxPositions` after other rules run, the single weakest-PnL still-open position is closed this cycle (rate-limited to 1/cycle to avoid dumping several at once — re-evaluated next cycle if still over cap). **Only on a confirmed regime** (since 2026-09-30).
+  - Confirmed means this assessment AND the previous one are caution/bearish (`isRegimeConfirmed` in market-regime.js, stored as runtime `config.marketRegime._regimeConfirmed` in the screening cycle).
+  - "unknown" (assessment error) never confirms. Before this, it counted as non-healthy.
+  - SL/trailing tightening, the caution deploy cap, size and the bearish skip still use the raw regime.
+  - Test: `test:regime-risk` [6].
 
 Both `effectiveStopLossPct` and `updatePnlAndCheckExits` take `regime` as an optional trailing parameter (default `"healthy"`) so any caller that doesn't pass it is unaffected — the three real call sites in `index.js` (management cycle, 30s PnL poll, `/simulate` debug command) all pass `config.marketRegime?._activeRegime ?? "healthy"`.
 
@@ -658,6 +662,23 @@ Agent Meridian HiveMind sync is handled by `hivemind.js`. It uses built-in Agent
   - Simulated "pause H hours after K losses": the best case was +$7 over 60 days (K=2, 2h). K=3 would have thrown away $48–55 of profit.
   - The longest run was 14 losses on 2026-08-30 (−$45 over 10h).
   - Lever for correlated losses: exposure while positions are open, which is already covered (regime-tightened SL/trailing, caution size and cap), not a deploy pause. Re-run `diag-streak.mjs` at the 2026-10-16 evaluation.
+- **Regime check audit (2026-09-30, `diag-regime.mjs` / `diag-regime2.mjs`, 60 days, 2981 assessments). Scoring and thresholds were NOT changed.**
+  - Distribution: healthy 69%, caution 30%, bearish 1%. Median gap between assessments 15m.
+  - **Reactive, not predictive.**
+    - Caution was already on in the 2h before the first loss of a loss cluster in only 13/29 clusters, against a 29% base rate. It was on during the cluster in 25/29.
+    - The regime score at deploy did not predict outcomes. Caution deploys did as well as or better than healthy ones.
+    - SOL30m during clusters was only −0.2% to −1.9%, so the losses were memecoin-specific. The SOL signal fired in 1% of assessments.
+  - **Stale.**
+    - With positions open, the regime was more than 30m old 31% of the time and more than 60m old 15% of the time.
+    - It is only assessed in screening, after the max-positions and SOL-short early returns (1241 skips).
+    - 12/29 clusters started with a regime more than 60m old. Refreshing in management was not done: it would add blips, and the regime doesn't lead.
+  - **Blips.**
+    - 527 of 1161 regime changes lasted a single assessment. 363 were a caution blip inside healthy (median score 2.0), 162 a healthy blip inside caution.
+    - Global smoothing was rejected on simulation:
+      - "Exit caution after 2 healthy" raised caution time from 31% to 47% for 26/29 vs 24/29 clusters.
+      - "Switch after 2 equal assessments, ≥2.5 immediate" dropped cluster coverage to 14/29.
+  - **Rule 10 fired on blips.** 67 of 104 trims happened during a one-assessment caution blip (55 matched: avg −0.65%, −$33). All trims were 4 open > cap 3. Hence the confirmed-regime gate above. Expected effect: about one needless close fewer per day. PnL at stake is small.
+  - Re-check at the 2026-10-16 evaluation. Count Rule 10 trims (should drop about 60%) and re-run both scripts.
 - **Close tx expiry (observed 2026-09-29, not changed).** 6 of about 75 close attempts in 3 days failed with `block height exceeded`, 6–30s after the tx was built. The retry landed within 3–60s every time. The bot sets no priority fee, and neither does the DLMM SDK. e/acc-SOL (a rug) expired twice and took about 90s to close. Revisit (priority fee or a resend loop) only if expiries grow or start costing measurable PnL.
 - **Security audit findings not yet patched** (surfaced 2026-09-28, deferred by user choice — swap-cap and secret-file-permission fixes were prioritized instead):
   - `envcrypt.js` "encryption" is a repeating-key XOR cipher, not real encryption. **Left as is (re-checked 2026-09-29):** the key (`.envrypt` / `ENVRYPT_KEY`) lives on the same host as `.env`, so authenticated encryption would add little. The real protection is `chmod 600` on `.env` / `user-config.json` (see Secret File Permissions).

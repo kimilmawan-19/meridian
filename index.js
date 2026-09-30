@@ -8,7 +8,7 @@ import { log } from "./logger.js";
 import { getMyPositions, getActiveBin } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates, fetchPoolVolatility } from "./tools/screening.js";
-import { assessMarketRegime } from "./market-regime.js";
+import { assessMarketRegime, isRegimeConfirmed } from "./market-regime.js";
 import { fetchPoolMarketData, getMarketDataStats } from "./tools/market-data.js";
 import { config, configMeta, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
 import { evolveThresholds, getPerformanceSummary, getDetailedPerformanceAnalysis } from "./lessons.js";
@@ -594,9 +594,10 @@ export async function runManagementCycle({ silent = false } = {}) {
     // Rule 10: regime trim-to-cap — existing positions get trimmed toward cautionMaxPositions
     // during caution/bearish too, not just new deploys blocked. Rate-limited to 1 position per
     // cycle (weakest PnL among still-STAY positions) to avoid dumping several at once.
+    // Only on a confirmed regime (2 consecutive non-healthy assessments) — see isRegimeConfirmed.
     {
       const activeRegime = config.marketRegime?._activeRegime ?? "healthy";
-      if (config.marketRegime?.enabled && activeRegime !== "healthy") {
+      if (config.marketRegime?.enabled && activeRegime !== "healthy" && config.marketRegime._regimeConfirmed) {
         const cap = config.marketRegime.cautionMaxPositions ?? 3;
         const stillOpen = positionData.filter((p) => actionMap.get(p.position)?.action === "STAY");
         const closingCount = positionData.length - stillOpen.length;
@@ -938,6 +939,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
     // Skip screening if market is broadly bearish to avoid deploying into hostile conditions
     if (config.marketRegime?.enabled) {
       const regime = await assessMarketRegime(candidates, currentBalance?.sol_price ?? null);
+      config.marketRegime._regimeConfirmed = isRegimeConfirmed(_lastRegime, regime.regime); // gates Rule 10 trim-to-cap
       _lastRegime = regime.regime; // drives caution screening slowdown on the next cycle
       config.marketRegime._activeRegime = regime.regime; // shared with computeDeployAmount (fair-share size modulation)
       if (regime.regime === "bearish" && config.marketRegime.skipOnBearish) {
@@ -999,6 +1001,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
       }
     } else {
       config.marketRegime._activeRegime = "healthy"; // regime detection off — never modulate deploy size
+      config.marketRegime._regimeConfirmed = false;
     }
 
     // Equity Fair-Share sizing: each position targets equity/maxPositions, scaled by regime.
