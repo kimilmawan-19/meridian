@@ -685,6 +685,11 @@ Agent Meridian HiveMind sync is handled by `hivemind.js`. It uses built-in Agent
   - Positions with the signal did no worse. For bid_ask they did better: +0.85% vs −1.09%, since a dump into the range is where bid_ask earns.
   - After the signal, the token rose again in 280 of 608 cases. Exiting at the signal would have cut max-age (+$509) and OOR (+$252) winners.
   - Adding the 1h-down filter (S2) changed nothing.
+- **Distance to ATH is recorded, not filtered (since 2026-09-30).**
+  - What it is: `price_vs_ath_pct` (OKX price as % of ATH, `tools/okx.js`), staged with the other screening signals (`stageSignals`, index.js). It lands in each position's `signal_snapshot` and in the `lessons.json` performance record at close.
+  - Record-only. It is not a Darwin weight (not in `SIGNAL_NAMES`), and `athFilterPct` stays off (default null).
+  - Staging runs only while `darwin.enabled` (default true), like every other snapshot field. Null when OKX had no data. Test: `test:signal-snapshot`.
+  - Evaluate after about 2–3 weeks (300+ closes): group PnL by `signal_snapshot.price_vs_ath_pct` bucket and strategy. Turn on `athFilterPct` only if a bucket is clearly net-negative.
 - **Close tx expiry (observed 2026-09-29, not changed).** 6 of about 75 close attempts in 3 days failed with `block height exceeded`, 6–30s after the tx was built. The retry landed within 3–60s every time. The bot sets no priority fee, and neither does the DLMM SDK. e/acc-SOL (a rug) expired twice and took about 90s to close. Revisit (priority fee or a resend loop) only if expiries grow or start costing measurable PnL.
 - **Security audit findings not yet patched** (surfaced 2026-09-28, deferred by user choice — swap-cap and secret-file-permission fixes were prioritized instead):
   - `envcrypt.js` "encryption" is a repeating-key XOR cipher, not real encryption. **Left as is (re-checked 2026-09-29):** the key (`.envrypt` / `ENVRYPT_KEY`) lives on the same host as `.env`, so authenticated encryption would add little. The real protection is `chmod 600` on `.env` / `user-config.json` (see Secret File Permissions).

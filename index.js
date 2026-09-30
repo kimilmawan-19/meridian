@@ -1360,6 +1360,9 @@ export async function runScreeningCycle({ silent = false } = {}) {
           smart_wallets_present: (sw?.in_pool?.length ?? 0) > 0,
           narrative_quality: n?.narrative ? "present" : "absent",
           volatility: pool.volatility ?? null,
+          // Record-only (not a Darwin weight): lets us check later whether entries near ATH lose more
+          // before turning on athFilterPct. OKX price as % of ATH; null when OKX had no data.
+          price_vs_ath_pct: pool.price_vs_ath_pct ?? null,
         });
       }
 

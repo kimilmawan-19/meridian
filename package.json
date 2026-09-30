@@ -35,6 +35,7 @@
     "test:swap-retry": "node test/test-swap-retry.mjs",
     "test:llm-retry": "node test/test-llm-retry.mjs",
     "test:llm-calls": "node test/test-llm-calls.mjs",
+    "test:signal-snapshot": "node test/test-signal-snapshot.mjs",
     "test:agent": "DRY_RUN=true node test/test-agent.js",
     "postinstall": "node scripts/patch-anchor.js"
   },
