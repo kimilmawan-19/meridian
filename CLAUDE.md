@@ -650,6 +650,14 @@ Agent Meridian HiveMind sync is handled by `hivemind.js`. It uses built-in Agent
   - Only 12 of 797 close reasons carried a decision PnL. Older ones are LLM free text, and break-even, max age, OOR and low yield don't print one.
   - Re-check with more data on 2026-10-16. Don't add pre-close refetches, on-chain PnL checks or a priority fee for freshness without new evidence.
   - The stop-loss reason now prints a rounded threshold (`Number(effSL.toFixed(2))`). Regime scaling used to produce labels like `<= -8.399999999999999%`. Test: `test:trailing-floor`.
+- **Loss streaks: checked 2026-09-30, no loss-streak pause added.**
+  - Tool: `diag-streak.mjs`, 60 days, 1456 positions. Each deploy is judged only by the closes the bot already knew about at deploy time.
+  - Closes do cluster: P(loss | previous close lost) is 41% vs 30% after a win. But that is parallel positions hit by the same market move, not a signal for the next deploy.
+  - Deploys made after ≥2 or ≥3 consecutive losses lost at the base rate (32–34% vs 34%). Shuffle-test p = 0.93 and 0.69.
+  - The regime-controlled split showed nothing either (healthy: 2+ streak −$0.03 per position vs +$0.34, n=163, not significant).
+  - Simulated "pause H hours after K losses": the best case was +$7 over 60 days (K=2, 2h). K=3 would have thrown away $48–55 of profit.
+  - The longest run was 14 losses on 2026-08-30 (−$45 over 10h).
+  - Lever for correlated losses: exposure while positions are open, which is already covered (regime-tightened SL/trailing, caution size and cap), not a deploy pause. Re-run `diag-streak.mjs` at the 2026-10-16 evaluation.
 - **Close tx expiry (observed 2026-09-29, not changed).** 6 of about 75 close attempts in 3 days failed with `block height exceeded`, 6–30s after the tx was built. The retry landed within 3–60s every time. The bot sets no priority fee, and neither does the DLMM SDK. e/acc-SOL (a rug) expired twice and took about 90s to close. Revisit (priority fee or a resend loop) only if expiries grow or start costing measurable PnL.
 - **Security audit findings not yet patched** (surfaced 2026-09-28, deferred by user choice — swap-cap and secret-file-permission fixes were prioritized instead):
   - `envcrypt.js` "encryption" is a repeating-key XOR cipher, not real encryption. **Left as is (re-checked 2026-09-29):** the key (`.envrypt` / `ENVRYPT_KEY`) lives on the same host as `.env`, so authenticated encryption would add little. The real protection is `chmod 600` on `.env` / `user-config.json` (see Secret File Permissions).
