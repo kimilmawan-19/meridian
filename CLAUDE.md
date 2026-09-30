@@ -702,6 +702,14 @@ Agent Meridian HiveMind sync is handled by `hivemind.js`. It uses built-in Agent
   - Evaluate after about 2–3 weeks (300+ closes): group PnL by `signal_snapshot.price_vs_ath_pct` bucket and strategy. Turn on `athFilterPct` only if a bucket is clearly net-negative.
   - Also recorded: `flow_consensus` (the 5m/1h/6h flow label the screener shows), `txn_buys_5m`/`txn_sells_5m` (DexScreener) and `net_buyers_1h` (Jupiter).
   - Use them the same way: keep or drop a flow/transaction filter or prompt line only if its buckets actually separate winners from losers. The aim is to simplify, not to add rules.
+- **Win rate / avg audit (2026-09-30, `diag-edge.mjs` + `diag-breakeven.mjs`, 60 days, 1465 positions). No change made.**
+  - Totals: win 65.7%, avg +0.56% (SE ±0.15%), median +0.39%, p10 −4.37%, p5 −9.82%, total +$452. Avg win $2.33 vs avg loss −$3.57.
+  - The leak is exits, not entries. Stop-loss closes are −$1219 (n=135, avg −9.9%). Losers that had peaked 0.5–5% are −$1111.
+  - **Entry features don't separate.** Every quartile of fee/TVL, organic, volatility, bin_step, mcap, holders and size is within about 2 SE of the mean. With 32 buckets that is noise. Don't add entry filters from this data.
+  - **Break-even in-range deferral is not the cause.**
+    - Only 81 positions were ever deferred, with a median lowest PnL of −0.92% while deferred. Shortening it (−0.5% to −4% depth caps) was negative in every variant (bootstrap positive in 8–42% of resamples). No deferral lasted 10m or more.
+    - The 80 stop losses on break-even-armed positions (−$659) went down without a deferral. They mostly predate direct closes (2026-09-29), when the break-even close waited on the LLM loop.
+  - Levers already deployed, to be measured at the 2026-10-16 evaluation: direct closes (09-29), the in-range trailing fix (09-30) and max age 600. Re-check stop-loss $ on armed positions (peak ≥1%) closed after 09-30.
 - **Housekeeping (2026-09-30).** Test: `test:housekeeping`.
   - `state.json` drops closed positions older than 7 days on every save (`pruneClosedPositions`, state.js).
     - Before, it kept every closed position (8.7 MB), and it is re-read and re-written many times per 30s poll.
