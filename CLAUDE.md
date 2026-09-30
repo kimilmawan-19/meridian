@@ -637,17 +637,27 @@ Agent Meridian HiveMind sync is handled by `hivemind.js`. It uses built-in Agent
   - Low-yield closes at 1–3h (n=437) were small net positives.
   - `TP_PROPOSAL` appeared 0 times in 92 days of logs, so the manager LLM makes almost no decisions.
   - Deploy hour and weekday showed no consistent loss pattern. The only `!!` block, 20–21 WIB, is explained by a single position, AMERICA (deployed 20:41 WIB). Don't add time-based rules without new evidence.
-- **In-range trailing TP never closes a position (confirmed 2026-09-29, fix deferred by user).**
-  - `updatePnlAndCheckExits` returns `TRAILING_TP` for an in-range position when the give-back floor (half the peak) is hit or the 90m in-range grace expires. Every trailing exit carries `needs_confirmation`, so it goes through the 30s recheck (`index.js` `scheduleTrailingDropConfirmation`).
-  - The confirmed exit is then cancelled by `state.js` (the `confirmed_trailing_exit_until` block) because the position is in range. That is exactly the condition that triggered it.
-  - Live logs showed 85 "Trailing TP confirmed exit cancelled … back in range" lines. OOR trailing exits work.
-  - This is also why `TP_PROPOSAL` never fires.
-  - 60-day impact, positions with peak ≥5%:
+- **In-range trailing TP never closed a position. Fixed 2026-09-30.**
+  - What was wrong:
+    - `updatePnlAndCheckExits` returns `TRAILING_TP` for an in-range position when the give-back floor (half the peak) is hit or the 90m in-range grace expires.
+    - Every trailing exit goes through the 30s recheck (`scheduleTrailingDropConfirmation`).
+    - The confirmed exit was then cancelled by the `confirmed_trailing_exit_until` block because the position was in range, which is exactly the condition that triggered it.
+    - Live logs showed 85 "Trailing TP confirmed exit cancelled … back in range" lines. This is also why `TP_PROPOSAL` never fired.
+  - Fix: exits from the in-range branches carry `in_range_exit: true`.
+    - The tag goes through `queueTrailingDropConfirmation` (5th arg, `pending_trailing_in_range`) and `resolvePendingTrailingDrop` (`confirmed_trailing_exit_in_range`).
+    - The "back in range" cancellation now applies only to OOR-triggered exits.
+    - The 5m-price-recovering cancel in the recheck is unchanged.
+  - What happens next: a confirmed in-range exit enters the TP veto layer as before. A floor hit is force-closed. A grace expiry below the floor becomes a `TP_PROPOSAL` for the manager LLM, with the veto budget.
+  - Expected (60-day backtest, positions with peak ≥5%):
     - 64 break-even closes: peak 7.3% → −0.90% (−$50).
     - 17 stop losses: peak 7.1% → −0.48%.
-    - The floor would have closed them around +3.5%, roughly $250–300 over 60 days.
-  - Risk of fixing: in-range dips that later recover (max-age closes: peak 10.1% → 8.7%) could be cut earlier. This can't be quantified, because the rule has never fired.
-  - Proposed fix: tag exits from the in-range branches (e.g. `in_range_exit: true`), carry the tag through `queueTrailingDropConfirmation` / `resolvePendingTrailingDrop`, and skip the in-range cancellation for tagged exits. Revisit at the 2026-10-16 evaluation.
+    - The floor would have closed them around +3.5%, roughly +$250–300 over 60 days.
+  - Risk: in-range dips that later recover (max-age closes: peak 10.1% → 8.7%) may now be cut earlier.
+  - Test: `test:trailing-floor` [5].
+  - Re-check at the 2026-10-16 evaluation:
+    - count closes with "give-back floor" / "in-range grace expired";
+    - check that "confirmed exit cancelled … back in range" now only follows OOR exits;
+    - compare break-even and max-age PnL.
 - **Exit data freshness: checked 2026-09-29, no change needed.**
   - Position PnL, bins and in-range state are force-fetched on every 30s poll and again by the management cycle it triggers. DexScreener data is cached for 60s. Live volatility refreshes each cycle.
   - Decision-to-realized gap (`diag-exit-gap.mjs`, 30 days): regime trim n=9, median +0.01%, worst −0.27%. The stop losses matched their decision PnL, apart from AMERICA (−59% → −68%, a rug that crossed the whole range in about 15s).

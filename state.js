@@ -541,7 +541,11 @@ export function resolvePendingPeak(position_address, currentPnlPct, toleranceRat
   return { confirmed: false, rejected: true, pendingPeak };
 }
 
-export function queueTrailingDropConfirmation(position_address, peakPnlPct, currentPnlPct, effectiveDropPct) {
+// inRangeExit: the exit came from an in-range branch (give-back floor or in-range grace expired).
+// Such an exit must survive the "back in range" cancellation below — being in range is exactly
+// the condition that triggered it. Live: 85 in-range trailing exits were cancelled this way, so
+// in-range trailing TP never closed a position.
+export function queueTrailingDropConfirmation(position_address, peakPnlPct, currentPnlPct, effectiveDropPct, inRangeExit = false) {
   if (peakPnlPct == null || currentPnlPct == null || effectiveDropPct == null) return false;
   const dropFromPeak = peakPnlPct - currentPnlPct;
   if (dropFromPeak < effectiveDropPct) return false;
@@ -563,6 +567,7 @@ export function queueTrailingDropConfirmation(position_address, peakPnlPct, curr
   // Store the trigger's effective drop so the 15s recheck applies the SAME threshold (givebackDivisor,
   // Layer-B override floor, stale-peak widening) instead of recomputing a divergent one.
   pos.pending_trailing_effective_drop_pct = effectiveDropPct;
+  pos.pending_trailing_in_range = !!inRangeExit;
   pos.pending_trailing_started_at = new Date().toISOString();
   save(state);
   log("state", `Position ${position_address} trailing drop candidate queued: peak ${peakPnlPct.toFixed(2)}% -> current ${currentPnlPct.toFixed(2)}%`);
@@ -583,7 +588,9 @@ export function resolvePendingTrailingDrop(position_address, currentPnlPct, trai
   // (givebackDivisor, Layer-B override floor, stale-peak widening). Fall back to the old
   // proportional formula for positions queued before this field existed.
   const effectiveDrop = pos.pending_trailing_effective_drop_pct ?? Math.max(trailingDropPct, pendingPeak / 3);
+  const inRangeExit = !!pos.pending_trailing_in_range;
 
+  pos.pending_trailing_in_range = null;
   pos.pending_trailing_current_pnl_pct = null;
   pos.pending_trailing_peak_pnl_pct = null;
   pos.pending_trailing_drop_pct = null;
@@ -596,6 +603,7 @@ export function resolvePendingTrailingDrop(position_address, currentPnlPct, trai
   if (stillNearCrash && stillDroppedEnough) {
     const reason = `Trailing TP: peak ${pendingPeak.toFixed(2)}% → current ${currentPnlPct.toFixed(2)}% (dropped ${(pendingPeak - currentPnlPct).toFixed(2)}% >= ${effectiveDrop.toFixed(2)}%)`;
     pos.confirmed_trailing_exit_reason = reason;
+    pos.confirmed_trailing_exit_in_range = inRangeExit;
     pos.confirmed_trailing_exit_until = new Date(Date.now() + 30_000).toISOString();
     save(state);
     log("state", `Position ${position_address} trailing drop confirmed after recheck: pending drop ${pendingDrop.toFixed(2)}%, current ${currentPnlPct.toFixed(2)}%`);
@@ -679,9 +687,10 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
 
   if (pos.confirmed_trailing_exit_until) {
     if (new Date(pos.confirmed_trailing_exit_until).getTime() > Date.now() && pos.confirmed_trailing_exit_reason) {
-      // If position is back in range since confirmation was queued, cancel the exit —
-      // fee collection is still active and the trailing signal is no longer valid.
-      if (in_range === true) {
+      // If an OOR-triggered exit finds the position back in range, cancel it — fee collection
+      // resumed and the trailing signal is no longer valid. An in-range exit (floor/grace) is
+      // kept: in range is the condition that triggered it.
+      if (in_range === true && !pos.confirmed_trailing_exit_in_range) {
         log("state", `Trailing TP confirmed exit cancelled for ${position_address} — back in range`);
         pos.confirmed_trailing_exit_reason = null;
         pos.confirmed_trailing_exit_until = null;
@@ -691,11 +700,13 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
       const reason = pos.confirmed_trailing_exit_reason;
       pos.confirmed_trailing_exit_reason = null;
       pos.confirmed_trailing_exit_until = null;
+      pos.confirmed_trailing_exit_in_range = null;
       save(state);
       return { action: "TRAILING_TP", reason, confirmed_recheck: true };
     }
     pos.confirmed_trailing_exit_reason = null;
     pos.confirmed_trailing_exit_until = null;
+    pos.confirmed_trailing_exit_in_range = null;
   }
 
   let changed = false;
@@ -857,6 +868,7 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
             action: "TRAILING_TP",
             reason: `Trailing TP: peak ${pos.peak_pnl_pct.toFixed(2)}% → current ${currentPnlPct.toFixed(2)}% (dropped ${dropFromPeak.toFixed(2)}% >= ${effectiveDrop.toFixed(2)}%${stalePeak ? ", stale-peak widened" : ""}, in-range grace expired: ${Math.round(elapsedMin)}m)`,
             needs_confirmation: true,
+            in_range_exit: true,
             peak_pnl_pct: pos.peak_pnl_pct,
             current_pnl_pct: currentPnlPct,
             drop_from_peak_pct: dropFromPeak,
@@ -873,6 +885,7 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
           action: "TRAILING_TP",
           reason: `Trailing TP: peak ${pos.peak_pnl_pct.toFixed(2)}% → current ${currentPnlPct.toFixed(2)}% (dropped ${dropFromPeak.toFixed(2)}% >= ${effectiveDrop.toFixed(2)}%${stalePeak ? ", stale-peak widened" : ""}${in_range === true ? `, in-range give-back floor ${givebackFloor.toFixed(2)}% hit` : ""})`,
           needs_confirmation: true,
+          in_range_exit: in_range === true,
           peak_pnl_pct: pos.peak_pnl_pct,
           current_pnl_pct: currentPnlPct,
           drop_from_peak_pct: dropFromPeak,

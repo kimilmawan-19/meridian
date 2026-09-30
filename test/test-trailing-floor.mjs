@@ -81,6 +81,28 @@ try {
   check("bearish SL fires with a rounded threshold", r5?.action === "STOP_LOSS" && /<= -8\.4%/.test(r5?.reason ?? ""), `(got ${r5?.reason})`);
   check("no long float in reason", !/\d\.\d{5,}/.test(r5?.reason ?? ""));
 
+  console.log("\n[5] confirmed in-range exit survives the 30s recheck (live: 85 cancelled \"back in range\")");
+  const E = "FloorPosE1111111111111111111111111111111111";
+  open(E);
+  state.updatePnlAndCheckExits(E, data(5, true), mgmt);
+  const e1 = state.updatePnlAndCheckExits(E, data(3.5, true), mgmt); // floor hit in range
+  check("in-range floor exit is tagged in_range_exit", e1?.in_range_exit === true, `(got ${JSON.stringify(e1)})`);
+  state.queueTrailingDropConfirmation(E, e1.peak_pnl_pct, e1.current_pnl_pct, e1.effective_drop_pct, e1.in_range_exit);
+  check("recheck confirms", state.resolvePendingTrailingDrop(E, 3.4, mgmt.trailingDropPct, 1.0)?.confirmed === true);
+  const e2 = state.updatePnlAndCheckExits(E, data(3.4, true), mgmt);
+  check("still in range → confirmed TRAILING_TP is returned, not cancelled", e2?.action === "TRAILING_TP" && e2?.confirmed_recheck === true, `(got ${JSON.stringify(e2)})`);
+
+  const F = "FloorPosF1111111111111111111111111111111111";
+  open(F);
+  const f1 = state.updatePnlAndCheckExits(F, data(5, false), mgmt); // OOR trigger
+  check("OOR exit is not tagged in_range_exit", f1?.in_range_exit === false, `(got ${JSON.stringify(f1)})`);
+  state.queueTrailingDropConfirmation(F, f1.peak_pnl_pct, f1.current_pnl_pct, f1.effective_drop_pct, f1.in_range_exit);
+  state.resolvePendingTrailingDrop(F, 5, mgmt.trailingDropPct, 1.0);
+  check("OOR exit back in range → still cancelled (unchanged)", state.updatePnlAndCheckExits(F, data(5, true), mgmt) == null);
+  const indexSrc = fs.readFileSync(new URL("../index.js", import.meta.url), "utf8");
+  check("management + 30s poll both pass the in-range tag to the queue",
+    (indexSrc.match(/config\.management\.trailingDropPct, exit\.in_range_exit\)/g) || []).length === 2);
+
 } catch (e) {
   fail++;
   console.error("\nFATAL:", e.stack);
