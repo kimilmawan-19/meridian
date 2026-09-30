@@ -679,6 +679,12 @@ Agent Meridian HiveMind sync is handled by `hivemind.js`. It uses built-in Agent
       - "Switch after 2 equal assessments, ≥2.5 immediate" dropped cluster coverage to 14/29.
   - **Rule 10 fired on blips.** 67 of 104 trims happened during a one-assessment caution blip (55 matched: avg −0.65%, −$33). All trims were 4 open > cap 3. Hence the confirmed-regime gate above. Expected effect: about one needless close fewer per day. PnL at stake is small.
   - Re-check at the 2026-10-16 evaluation. Count Rule 10 trims (should drop about 60%) and re-run both scripts.
+- **Flow re-check on held positions: tested 2026-09-30, rejected. Don't add a hold-time flow exit without new evidence.**
+  - Tool: `diag-flowhold.mjs`, 30 days, 777 positions, 89k DexScreener 5m samples from the `DexScreener OK` log lines. The log has only 5m price/volume, so 1h was approximated and 6h was unavailable.
+  - A confirmed 5m DISTRIBUTION (price5m < −0.5%, vol5m > 1.1× the prior-hour median, twice within 15m) fired in 624 of 777 positions (80%). It is normal memecoin noise.
+  - Positions with the signal did no worse. For bid_ask they did better: +0.85% vs −1.09%, since a dump into the range is where bid_ask earns.
+  - After the signal, the token rose again in 280 of 608 cases. Exiting at the signal would have cut max-age (+$509) and OOR (+$252) winners.
+  - Adding the 1h-down filter (S2) changed nothing.
 - **Close tx expiry (observed 2026-09-29, not changed).** 6 of about 75 close attempts in 3 days failed with `block height exceeded`, 6–30s after the tx was built. The retry landed within 3–60s every time. The bot sets no priority fee, and neither does the DLMM SDK. e/acc-SOL (a rug) expired twice and took about 90s to close. Revisit (priority fee or a resend loop) only if expiries grow or start costing measurable PnL.
 - **Security audit findings not yet patched** (surfaced 2026-09-28, deferred by user choice — swap-cap and secret-file-permission fixes were prioritized instead):
   - `envcrypt.js` "encryption" is a repeating-key XOR cipher, not real encryption. **Left as is (re-checked 2026-09-29):** the key (`.envrypt` / `ENVRYPT_KEY`) lives on the same host as `.env`, so authenticated encryption would add little. The real protection is `chmod 600` on `.env` / `user-config.json` (see Secret File Permissions).
