@@ -40,8 +40,26 @@ function load() {
   }
 }
 
+// Closed positions are kept for a week (the daily briefing reads the last 24h of closes).
+// lessons.json holds the full performance record; state.json used to keep every closed
+// position forever (8.7 MB), and it is re-read and re-written many times per 30s poll.
+const CLOSED_RETENTION_DAYS = 7;
+
+export function pruneClosedPositions(state, now = Date.now()) {
+  const cutoff = now - CLOSED_RETENTION_DAYS * 86_400_000;
+  let removed = 0;
+  for (const [addr, p] of Object.entries(state.positions || {})) {
+    if (p?.closed && p.closed_at && Date.parse(p.closed_at) < cutoff) {
+      delete state.positions[addr];
+      removed++;
+    }
+  }
+  return removed;
+}
+
 function save(state) {
   try {
+    pruneClosedPositions(state);
     state.lastUpdated = new Date().toISOString();
     fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
   } catch (err) {

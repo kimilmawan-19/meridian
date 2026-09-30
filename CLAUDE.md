@@ -343,7 +343,7 @@ const actualBaseFee = baseFactor > 0
   - Live logs (3 days, 2026-09-29) had 12 timeouts, none retried, which failed 4 management and 2 screening cycles. Direct closes run before the LLM, so only TP_PROPOSAL/CLAIM/INSTRUCTION decisions were lost. Test: `test:llm-retry`.
 - **The "fallback model" is not a different model.** It is `screeningModel` / `managementModel`, which is already the model passed in. The old `stepfun` fallback no longer exists.
 - **Empty responses:** 180 of 637 LLM calls (28%) came back with no content and no tool call. Each costs one extra call. The log line now includes `finish_reason`, `completion_tokens` and reasoning length. Almost all of them are in screening (see below), so the cause is not the management token cap. Check `finish_reason` in the logs before changing anything.
-- **The hourly health check (`healthTask`) never runs.** Management is scheduled `*/10` and also fires at minute :00, sets `_managementBusy` first, and the health check returns. If it ever runs (for example, after a `managementIntervalMin` change), it blocks management and the 30s poll while the LLM works, and its output is discarded.
+- **The hourly LLM health check (`healthTask`) was removed on 2026-09-30.** It never ran: management is scheduled `*/10`, fires at minute :00 too and sets `_managementBusy` first. Had it run, it would have blocked management and the 30s poll while the LLM worked, and its output was discarded.
 - **Screening-cycle tool list** (`SCREENING_CYCLE_TOOLS`, index.js): `deploy_position` and the three token tools (holders, narrative, info). The call passes `allowedTools` and `requireToolUse: false` to `agentLoop`.
   - Why: the candidate blocks already carry pool memory, smart wallets, active bin and balance. Live logs (3 days) showed `get_pool_memory` called 93× and `check_smart_wallets_on_pool` 21×. Every tool call is another full-conversation LLM round-trip.
   - The goal contains "deploy", so `tool_choice=required` used to be forced on step 1. That made a `NO DEPLOY` answer cost at least 2 calls, and it was sometimes rejected outright.
@@ -702,6 +702,16 @@ Agent Meridian HiveMind sync is handled by `hivemind.js`. It uses built-in Agent
   - Evaluate after about 2–3 weeks (300+ closes): group PnL by `signal_snapshot.price_vs_ath_pct` bucket and strategy. Turn on `athFilterPct` only if a bucket is clearly net-negative.
   - Also recorded: `flow_consensus` (the 5m/1h/6h flow label the screener shows), `txn_buys_5m`/`txn_sells_5m` (DexScreener) and `net_buyers_1h` (Jupiter).
   - Use them the same way: keep or drop a flow/transaction filter or prompt line only if its buckets actually separate winners from losers. The aim is to simplify, not to add rules.
+- **Housekeeping (2026-09-30).** Test: `test:housekeeping`.
+  - `state.json` drops closed positions older than 7 days on every save (`pruneClosedPositions`, state.js).
+    - Before, it kept every closed position (8.7 MB), and it is re-read and re-written many times per 30s poll.
+    - The daily briefing only reads the last 24h of closes. `lessons.json` keeps the full performance record, which every analysis uses.
+    - After the first save, `getStateSummary`'s closed count and all-time claimed fees cover only the last 7 days.
+  - Daily `logs/agent-*.log` and `actions-*.jsonl` files older than `LOG_RETENTION_DAYS` (env, default 90) are deleted, checked once per day by `logger.js` (`pruneOldLogs`).
+    - Before, nothing was ever deleted: 463 MB.
+    - The pm2 copies in `~/.pm2/logs` are separate. Use `pm2 install pm2-logrotate` for those.
+  - Removed `backups/20260517/` (old copies of config.js, index.js and setup.js, about 2,800 lines; nothing imported them) and the hourly health check.
+  - Not done: trimming routine success log lines. That needs a per-category size count first.
 - **Close tx expiry (observed 2026-09-29, not changed).** 6 of about 75 close attempts in 3 days failed with `block height exceeded`, 6–30s after the tx was built. The retry landed within 3–60s every time. The bot sets no priority fee, and neither does the DLMM SDK. e/acc-SOL (a rug) expired twice and took about 90s to close. Revisit (priority fee or a resend loop) only if expiries grow or start costing measurable PnL.
 - **Security audit findings not yet patched** (surfaced 2026-09-28, deferred by user choice — swap-cap and secret-file-permission fixes were prioritized instead):
   - `envcrypt.js` "encryption" is a repeating-key XOR cipher, not real encryption. **Left as is (re-checked 2026-09-29):** the key (`.envrypt` / `ENVRYPT_KEY`) lives on the same host as `.env`, so authenticated encryption would add little. The real protection is `chmod 600` on `.env` / `user-config.json` (see Secret File Permissions).
