@@ -710,6 +710,31 @@ Agent Meridian HiveMind sync is handled by `hivemind.js`. It uses built-in Agent
     - Only 81 positions were ever deferred, with a median lowest PnL of −0.92% while deferred. Shortening it (−0.5% to −4% depth caps) was negative in every variant (bootstrap positive in 8–42% of resamples). No deferral lasted 10m or more.
     - The 80 stop losses on break-even-armed positions (−$659) went down without a deferral. They mostly predate direct closes (2026-09-29), when the break-even close waited on the LLM loop.
   - Levers already deployed, to be measured at the 2026-10-16 evaluation: direct closes (09-29), the in-range trailing fix (09-30) and max age 600. Re-check stop-loss $ on armed positions (peak ≥1%) closed after 09-30.
+- **Projection for the 2026-10-16 evaluation (written 2026-09-30).**
+  - These are estimates from the backtests above, not a joint simulation. Baseline (60 days, before the fixes): total +$452, avg +0.56%, median +0.39%, win 65.7%, p10 −4.37%, p5 −9.82%, avg win $2.33 vs avg loss −$3.57. Average position is about $92.
+  - Expected change per 60 days, by fix:
+
+    | Fix | Basis | Expected | Confidence |
+    |---|---|---|---|
+    | In-range trailing TP (09-30) | 39 losers with peak ≥5% ended −3.2% (−$120); the floor closes near half the peak (about +3.5%). Discounted for in-range dips that recover. | +$150 to +$300 | Medium |
+    | Direct closes (09-29) | 13 break-even decisions in 30 days waited on the LLM and ended −10.7% avg; a prompt close would realize about −1 to −2%. Upper bound: 80 armed stop losses, −$659 per 60 days. Range-crossing rugs are not helped. | +$100 to +$240 | Medium |
+    | Max age 600 (09-29) | Max-age closes still earned about 0.7% of capital per hour; fewer slots refilled into the loss-prone first 6h. No data beyond about 6.3h. | $0 to +$300 | Low |
+
+  - The fixes overlap: trailing and direct closes both target positions that were up and then fell. Combined estimate: +$300 to +$600 per 60 days.
+    - Avg per position about +0.8% to +1.0%.
+    - Win rate about 67–68%. Only the trailing fix turns losers into winners.
+    - p5 and the avg-loss $ should improve most. Median should barely move.
+    - Position count per day may fall (max age 600), so judge total $ and avg, not trade count.
+  - What to check on 2026-10-16 (about 2 weeks, about 350 closes; avg SE about ±0.3%, so avg alone won't be conclusive):
+    1. Trailing fix: count of "give-back floor" / "in-range grace expired" closes and their avg PnL.
+    2. Direct closes: stop-loss $ on positions with peak ≥1%, against a baseline of about −$150 per 2 weeks (−$659 per 60 days).
+    3. Max age: PnL in the 6–12h and 12h+ hold buckets, and stop losses after 6h.
+    4. Overall: re-run `diag-breakeven.mjs` (avg, median, p10/p5, avg win vs avg loss) and `diag-edge.mjs` for the post-09-30 window, and compare against the baseline above.
+  - Could be off because:
+    - the market may differ (the second half of the baseline was already weaker, avg 0.39% vs 0.75%);
+    - max age has no reference data;
+    - real fills during dumps are worse than logged PnL.
+  - If a fix's own metric (items 1–3) looks worse than its baseline, look at that fix alone before changing anything else.
 - **Housekeeping (2026-09-30).** Test: `test:housekeeping`.
   - `state.json` drops closed positions older than 7 days on every save (`pruneClosedPositions`, state.js).
     - Before, it kept every closed position (8.7 MB), and it is re-read and re-written many times per 30s poll.
