@@ -1363,6 +1363,12 @@ export async function runScreeningCycle({ silent = false } = {}) {
           // Record-only (not a Darwin weight): lets us check later whether entries near ATH lose more
           // before turning on athFilterPct. OKX price as % of ATH; null when OKX had no data.
           price_vs_ath_pct: pool.price_vs_ath_pct ?? null,
+          // Record-only, same purpose: which of the flow/transaction lines the screener sees
+          // actually separate winners from losers.
+          flow_consensus: md ? regimeConsensus : null,
+          txn_buys_5m: md?.txn_buys_5m ?? null,
+          txn_sells_5m: md?.txn_sells_5m ?? null,
+          net_buyers_1h: netBuyers ?? null,
         });
       }
 

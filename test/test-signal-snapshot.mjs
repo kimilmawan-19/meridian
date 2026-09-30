@@ -1,4 +1,5 @@
-// Verifies price_vs_ath_pct (OKX price as % of ATH) is recorded in each position's
+// Verifies price_vs_ath_pct (OKX price as % of ATH) plus the flow/transaction fields the screener
+// sees (flow_consensus, 5m buys/sells, net_buyers_1h) are recorded in each position's
 // signal_snapshot so closed-position performance can later be grouped by distance to ATH
 // before turning on athFilterPct. Record-only: it must not become a Darwin weight.
 // Real signal-tracker import + source drift checks for the deploy → close path.
@@ -31,7 +32,10 @@ try {
     src("tools/dlmm.js").includes("signal_snapshot: signalSnapshot,") && src("state.js").includes("signal_snapshot: signal_snapshot || null,"));
   check("close carries the tracked snapshot into the performance record",
     src("tools/dlmm.js").includes("...(tracked?.signal_snapshot || {}),") && src("lessons.js").includes("const snapshot = { ...(perf.signal_snapshot || {}) };"));
-  check("not a Darwin weight (signal-weights.js untouched)", !src("signal-weights.js").includes("price_vs_ath_pct"));
+  for (const f of ["flow_consensus: md ? regimeConsensus : null,", "txn_buys_5m: md?.txn_buys_5m ?? null,", "txn_sells_5m: md?.txn_sells_5m ?? null,", "net_buyers_1h: netBuyers ?? null,"])
+    check(`screening stages ${f.split(":")[0]}`, src("index.js").includes(f));
+  check("not Darwin weights (signal-weights.js untouched)",
+    !/price_vs_ath_pct|flow_consensus|txn_buys_5m|net_buyers_1h/.test(src("signal-weights.js")));
 } catch (e) {
   fail++;
   console.error("\nFATAL:", e.stack);
