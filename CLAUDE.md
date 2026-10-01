@@ -658,6 +658,17 @@ Agent Meridian HiveMind sync is handled by `hivemind.js`. It uses built-in Agent
     - count closes with "give-back floor" / "in-range grace expired";
     - check that "confirmed exit cancelled … back in range" now only follows OOR exits;
     - compare break-even and max-age PnL.
+- **Partial close is live since the in-range trailing fix. Observed 2026-10-01, not changed.**
+  - The first partial ever: JACK-SOL, 50% at peak 5.6%. The live `user-config.json` must have `partialExit.enabled: true`, since the code default is false.
+  - Flow: a `TRAILING_TP` above the half-peak floor with veto budget left becomes a `TP_PROPOSAL`. The manager LLM is offered `partial_close_position` when peak ≥ `minPeakPct` (4) and the remainder stays ≥ `minRemainderUsd` ($15). The prompt nudges toward a ~50% partial when the signal is mixed. The pct is clamped to 25–75%. `markPartialExit` resets the veto budget and sets `trailing_drop_override` to `stage2TrailingDropPct` (0.8).
+  - The "locked $X" in the notification is the pre-partial value × pct at the current price, not at peak.
+  - **The tightened trailing stop is mostly a no-op.** `effectiveDrop = max(dropFloor, peak/3)`, so 0.8 only bites when peak < 4.5%, and partials require peak ≥ 4%. JACK: 1.87% before and after. The real protection for the runner is the half-peak floor (force close).
+  - **The trailing trigger likely re-fires next cycle.** Peak and drop are unchanged by the partial and the veto budget was reset, so another `TP_PROPOSAL` follows. The LLM can scale out again (50% of the remainder) until the remainder is under $15, so a partial may turn into a 50% → 25% → … ladder instead of one scale-out plus a runner. Not yet seen in logs.
+  - Check at the 2026-10-16 evaluation:
+    - follow JACK in the logs (`Trailing TP`, `partial exit #`, its final close);
+    - count repeated partials per position;
+    - compare final PnL of partially closed positions (`partial_taken_count` > 0 in `lessons.json`) with full trailing closes at similar peaks.
+  - Possible fixes, only if the data shows harm: allow one partial per position, or measure the runner's trailing from a fresh peak after the partial.
 - **Exit data freshness: checked 2026-09-29, no change needed.**
   - Position PnL, bins and in-range state are force-fetched on every 30s poll and again by the management cycle it triggers. DexScreener data is cached for 60s. Live volatility refreshes each cycle.
   - Decision-to-realized gap (`diag-exit-gap.mjs`, 30 days): regime trim n=9, median +0.01%, worst −0.27%. The stop losses matched their decision PnL, apart from AMERICA (−59% → −68%, a rug that crossed the whole range in about 15s).
