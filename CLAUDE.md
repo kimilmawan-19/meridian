@@ -745,6 +745,13 @@ Agent Meridian HiveMind sync is handled by `hivemind.js`. It uses built-in Agent
     - The pm2 copies in `~/.pm2/logs` are separate. Use `pm2 install pm2-logrotate` for those.
   - Removed `backups/20260517/` (old copies of config.js, index.js and setup.js, about 2,800 lines; nothing imported them) and the hourly health check.
   - Not done: trimming routine success log lines. That needs a per-category size count first.
+- **Orphan positions from failed wide-range deploys. Fixed 2026-10-01.** Test: `test:orphan-cleanup`.
+  - A deploy with more than 69 bins (`bins_below` > 64 plus the minimum 5 `bins_above`) is two steps: create an empty position, then add liquidity. If the add failed, the empty position stayed on-chain, untracked (it shows as `TOKEN/SOL` with $0 value), holding a position slot and its rent.
+  - Live logs: about 129 such failures since July, about 3 a day in September. About 55% were `Simulation failed` and 45% `block height exceeded` on the add-liquidity tx.
+  - Older orphans were apparently closed by the manager LLM seeing a $0 position. Since direct closes (09-29) nothing closed them; bukangi/SOL sat there for 8.5h.
+  - Fix: the deploy `catch` calls `cleanupOrphanPosition` (tools/dlmm.js) once the create txs have landed. It closes the empty account, or removes a partial add first. A failed cleanup logs `Orphan position … left open … close it manually with /close` and never throws. The next screening cycle retries the deploy as usual.
+  - Not done (user's choice): retrying the add-liquidity tx after an expiry. Revisit if failed wide-range deploys keep costing deploys.
+  - Check at the 2026-10-16 evaluation: count `Orphan position … closed` vs `left open` lines.
 - **Close tx expiry (observed 2026-09-29, not changed).** 6 of about 75 close attempts in 3 days failed with `block height exceeded`, 6–30s after the tx was built. The retry landed within 3–60s every time. The bot sets no priority fee, and neither does the DLMM SDK. e/acc-SOL (a rug) expired twice and took about 90s to close. Revisit (priority fee or a resend loop) only if expiries grow or start costing measurable PnL.
 - **Security audit findings not yet patched** (surfaced 2026-09-28, deferred by user choice — swap-cap and secret-file-permission fixes were prioritized instead):
   - `envcrypt.js` "encryption" is a repeating-key XOR cipher, not real encryption. **Left as is (re-checked 2026-09-29):** the key (`.envrypt` / `ENVRYPT_KEY`) lives on the same host as `.env`, so authenticated encryption would add little. The real protection is `chmod 600` on `.env` / `user-config.json` (see Secret File Permissions).

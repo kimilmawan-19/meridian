@@ -766,6 +766,8 @@ export async function deployPosition({
   log("deploy", `Amount: ${finalAmountX} X, ${finalAmountY} Y`);
   log("deploy", `Position: ${newPosition.publicKey.toString()}`);
 
+  // Set once the wide-range create txs land: from then on a failure leaves an empty position on-chain.
+  let positionCreated = false;
   try {
     const txHashes = [];
 
@@ -790,6 +792,7 @@ export async function deployPosition({
         txHashes.push(txHash);
         log("deploy", `Create tx ${i + 1}/${createTxArray.length}: ${txHash}`);
       }
+      positionCreated = true;
 
       // Phase 2: Add liquidity (may be multiple txs)
       const addTxs = await pool.addLiquidityByStrategyChunkable({
@@ -893,7 +896,37 @@ export async function deployPosition({
     };
   } catch (error) {
     log("deploy_error", error.message);
+    if (positionCreated) await cleanupOrphanPosition(pool, newPosition.publicKey, wallet);
     return { success: false, error: error.message };
+  }
+}
+
+// A wide-range deploy that fails after its create txs leaves an untracked position on-chain
+// (live: ~3/day in Sep 2026, mostly "Simulation failed" or "block height exceeded" on add
+// liquidity). It took a position slot and its rent until something closed it; since direct
+// closes nothing did. Close it right away; a partial add-liquidity is removed the same way.
+export async function cleanupOrphanPosition(pool, positionPubKey, wallet,
+  send = (tx) => sendAndConfirmTransaction(getConnection(), tx, [wallet])) {
+  const address = positionPubKey.toString();
+  try {
+    const data = (await pool.getPosition(positionPubKey))?.positionData;
+    const bins = Array.isArray(data?.positionBinData) ? data.positionBinData : [];
+    const hasLiquidity = bins.some((bin) => new BN(bin.positionLiquidity || "0").gt(new BN(0)));
+    const txs = hasLiquidity
+      ? await pool.removeLiquidity({
+          user: wallet.publicKey,
+          position: positionPubKey,
+          fromBinId: data.lowerBinId ?? -887272,
+          toBinId: data.upperBinId ?? 887272,
+          bps: new BN(10000),
+          shouldClaimAndClose: true,
+        })
+      : await pool.closePosition({ owner: wallet.publicKey, position: { publicKey: positionPubKey } });
+    for (const tx of Array.isArray(txs) ? txs : [txs]) await send(tx);
+    _positionsCacheAt = 0;
+    log("deploy", `Orphan position ${address} closed after failed deploy${hasLiquidity ? " (partial liquidity removed)" : ""}`);
+  } catch (e) {
+    log("deploy_error", `Orphan position ${address} left open after failed deploy — close it manually with /close: ${e.message}`);
   }
 }
 

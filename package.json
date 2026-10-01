@@ -38,7 +38,8 @@
     "test:signal-snapshot": "node test/test-signal-snapshot.mjs",
     "test:housekeeping": "node test/test-housekeeping.mjs",
     "test:agent": "DRY_RUN=true node test/test-agent.js",
-    "postinstall": "node scripts/patch-anchor.js"
+    "postinstall": "node scripts/patch-anchor.js",
+    "test:orphan-cleanup": "node test/test-orphan-cleanup.mjs"
   },
   "knip": {
     "ignore": [
