@@ -905,29 +905,44 @@ export async function deployPosition({
 // (live: ~3/day in Sep 2026, mostly "Simulation failed" or "block height exceeded" on add
 // liquidity). It took a position slot and its rent until something closed it; since direct
 // closes nothing did. Close it right away; a partial add-liquidity is removed the same way.
+// The cleanup tx can itself expire (live 2026-10-02: OP/SOL, "block height exceeded"), so each
+// attempt re-reads the position and rebuilds the tx. An earlier attempt that landed late shows
+// up as a missing account on the next read.
 export async function cleanupOrphanPosition(pool, positionPubKey, wallet,
-  send = (tx) => sendAndConfirmTransaction(getConnection(), tx, [wallet])) {
+  send = (tx) => sendAndConfirmTransaction(getConnection(), tx, [wallet]),
+  { attempts = 4, delayMs = 3000 } = {}) {
   const address = positionPubKey.toString();
-  try {
-    const data = (await pool.getPosition(positionPubKey))?.positionData;
-    const bins = Array.isArray(data?.positionBinData) ? data.positionBinData : [];
-    const hasLiquidity = bins.some((bin) => new BN(bin.positionLiquidity || "0").gt(new BN(0)));
-    const txs = hasLiquidity
-      ? await pool.removeLiquidity({
-          user: wallet.publicKey,
-          position: positionPubKey,
-          fromBinId: data.lowerBinId ?? -887272,
-          toBinId: data.upperBinId ?? 887272,
-          bps: new BN(10000),
-          shouldClaimAndClose: true,
-        })
-      : await pool.closePosition({ owner: wallet.publicKey, position: { publicKey: positionPubKey } });
-    for (const tx of Array.isArray(txs) ? txs : [txs]) await send(tx);
-    _positionsCacheAt = 0;
-    log("deploy", `Orphan position ${address} closed after failed deploy${hasLiquidity ? " (partial liquidity removed)" : ""}`);
-  } catch (e) {
-    log("deploy_error", `Orphan position ${address} left open after failed deploy — close it manually with /close: ${e.message}`);
+  let lastError = null;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      const data = (await pool.getPosition(positionPubKey))?.positionData;
+      const bins = Array.isArray(data?.positionBinData) ? data.positionBinData : [];
+      const hasLiquidity = bins.some((bin) => new BN(bin.positionLiquidity || "0").gt(new BN(0)));
+      const txs = hasLiquidity
+        ? await pool.removeLiquidity({
+            user: wallet.publicKey,
+            position: positionPubKey,
+            fromBinId: data.lowerBinId ?? -887272,
+            toBinId: data.upperBinId ?? 887272,
+            bps: new BN(10000),
+            shouldClaimAndClose: true,
+          })
+        : await pool.closePosition({ owner: wallet.publicKey, position: { publicKey: positionPubKey } });
+      for (const tx of Array.isArray(txs) ? txs : [txs]) await send(tx);
+      _positionsCacheAt = 0;
+      log("deploy", `Orphan position ${address} closed after failed deploy${hasLiquidity ? " (partial liquidity removed)" : ""}${attempt > 1 ? ` (attempt ${attempt})` : ""}`);
+      return;
+    } catch (e) {
+      lastError = e;
+      if (attempt > 1 && /not found|does not exist|invalid account|account.*(closed|missing)/i.test(e.message)) {
+        _positionsCacheAt = 0;
+        log("deploy", `Orphan position ${address} already closed (earlier cleanup attempt landed)`);
+        return;
+      }
+      if (attempt < attempts) await new Promise((r) => setTimeout(r, delayMs));
+    }
   }
+  log("deploy_error", `Orphan position ${address} left open after failed deploy — close it manually with /close: ${lastError?.message}`);
 }
 
 const POSITIONS_CACHE_TTL = 5 * 60_000; // 5 minutes

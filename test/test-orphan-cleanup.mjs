@@ -47,10 +47,24 @@ try {
   check("remove tx sent", sent2.length === 1 && sent2[0] === "removeTx");
 
   console.log("\n[3] cleanup failure is logged, never thrown");
-  let threw = false;
-  try { await cleanupOrphanPosition(stubPool("0"), pubkey, wallet, async () => { throw new Error("block height exceeded"); }); }
+  let threw = false, tries = 0;
+  try { await cleanupOrphanPosition(stubPool("0"), pubkey, wallet, async () => { tries++; throw new Error("block height exceeded"); }, { delayMs: 0 }); }
   catch { threw = true; }
   check("no throw (deploy still returns its own error)", !threw);
+  check("retried 4 times before giving up", tries === 4, `tries=${tries}`);
+
+  console.log("\n[3b] close tx expires once (live OP/SOL 2026-10-02) → retried with a rebuilt tx");
+  const p3 = stubPool("0"); let n3 = 0;
+  await cleanupOrphanPosition(p3, pubkey, wallet, async () => { if (++n3 === 1) throw new Error("Signature has expired: block height exceeded"); }, { delayMs: 0 });
+  check("second attempt succeeds", n3 === 2, `sends=${n3}`);
+  check("tx rebuilt per attempt", p3.calls.length === 2, JSON.stringify(p3.calls));
+
+  console.log("\n[3c] earlier attempt landed late → account missing on re-read, treated as closed");
+  let reads = 0, sends4 = 0;
+  const p4 = { getPosition: async () => { if (++reads > 1) throw new Error("Account not found"); return { positionData: { positionBinData: [] } }; },
+    closePosition: async () => "closeTx" };
+  await cleanupOrphanPosition(p4, pubkey, wallet, async () => { sends4++; throw new Error("block height exceeded"); }, { delayMs: 0 });
+  check("stops after the missing-account read", reads === 2 && sends4 === 1, `reads=${reads} sends=${sends4}`);
 
   console.log("\n[4] deploy wiring (drift)");
   const src = fs.readFileSync(new URL("../tools/dlmm.js", import.meta.url), "utf8");
