@@ -688,6 +688,20 @@ Agent Meridian HiveMind sync is handled by `hivemind.js`. It uses built-in Agent
   - **Hypothesis only, not acted on.** After a falling coin, curve does worse than bid_ask: 6h price <0 gives −0.36% (n=137) vs +1.19% (n=142), and more than 40% below the 24h high gives −0.28% vs +1.33%. About 2 SE, and confounded because `curveMaxVolatility` picks the strategy.
   - **SI-SOL (2026-10-01, −12.99%, stop loss −14.14% vs −12%) is not a bug.** The first poll after the dump already read −14.14%. A 5m candle with a low ≤ −10% below the previous close occurs in 34% of curve and 66% of bid_ask positions (partly wicks), so a jump of 2 points or more between two 30s polls is normal. No rule inside a poll window can catch it.
   - Price after close (6h, no random-time baseline): after max-age and OOR exits the token kept falling (bid_ask median −10% and −14%), so no sign of exits being too early. After break-even and trailing exits bid_ask rose (+9% and +30%), but n=18 and 9.
+  - **Code audit against these findings (2026-10-02): consistent.**
+    - Grace: `updateR9GraceZone` runs each management cycle. Grace depth is measured from `upper_bin`, so it includes the 5 bins above; 70% ≈ 67% of the range below entry.
+    - Rule 4 OOR-below is correct code; the condition (≥30 continuous minutes below the bottom) is just rare.
+    - Stop loss is checked before trailing and is never deferred in range.
+    - The executor forces curve at low volatility. `maxBinsBelow` stays 69.
+  - **Known quirk, not fixed: trailing-recheck "Price recovering" cancel leaves the pending state set.**
+    - `scheduleTrailingDropConfirmation` (index.js) returns on DexScreener `price_change_5m > 0` without clearing `pending_trailing_*`. Only `resolvePendingTrailingDrop` clears it.
+    - So the next recheck is queued only when PnL makes a new low below the pending value. Meanwhile the poll skips the deterministic rules for that position (stop loss still runs).
+    - Live since 09-30: 2 cancels, both on one position (peak 6.15%). It re-queued at 2.82% and closed at 2.79%, 16 minutes and 0.06 points after the first cancel.
+    - Fix if it ever matters: call `resolvePendingTrailingDrop(positionAddress, null, …)` in the cancel branch. Count `Price recovering` lines at the 2026-10-16 evaluation.
+  - **Prompt text not backed by this data, left as is** (advisory only; strategy is enforced by the executor's volatility guard):
+    - prompt.js calls curve "lowest bag-holding risk", but curve lost more when price kept falling.
+    - MARKUP is called the "ideal entry zone", but PnL after impulses was neutral.
+    - The strategy characteristics block shows only the default strategy (`bid_ask`), while about 43% of deploys are curve.
 - **Exit data freshness: checked 2026-09-29, no change needed.**
   - Position PnL, bins and in-range state are force-fetched on every 30s poll and again by the management cycle it triggers. DexScreener data is cached for 60s. Live volatility refreshes each cycle.
   - Decision-to-realized gap (`diag-exit-gap.mjs`, 30 days): regime trim n=9, median +0.01%, worst −0.27%. The stop losses matched their decision PnL, apart from AMERICA (−59% → −68%, a rug that crossed the whole range in about 15s).
