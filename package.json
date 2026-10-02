@@ -40,7 +40,8 @@
     "test:agent": "DRY_RUN=true node test/test-agent.js",
     "postinstall": "node scripts/patch-anchor.js",
     "test:orphan-cleanup": "node test/test-orphan-cleanup.mjs",
-    "test:deploy-prompt": "node test/test-deploy-prompt.mjs"
+    "test:deploy-prompt": "node test/test-deploy-prompt.mjs",
+    "test:candidate-order": "node test/test-candidate-order.mjs"
   },
   "knip": {
     "ignore": [

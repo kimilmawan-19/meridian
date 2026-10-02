@@ -7,7 +7,7 @@ import { agentLoop } from "./agent.js";
 import { log } from "./logger.js";
 import { getMyPositions, getActiveBin } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
-import { getTopCandidates, fetchPoolVolatility } from "./tools/screening.js";
+import { getTopCandidates, fetchPoolVolatility, getPoolDetail } from "./tools/screening.js";
 import { assessMarketRegime, isRegimeConfirmed } from "./market-regime.js";
 import { fetchPoolMarketData, getMarketDataStats } from "./tools/market-data.js";
 import { config, configMeta, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
@@ -1013,14 +1013,17 @@ export async function runScreeningCycle({ silent = false } = {}) {
     const allCandidates = [];
     for (const pool of candidates) {
       const mint = pool.base?.mint;
-      const [smartWallets, narrative, tokenInfo, screenMd] = await Promise.allSettled([
+      const [smartWallets, narrative, tokenInfo, screenMd, detail24h] = await Promise.allSettled([
         checkSmartWalletsOnPool({ pool_address: pool.pool }),
         mint ? getTokenNarrative({ mint }) : Promise.resolve(null),
         mint ? getTokenInfo({ query: mint }) : Promise.resolve(null),
         fetchPoolMarketData(pool.pool),
+        getPoolDetail({ pool_address: pool.pool, timeframe: "24h" }), // record-only: fee/TVL over 24h, to compare with the screening timeframe
       ]);
+      const feeTvl24h = Number(detail24h.status === "fulfilled" ? detail24h.value?.fee_active_tvl_ratio : null);
       allCandidates.push({
         pool,
+        fee_tvl_24h: Number.isFinite(feeTvl24h) ? feeTvl24h : null,
         sw: smartWallets.status === "fulfilled" ? smartWallets.value : null,
         n: narrative.status === "fulfilled" ? narrative.value : null,
         ti: tokenInfo.status === "fulfilled" ? tokenInfo.value?.results?.[0] : null,
@@ -1247,7 +1250,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
     );
 
     // Build compact candidate blocks
-    const candidateBlocks = passing.map(({ pool, sw, n, ti, md, mem }, i) => {
+    const candidateBlocks = passing.map(({ pool, sw, n, ti, md, mem, fee_tvl_24h }, i) => {
       const botPct = ti?.audit?.bot_holders_pct ?? "?";
       const top10Pct = ti?.audit?.top_holders_pct ?? "?";
       const feesSol = ti?.global_fees_sol ?? "?";
@@ -1332,7 +1335,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
         : null;
 
       const block = [
-        `POOL: ${pool.name} (${pool.pool})`,
+        `POOL #${i + 1} of ${passing.length}: ${pool.name} (${pool.pool})`,
         `  metrics: bin_step=${pool.bin_step}, fee_pct=${pool.fee_pct}%, fee_tvl=${pool.fee_active_tvl_ratio}, vol=$${pool.volume_window}, tvl=$${pool.tvl ?? pool.active_tvl}, volatility_${pool.volatility_timeframe || "30m"}=${pool.volatility}, mcap=$${pool.mcap}, organic=${pool.organic_score}${pool.token_age_hours != null ? `, age=${pool.token_age_hours}h` : ""}`,
         `  audit: top10=${top10Pct}%, bots=${botPct}%, fees=${feesSol}SOL${launchpad ? `, launchpad=${launchpad}` : ""}`,
         (pool.active_pct != null || pool.unique_traders != null) ? `  structure:${pool.active_pct != null ? ` active_liq=${pool.active_pct}%` : ""}${pool.unique_traders != null ? ` unique_traders=${pool.unique_traders}` : ""}`.trimEnd() : null,
@@ -1369,6 +1372,13 @@ export async function runScreeningCycle({ silent = false } = {}) {
           txn_buys_5m: md?.txn_buys_5m ?? null,
           txn_sells_5m: md?.txn_sells_5m ?? null,
           net_buyers_1h: netBuyers ?? null,
+          // Record-only, for the fee/TVL prioritisation check: pool TVL, the same ratio over 24h, and
+          // where this candidate stood in its cycle (rank 1 = highest fee_tvl × organic).
+          tvl: pool.tvl ?? pool.active_tvl ?? null,
+          fee_tvl_24h: fee_tvl_24h ?? null,
+          candidate_rank: i + 1,
+          candidate_count: passing.length,
+          top_fee_tvl: passing[0]?.pool?.fee_active_tvl_ratio ?? null,
         });
       }
 
@@ -1376,6 +1386,9 @@ export async function runScreeningCycle({ silent = false } = {}) {
     });
 
     const weightsSummary = config.darwin?.enabled ? getWeightsSummary() : null;
+
+    // One line per cycle: the order the LLM saw, so the pick's rank can be measured later.
+    log("screening", `Candidates (best first): ${passing.map(({ pool }, i) => `#${i + 1} ${pool.name} fee_tvl=${pool.fee_active_tvl_ratio} org=${pool.organic_score}`).join(" | ")}`);
 
     let deploySucceeded = false;
     // The screening report (sent whenever a deploy was attempted) replaces notifyDeploy here.
@@ -1390,7 +1403,7 @@ ${candidateBlocks.join("\n\n")}
 
 STEPS:
 1. Decide if any candidate is actually worth deploying. One surviving candidate is not automatically good enough.
-2. Pick the best candidate based on narrative quality, smart wallets, and pool metrics.
+2. Pick the candidate by CANDIDATE ORDER in your system prompt. The list above is already ordered best-first by fee_tvl × organic; narrative and smart wallets are skip signals and tie-breaks, not the ranking.
 3. Call deploy_position (active_bin is pre-fetched above — no need to call get_active_bin).
    Compute bins_below and bins_above using the strategy-specific guidance in your system prompt (DEPLOY RULES section). Pass deploy_position.volatility = the candidate volatility value.
 4. Report in this exact format (no tables, no extra sections):
@@ -1431,7 +1444,7 @@ STEPS:
    <If OKX enrichment is missing, write exactly: OKX: unavailable>
 
    WHY THIS WON
-   <2-4 concise sentences on why this pool won, key risks, and why it still beat the alternatives>
+   <2-4 concise sentences: start with its rank (#k of n) and fee_tvl; if it is not #1, name the skip signal or tie-break that moved it. Then key risks and why it still beat the alternatives>
 5. If no pool qualifies, report in this exact format instead:
    ⛔ NO DEPLOY
 
@@ -1454,8 +1467,12 @@ IMPORTANT:
       // NO DEPLOY is a valid text-only answer, so no forced tool call on step 1.
       allowedTools: SCREENING_CYCLE_TOOLS,
       requireToolUse: false,
-      onToolStart: async ({ name }) => {
-        if (name === "deploy_position") deployAttempted = true;
+      onToolStart: async ({ name, args }) => {
+        if (name === "deploy_position") {
+          deployAttempted = true;
+          const k = passing.findIndex(({ pool }) => pool.pool === args?.pool_address);
+          if (k >= 0) log("screening", `Screener pick: ${passing[k].pool.name} rank #${k + 1} of ${passing.length} (fee_tvl=${passing[k].pool.fee_active_tvl_ratio}, top=${passing[0].pool.fee_active_tvl_ratio})`);
+        }
       },
       onToolFinish: async ({ name, result, success }) => {
         if (name === "deploy_position") {
