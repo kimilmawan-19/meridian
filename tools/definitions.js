@@ -131,17 +131,17 @@ Only call this if you need the current price to calculate a specific bin range (
 
 PRIORITY ORDER for strategy and bins:
 1. User explicitly specifies → always follow exactly (user override is absolute)
-2. No user spec → use active strategy's lp_strategy and choose bins based on volatility
+2. No user spec → strategy follows the pool's volatility (see HARD RULES) and bins follow volatility too
 
 HARD RULES:
-- Never use 'curve'.
+- Strategy follows volatility: volatility <= ${config.strategy?.curveMaxVolatility ?? 3.5} → "curve"; above → "bid_ask". The executor blocks the other choice. With a bullish top_cluster_trend, bid_ask is allowed down to curveMaxVolatility − 1 (never below 1.5). Never use "spot".
 - Bin Step: Only deploy in pools with bin_step between ${config.screening.minBinStep} and ${config.screening.maxBinStep}.
 - Volatility must be positive. If volatility is 0, null, or missing, do not deploy.
 - Range must cover at least 35 total bins. Never deploy 1-bin/tiny ranges.
 - For single-side SOL deploys (amount_y only, amount_x=0): set bins_above to ~25% of bins_below (e.g. bins_below=40 → bins_above=10, max 30% of bins_below). This gives the position upside buffer before going out-of-range.
 
 Guidelines (only when user hasn't specified):
-- Strategy: use the active strategy's lp_strategy field (bid_ask or spot)
+- Strategy: "curve" or "bid_ask" by volatility, as in HARD RULES. Do not take it from a saved strategy's lp_strategy.
 - Bins: choose from configured minBinsBelow/maxBinsBelow by positive volatility. The hard lower floor is 35 bins.
 - Deposit: single-sided SOL only: set amount_y/amount_sol, keep amount_x=0.
 
