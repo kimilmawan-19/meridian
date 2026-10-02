@@ -669,6 +669,25 @@ Agent Meridian HiveMind sync is handled by `hivemind.js`. It uses built-in Agent
     - count repeated partials per position;
     - compare final PnL of partially closed positions (`partial_taken_count` > 0 in `lessons.json`) with full trailing closes at similar peaks.
   - Possible fixes, only if the data shows harm: allow one partial per position, or measure the runner's trailing from a fresh peak after the partial.
+- **Price path vs strategy, impulse entries and OOR-below exits: explored 2026-10-02, no change.**
+  - Tools: `diag-ohlcv.mjs` (GeckoTerminal 5m candles in SOL, cached per position in `ohlcv-cache/`), `diag-impulse.mjs`, `diag-oor.mjs`, `diag-oor2.mjs`. 30 days, 657 curve/bid_ask positions with full candles, total about +$282.
+  - A price path chained from the logged DexScreener `price5m` does not work: positions whose price fell more than 20% still had a median PnL near 0%. Use the real candles.
+  - **Where the money goes.** Positions earn when price falls into the range and lose when it falls through the bottom.
+    - Curve is best at 25–50% of the range used (+2.71%). Bid_ask is best at 50–100% (+3.4% to +3.8%).
+    - Falling through the whole range (≥100%): curve −6.60% (n=28), bid_ask −2.86% (n=56), together −$424. Curve at 75–100%: −2.58% (n=32). Everything else nets about +$790.
+  - **Entry grace is not too loose.** Curve at 50–75% depth still earns +1.08%, so lowering the 70% curve grace would cut winners. Bid_ask at 75–100% earns +3.4%, which fits the 95 grace. Don't lower either.
+  - **Impulse filter rejected.**
+    - After a 1h rise ≥10.6% the 6h path is "keeps falling" in 48% of entries vs 35–39% (weak, about 2 SE), but PnL is not worse. Bid_ask after a 15m rise ≥20% made +3.66% (n=28).
+    - No filter bucket reached the 95% bar. The closest, 1h ≥40%, is n=30, −$44, 80% of resamples negative, one of about 35 buckets tested. Best case +$44 per 30 days.
+    - `maxPump1hPct` stays 80. Re-check with more data at the 2026-10-16 evaluation only if wanted.
+  - **OOR-below exit: no change.**
+    - 84 positions (13%) crossed the range bottom. All of their net loss is stop loss (n=30, −$473, closed a median 6 minutes after crossing). The other 54 net +$48, and 62% of all 84 closed back above the bottom.
+    - Simulation of the real Rule 4 shape, "close after X continuous minutes below the bottom": X=10 +$19, X=15 +$11, X=30 −$2 (75% / 64% / 28% positive). Only 7 of 84 stay below for 15 minutes or more, and X=5 would hurt (−$564).
+    - Zero Rule 4 OOR-below closes and zero `Rule 4 OOR below deferred` log lines in the window, so Rule 4 below practically never matters. Don't touch `outOfRangeWaitMinutes` or the buy-pressure deferral.
+    - An earlier simulation ("exit X minutes after first touching the bottom", +$324 to +$426 at 98–99% positive) was biased. It did not require price to still be below the bottom. Keep that condition in any exit simulation.
+  - **Hypothesis only, not acted on.** After a falling coin, curve does worse than bid_ask: 6h price <0 gives −0.36% (n=137) vs +1.19% (n=142), and more than 40% below the 24h high gives −0.28% vs +1.33%. About 2 SE, and confounded because `curveMaxVolatility` picks the strategy.
+  - **SI-SOL (2026-10-01, −12.99%, stop loss −14.14% vs −12%) is not a bug.** The first poll after the dump already read −14.14%. A 5m candle with a low ≤ −10% below the previous close occurs in 34% of curve and 66% of bid_ask positions (partly wicks), so a jump of 2 points or more between two 30s polls is normal. No rule inside a poll window can catch it.
+  - Price after close (6h, no random-time baseline): after max-age and OOR exits the token kept falling (bid_ask median −10% and −14%), so no sign of exits being too early. After break-even and trailing exits bid_ask rose (+9% and +30%), but n=18 and 9.
 - **Exit data freshness: checked 2026-09-29, no change needed.**
   - Position PnL, bins and in-range state are force-fetched on every 30s poll and again by the management cycle it triggers. DexScreener data is cached for 60s. Live volatility refreshes each cycle.
   - Decision-to-realized gap (`diag-exit-gap.mjs`, 30 days): regime trim n=9, median +0.01%, worst −0.27%. The stop losses matched their decision PnL, apart from AMERICA (−59% → −68%, a rug that crossed the whole range in about 15s).
