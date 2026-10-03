@@ -46,7 +46,7 @@ export async function generateBriefing() {
     "",
     `<b>Lessons Learned:</b>`,
     lessonsLast24h.length > 0
-      ? lessonsLast24h.map(l => `• ${l.rule}`).join("\n")
+      ? lessonsLast24h.map(l => `• ${escapeHtml(l.rule)}`).join("\n")
       : "• No new lessons recorded overnight.",
     "",
     `<b>Current Portfolio:</b>`,
@@ -58,6 +58,12 @@ export async function generateBriefing() {
   ];
 
   return lines.join("\n");
+}
+
+// Escape dynamic content (token symbols / narratives) before inserting into an HTML message.
+// Telegram parse_mode=HTML rejects the WHOLE message (HTTP 400) on a stray &, <, or >.
+function escapeHtml(s) {
+  return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 function loadJson(file) {
