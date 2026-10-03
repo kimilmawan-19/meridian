@@ -34,6 +34,16 @@ try {
     src("tools/dlmm.js").includes("...(tracked?.signal_snapshot || {}),") && src("lessons.js").includes("const snapshot = { ...(perf.signal_snapshot || {}) };"));
   for (const f of ["flow_consensus: md ? regimeConsensus : null,", "txn_buys_5m: md?.txn_buys_5m ?? null,", "txn_sells_5m: md?.txn_sells_5m ?? null,", "net_buyers_1h: netBuyers ?? null,"])
     check(`screening stages ${f.split(":")[0]}`, src("index.js").includes(f));
+  console.log("\n[3] audit fields for evaluating the hard filters (record-only)");
+  for (const f of ["top10_pct: ti?.audit?.top_holders_pct ?? null,", "bot_holders_pct: ti?.audit?.bot_holders_pct ?? null,", "bundle_pct: pool.bundle_pct ?? null,",
+    "token_fees_sol: ti?.global_fees_sol ?? null,", "token_age_hours: pool.token_age_hours ?? null,", "active_pct: pool.active_pct ?? null,",
+    "unique_traders: pool.unique_traders ?? null,", "regime_at_entry: config.marketRegime?._activeRegime ?? null,"])
+    check(`screening stages ${f.split(":")[0]}`, src("index.js").includes(f));
+  stageSignals("AuditPool1", { base_mint: "AuditMint1", top10_pct: 22.5, bot_holders_pct: 20.7, bundle_pct: 8, token_fees_sol: 158, token_age_hours: 96, active_pct: 41.2, unique_traders: 130, regime_at_entry: "caution" });
+  const audit = getAndClearStagedSignals("AuditPool1", "AuditMint1");
+  check("round trip keeps all eight audit fields", audit?.top10_pct === 22.5 && audit?.bot_holders_pct === 20.7 && audit?.bundle_pct === 8 && audit?.token_fees_sol === 158
+    && audit?.token_age_hours === 96 && audit?.active_pct === 41.2 && audit?.unique_traders === 130 && audit?.regime_at_entry === "caution", JSON.stringify(audit));
+  check("none of them is a Darwin weight", !/top10_pct|bot_holders_pct|bundle_pct|token_fees_sol|token_age_hours|active_pct|unique_traders|regime_at_entry/.test(src("signal-weights.js")));
   check("not Darwin weights (signal-weights.js untouched)",
     !/price_vs_ath_pct|flow_consensus|txn_buys_5m|net_buyers_1h/.test(src("signal-weights.js")));
 } catch (e) {

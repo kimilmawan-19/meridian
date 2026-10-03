@@ -1372,6 +1372,16 @@ export async function runScreeningCycle({ silent = false } = {}) {
           candidate_rank: i + 1,
           candidate_count: passing.length,
           top_fee_tvl: passing[0]?.pool?.fee_active_tvl_ratio ?? null,
+          // Record-only, so the rug-hygiene filters and the pool-structure lines can be evaluated later.
+          // Raw values (null when the source had none), not the "?" placeholders used in the prompt block.
+          top10_pct: ti?.audit?.top_holders_pct ?? null,
+          bot_holders_pct: ti?.audit?.bot_holders_pct ?? null,
+          bundle_pct: pool.bundle_pct ?? null,
+          token_fees_sol: ti?.global_fees_sol ?? null,
+          token_age_hours: pool.token_age_hours ?? null,
+          active_pct: pool.active_pct ?? null,
+          unique_traders: pool.unique_traders ?? null,
+          regime_at_entry: config.marketRegime?._activeRegime ?? null,
         });
       }
 
