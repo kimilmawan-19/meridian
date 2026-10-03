@@ -41,7 +41,8 @@
     "postinstall": "node scripts/patch-anchor.js",
     "test:orphan-cleanup": "node test/test-orphan-cleanup.mjs",
     "test:deploy-prompt": "node test/test-deploy-prompt.mjs",
-    "test:candidate-order": "node test/test-candidate-order.mjs"
+    "test:candidate-order": "node test/test-candidate-order.mjs",
+    "test:caution-bar": "node test/test-caution-bar.mjs"
   },
   "knip": {
     "ignore": [

@@ -72,37 +72,6 @@ try {
   check("marketRegimeBearishTrailMult default 0.6", config.management.marketRegimeBearishTrailMult === 0.6);
   check("bearishScoreThreshold default 3.7", config.marketRegime.bearishScoreThreshold === 3.7);
   check("cautionScoreThreshold default 1.8", config.marketRegime.cautionScoreThreshold === 1.8);
-  check("cautionMinTokenAgeHours default 72", config.marketRegime.cautionMinTokenAgeHours === 72);
-  check("cautionMinMcapMult default 2", config.marketRegime.cautionMinMcapMult === 2);
-
-  console.log("\n[2b] Maturity bias floor math (mirrors index.js caution elevation block)");
-  function ageFloorApplied(currentMinTokenAgeHours, cautionFloor) {
-    return Math.max(currentMinTokenAgeHours ?? 0, cautionFloor);
-  }
-  function mcapFloorApplied(currentMinMcap, mult) {
-    return Math.max(currentMinMcap, currentMinMcap * mult);
-  }
-  check("age floor: unset (null) -> 72h", ageFloorApplied(null, 72) === 72);
-  check("age floor: existing 100h (stricter) -> stays 100h, never loosened", ageFloorApplied(100, 72) === 100);
-  check("age floor: existing 24h (looser) -> raised to 72h", ageFloorApplied(24, 72) === 72);
-  check("mcap floor: 150k * 2 -> 300k", mcapFloorApplied(150_000, 2) === 300_000);
-  check("mcap floor: mult=1 is a no-op", mcapFloorApplied(150_000, 1) === 150_000);
-
-  console.log("\n[2c] Restore sentinel (mirrors index.js finally block save/restore)");
-  // minTokenAgeHours can legitimately BE null (its default) — using `!= null` as the "was
-  // raised this cycle" sentinel would wrongly skip restoring back to null. Verify the
-  // `undefined`-sentinel pattern used in index.js round-trips null correctly.
-  function simulateRaiseAndRestore(originalValue) {
-    let saved; // undefined = not raised
-    let current = originalValue;
-    saved = current; // raise: save original (whatever it is, including null)
-    current = 72; // raise: apply floor
-    // ...cycle runs...
-    if (saved !== undefined) { current = saved; saved = undefined; } // finally: restore
-    return current;
-  }
-  check("restore round-trips null correctly", simulateRaiseAndRestore(null) === null);
-  check("restore round-trips existing 100 correctly", simulateRaiseAndRestore(100) === 100);
 
   console.log("\n[3] Trailing give-back regime scaling (mirrors state.js updatePnlAndCheckExits)");
   function trailingEffectiveDrop(peakPnlPct, dropFloor, givebackDivisor, regime, mgmtConfig) {

@@ -278,14 +278,6 @@ export const config = {
     // absorb that signal's headroom — starting calibration, tune from market_regime logs.
     bearishScoreThreshold: u.marketRegime?.bearishScoreThreshold ?? 3.7,
     cautionScoreThreshold: u.marketRegime?.cautionScoreThreshold ?? 1.8,
-    // Maturity bias during caution: prefer tokens past the newest/most dump-prone phase and
-    // with more established liquidity, without leaving the bot's memecoin/trending universe
-    // (unlike shifting to true blue-chip majors, which would collapse fee yield — this bot's
-    // edge is fee_active_tvl_ratio/organic screening on volatile pools, not efficient blue-chip
-    // markets). Applied as a floor (Math.max with the existing value) in index.js, restored
-    // after the cycle so it doesn't compound.
-    cautionMinTokenAgeHours: u.marketRegime?.cautionMinTokenAgeHours ?? 72, // token age floor (hours) while caution
-    cautionMinMcapMult:      u.marketRegime?.cautionMinMcapMult      ?? 2,  // minMcap multiplier while caution
     _activeRegime: "healthy",  // runtime-only: latest assessed regime, shared with computeDeployAmount (set by index.js screening cycle)
   },
 

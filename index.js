@@ -7,7 +7,7 @@ import { agentLoop } from "./agent.js";
 import { log } from "./logger.js";
 import { getMyPositions, getActiveBin } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
-import { getTopCandidates, fetchPoolVolatility, getPoolDetail } from "./tools/screening.js";
+import { getTopCandidates, fetchPoolVolatility, getPoolDetail, dropBelowFeeFloor } from "./tools/screening.js";
 import { assessMarketRegime, isRegimeConfirmed } from "./market-regime.js";
 import { fetchPoolMarketData, getMarketDataStats } from "./tools/market-data.js";
 import { config, configMeta, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
@@ -117,11 +117,6 @@ const _oorNotified = new Set(); // positions already alerted for the current out
 const _pollTriggeredAt = new Map(); // position_address → epoch ms; per-position poll-trigger cooldown (a dump on one position no longer blocks exits on others)
 let _cachedSolPrice = null; // updated each management cycle, reused by PnL poll for Rule 6 grace check
 let _cautionOrigFeeRatio = null; // saved before caution raise, restored in screening cycle finally
-let _cautionOrigOrganic  = null;
-// undefined = not currently raised this cycle (the sentinel, since the underlying config
-// value can itself legitimately be null — minTokenAgeHours defaults to null/"no minimum").
-let _cautionOrigMinTokenAgeHours;
-let _cautionOrigMinMcap;
 let _lastRegime = "healthy"; // most recent market regime assessment — drives caution screening slowdown
 const _peakConfirmTimers = new Map();
 const _trailingDropConfirmTimers = new Map();
@@ -979,25 +974,15 @@ export async function runScreeningCycle({ silent = false } = {}) {
           screenReport = "Screening throttled — caution regime at capacity.";
           return screenReport;
         }
-        // Below caution cap: still allowed to deploy, but raise quality bar for this cycle only.
-        // Save originals so they can be restored in the finally block. Without restore, repeated
-        // caution cycles compound the multiplier (0.05 → 0.07 → 0.098 → ...) until no pool passes.
+        // Below caution cap: still allowed to deploy, but raise the fee/TVL floor for this cycle only.
+        // Saved so it can be restored in the finally block; without the restore, repeated caution
+        // cycles compound the multiplier (0.05 → 0.07 → 0.098 → ...) until no pool passes.
+        // Only fee/TVL is raised. Raising organic, mcap and token age here never reached the candidates
+        // (they are fetched before this block) and the 60-day data does not support them: the positions
+        // that bar would have removed made +1.10% (n=25), and caution deploys did better than healthy ones.
         _cautionOrigFeeRatio = config.screening.minFeeActiveTvlRatio;
-        _cautionOrigOrganic  = config.screening.minOrganic;
         config.screening.minFeeActiveTvlRatio = +(_cautionOrigFeeRatio * 1.4).toFixed(4);
-        config.screening.minOrganic = Math.min(85, _cautionOrigOrganic + 10);
-        // Maturity bias: during caution, prefer tokens that have survived past the newest,
-        // most dump-prone phase (age floor) and have more established liquidity (mcap floor).
-        // Math.max with the existing value means this only ever raises the bar, never loosens
-        // a stricter user-set floor. Restored in the finally block same as the two above —
-        // without restore, repeated caution cycles would compound indefinitely.
-        _cautionOrigMinTokenAgeHours = config.screening.minTokenAgeHours;
-        _cautionOrigMinMcap = config.screening.minMcap;
-        const ageFloor = config.marketRegime.cautionMinTokenAgeHours ?? 72;
-        config.screening.minTokenAgeHours = Math.max(config.screening.minTokenAgeHours ?? 0, ageFloor);
-        const mcapMult = config.marketRegime.cautionMinMcapMult ?? 2;
-        config.screening.minMcap = Math.max(config.screening.minMcap, config.screening.minMcap * mcapMult);
-        log("market_regime", `Caution regime — quality bar raised for this cycle (minFeeActiveTvlRatio=${config.screening.minFeeActiveTvlRatio} minOrganic=${config.screening.minOrganic} minTokenAgeHours=${config.screening.minTokenAgeHours} minMcap=${config.screening.minMcap}), capacity ${prePositions.total_positions}/${cautionCap}`);
+        log("market_regime", `Caution regime — fee/TVL floor raised for this cycle (minFeeActiveTvlRatio=${config.screening.minFeeActiveTvlRatio}), capacity ${prePositions.total_positions}/${cautionCap}`);
       }
     } else {
       config.marketRegime._activeRegime = "healthy"; // regime detection off — never modulate deploy size
@@ -1010,8 +995,16 @@ export async function runScreeningCycle({ silent = false } = {}) {
     const deployAmount = computeDeployAmount(currentBalance.sol, { openPositionsValueSol });
     log("cron", `Computed deploy amount: ${deployAmount} SOL (wallet: ${currentBalance.sol} SOL, open-pos: ${openPositionsValueSol.toFixed(3)} SOL, regime: ${config.marketRegime._activeRegime})`);
 
+    // The executor enforces the (possibly caution-raised) fee/TVL floor at deploy time, so apply it here
+    // too: otherwise the LLM is offered a candidate that the executor then blocks.
+    const { kept: candidatesAboveFloor, dropped: belowFloor } = dropBelowFeeFloor(candidates, config.screening.minFeeActiveTvlRatio);
+    for (const pool of belowFloor) {
+      log("screening", `Fee floor: dropped ${pool.name} — fee/TVL ${pool.fee_active_tvl_ratio} < ${config.screening.minFeeActiveTvlRatio} (${config.marketRegime._activeRegime})`);
+      earlyFilteredExamples.push({ name: pool.name, reason: `fee/TVL ${pool.fee_active_tvl_ratio} below ${config.screening.minFeeActiveTvlRatio}` });
+    }
+
     const allCandidates = [];
-    for (const pool of candidates) {
+    for (const pool of candidatesAboveFloor) {
       const mint = pool.base?.mint;
       const [smartWallets, narrative, tokenInfo, screenMd, detail24h] = await Promise.allSettled([
         checkSmartWalletsOnPool({ pool_address: pool.pool }),
@@ -1512,22 +1505,10 @@ IMPORTANT:
     screenFailed = true;
   } finally {
     setDeployNotifyMuted(false);
-    // Restore caution-raised thresholds so they don't compound across cycles
+    // Restore the caution-raised fee/TVL floor so it doesn't compound across cycles
     if (_cautionOrigFeeRatio != null) {
       config.screening.minFeeActiveTvlRatio = _cautionOrigFeeRatio;
       _cautionOrigFeeRatio = null;
-    }
-    if (_cautionOrigOrganic != null) {
-      config.screening.minOrganic = _cautionOrigOrganic;
-      _cautionOrigOrganic = null;
-    }
-    if (_cautionOrigMinTokenAgeHours !== undefined) {
-      config.screening.minTokenAgeHours = _cautionOrigMinTokenAgeHours;
-      _cautionOrigMinTokenAgeHours = undefined;
-    }
-    if (_cautionOrigMinMcap !== undefined) {
-      config.screening.minMcap = _cautionOrigMinMcap;
-      _cautionOrigMinMcap = undefined;
     }
     _screeningBusy = false;
     if (!silent && telegramEnabled()) {

@@ -454,8 +454,6 @@ const toolMap = {
       cautionPositionSizeMult: ["marketRegime", "cautionPositionSizeMult"],
       bearishScoreThreshold: ["marketRegime", "bearishScoreThreshold"],
       cautionScoreThreshold: ["marketRegime", "cautionScoreThreshold"],
-      cautionMinTokenAgeHours: ["marketRegime", "cautionMinTokenAgeHours"],
-      cautionMinMcapMult: ["marketRegime", "cautionMinMcapMult"],
       marketRegimeCautionSlMult: ["management", "marketRegimeCautionSlMult"],
       marketRegimeBearishSlMult: ["management", "marketRegimeBearishSlMult"],
       marketRegimeCautionTrailMult: ["management", "marketRegimeCautionTrailMult"],

@@ -39,6 +39,21 @@ function scoreCandidate(pool) {
   return feeTvl * (organic / 100);
 }
 
+// Drop candidates whose fee/TVL is below the floor. Missing data stays in (fail-open), like the other
+// hard filters. Used after the regime check: in caution the floor is raised (x1.4) and the executor
+// enforces it at deploy, so a candidate below it would be shown to the LLM and then blocked.
+export function dropBelowFeeFloor(pools, floor) {
+  const min = Number(floor);
+  const kept = [], dropped = [];
+  for (const pool of pools) {
+    const raw = pool?.fee_active_tvl_ratio;
+    const fee = raw == null ? NaN : Number(raw); // Number(null) is 0, which would drop a pool with no data
+    if (Number.isFinite(min) && Number.isFinite(fee) && fee < min) dropped.push(pool);
+    else kept.push(pool);
+  }
+  return { kept, dropped };
+}
+
 function numeric(value) {
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
