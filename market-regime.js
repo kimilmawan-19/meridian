@@ -45,6 +45,34 @@ export function isRegimeConfirmed(prevRegime, regime) {
   return nonHealthy(prevRegime) && nonHealthy(regime);
 }
 
+// Meteora discovery timeframes bracketing 6h (it has no 6h). One call each; a failure gives null.
+const LONG_TIMEFRAMES = ["4h", "12h"];
+
+export function summarizeLongTimeframe(pools) {
+  if (!Array.isArray(pools) || pools.length < 10) return null;
+  const pos = pools.filter(p => (p.pool_price_change_pct ?? 0) > 0).length;
+  const vc = pools.map(p => p.volume_change_pct).filter(v => v != null && Number.isFinite(Number(v))).map(Number);
+  return {
+    breadth: +(pos / pools.length * 100).toFixed(1),
+    volChange: vc.length >= 5 ? +(vc.reduce((a, b) => a + b, 0) / vc.length).toFixed(1) : null,
+    pools: pools.length,
+  };
+}
+
+async function recordLongTimeframes() {
+  const out = {};
+  const res = await Promise.allSettled(LONG_TIMEFRAMES.map(tf => fetchTrendingBreadth({ timeframe: tf })));
+  LONG_TIMEFRAMES.forEach((tf, i) => { out[tf] = res[i].status === "fulfilled" ? summarizeLongTimeframe(res[i].value) : null; });
+  return out;
+}
+
+function formatLongTf(longTf) {
+  return LONG_TIMEFRAMES.map(tf => {
+    const s = longTf?.[tf];
+    return `breadth ${tf}=${s?.breadth ?? "?"}% volChange ${tf}=${s?.volChange ?? "?"}%`;
+  }).join(" ");
+}
+
 export async function assessMarketRegime(candidates = [], solPriceUsd = null) {
   try {
     // Layer 1 + 2: fetch both timeframes from Meteora (unfiltered trending)
@@ -55,6 +83,9 @@ export async function assessMarketRegime(candidates = [], solPriceUsd = null) {
 
     const pools5m = res5m.status === "fulfilled" ? res5m.value : [];
     const pools1h = res1h.status === "fulfilled" ? res1h.value : [];
+
+    // Record-only: longer-timeframe breadth and volume trend. NOT part of the score.
+    const longTf = await recordLongTimeframes();
 
     // Layer 3: DexScreener for top 5 candidates (flow + vol acceleration)
     const top5 = candidates.slice(0, 5);
@@ -196,6 +227,7 @@ export async function assessMarketRegime(candidates = [], solPriceUsd = null) {
       solChg30m:       chg30m !== null ? +chg30m.toFixed(2) : null,
       solChg60m:       chg60m !== null ? +chg60m.toFixed(2) : null,
       solMomentumScore: +solMomentumScore.toFixed(2),
+      longTf,
     };
 
     log(
@@ -204,6 +236,7 @@ export async function assessMarketRegime(candidates = [], solPriceUsd = null) {
       `breadth 5m=${signals.breadth5m ?? "?"}% 1h=${signals.breadth1h ?? "?"}% (${pools5m.length}/${pools1h.length} pools) | ` +
       `volChange=${signals.avgVolChangePct ?? "?"}% accel=${signals.avgAccel ?? "?"}x | ` +
       `sol30m=${signals.solChg30m ?? "?"}% sol60m=${signals.solChg60m ?? "?"}% | ` +
+      `longtf: ${formatLongTf(longTf)} | ` +
       `scores: breadth=${breadthScore.toFixed(2)} vol=${volumeScore.toFixed(2)} flow=${flowScore.toFixed(2)} sol=${solMomentumScore.toFixed(2)}`
     );
 

@@ -42,7 +42,8 @@
     "test:orphan-cleanup": "node test/test-orphan-cleanup.mjs",
     "test:deploy-prompt": "node test/test-deploy-prompt.mjs",
     "test:candidate-order": "node test/test-candidate-order.mjs",
-    "test:caution-bar": "node test/test-caution-bar.mjs"
+    "test:caution-bar": "node test/test-caution-bar.mjs",
+    "test:regime-longtf": "node test/test-regime-longtf.mjs"
   },
   "knip": {
     "ignore": [
