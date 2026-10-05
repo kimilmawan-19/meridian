@@ -10,14 +10,14 @@ const _cache = new Map();
 const _stats = { hits: 0, misses: 0, errors: 0, totalLatencyMs: 0, fetchCount: 0 };
 
 /**
- * Fetch 5m/1h market data for a Solana pair from DexScreener.
+ * Fetch 5m/1h/6h market data for a Solana pair from DexScreener.
  * Results are cached for 60 seconds per pair address.
  * Returns null on any failure — never throws.
  *
  * @param {string} pairAddress  Meteora pool address (= DexScreener pairAddress for Solana)
  * @returns {Promise<{
- *   volume_5m: number|null, volume_1h: number|null,
- *   price_change_5m: number|null, price_change_1h: number|null,
+ *   volume_5m: number|null, volume_1h: number|null, volume_6h: number|null, volume_24h: number|null,
+ *   price_change_5m: number|null, price_change_1h: number|null, price_change_6h: number|null,
  *   txn_buys_5m: number|null, txn_sells_5m: number|null,
  *   liquidity_usd: number|null, fetched_at: string
  * }|null>}
@@ -63,14 +63,17 @@ export async function fetchPoolMarketData(pairAddress) {
     }
 
     const data = {
-      volume_5m:       pair.volume?.m5      ?? null,
-      volume_1h:       pair.volume?.h1      ?? null,
-      price_change_5m: pair.priceChange?.m5 ?? null,
-      price_change_1h: pair.priceChange?.h1 ?? null,
-      txn_buys_5m:     pair.txns?.m5?.buys  ?? null,
-      txn_sells_5m:    pair.txns?.m5?.sells ?? null,
-      liquidity_usd:   pair.liquidity?.usd  ?? null,
-      fetched_at:      new Date().toISOString(),
+      volume_5m:        pair.volume?.m5       ?? null,
+      volume_1h:        pair.volume?.h1       ?? null,
+      volume_6h:        pair.volume?.h6       ?? null,
+      volume_24h:       pair.volume?.h24      ?? null,
+      price_change_5m:  pair.priceChange?.m5  ?? null,
+      price_change_1h:  pair.priceChange?.h1  ?? null,
+      price_change_6h:  pair.priceChange?.h6  ?? null,
+      txn_buys_5m:      pair.txns?.m5?.buys   ?? null,
+      txn_sells_5m:     pair.txns?.m5?.sells  ?? null,
+      liquidity_usd:    pair.liquidity?.usd   ?? null,
+      fetched_at:       new Date().toISOString(),
     };
 
     log("market_data", `DexScreener OK ${pairAddress.slice(0, 8)} — vol5m=$${data.volume_5m ?? "?"} price5m=${data.price_change_5m ?? "?"}% (${latencyMs}ms)`);

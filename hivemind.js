@@ -151,6 +151,7 @@ function normalizeSharedLesson(lesson) {
 }
 
 export function getSharedLessonsForPrompt({ agentType = "GENERAL", maxLessons = 6 } = {}) {
+  if (!config.hiveMind?.lessonsInPrompt) return null;
   const role = String(agentType || "GENERAL").toUpperCase();
   const shared = (readCache().sharedLessons || [])
     .map(normalizeSharedLesson)

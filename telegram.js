@@ -41,6 +41,7 @@ function saveChatId(id) {
       : {};
     cfg.telegramChatId = id;
     fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify(cfg, null, 2));
+    try { fs.chmodSync(USER_CONFIG_PATH, 0o600); } catch (_) { /* best-effort on non-POSIX FS */ }
   } catch (e) {
     log("telegram_error", `Failed to persist chatId: ${e.message}`);
   }
@@ -83,24 +84,50 @@ export function isEnabled() {
   return !!TOKEN;
 }
 
+// Backoff before each retry of a network-level failure (fetch threw). The server's route to
+// api.telegram.org drops often (live logs: 23 "sendMessage failed: fetch failed" in 3 days,
+// some right at a close), and a dropped alert was never resent. HTTP errors are not retried.
+const NETWORK_RETRY_DELAYS_MS = [1000, 3000];
+
 async function postTelegram(method, body) {
   if (!TOKEN || !chatId) return null;
-  try {
-    const res = await fetch(`${BASE}/${method}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, ...body }),
-    });
-    if (!res.ok) {
-      const err = await res.text();
-      log("telegram_error", `${method} ${res.status}: ${err.slice(0, 200)}`);
+  // Typing indicators are re-sent every 4s anyway — retrying them only adds noise.
+  const delays = method === "sendChatAction" ? [] : NETWORK_RETRY_DELAYS_MS;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const res = await fetch(`${BASE}/${method}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: chatId, ...body }),
+      });
+      if (!res.ok) {
+        const err = await res.text();
+        log("telegram_error", `${method} ${res.status}: ${err.slice(0, 200)}`);
+        return null;
+      }
+      return await res.json();
+    } catch (e) {
+      if (attempt < delays.length) {
+        await sleep(delays[attempt]);
+        continue;
+      }
+      log("telegram_error", `${method} failed: ${e.message}`);
       return null;
     }
-    return await res.json();
-  } catch (e) {
-    log("telegram_error", `${method} failed: ${e.message}`);
-    return null;
   }
+}
+
+// Escape dynamic text interpolated into HTML notifications. Close reasons are raw rule text
+// ("Stop loss: PnL -11.2% <= -10.2%"); an unescaped "<" makes Telegram reject the whole
+// message with 400 "can't parse entities", which silently dropped close notifications.
+export function escapeHtml(value) {
+  return String(value ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function htmlToPlain(html) {
+  return String(html)
+    .replace(/<\/?[a-z][^>]*>/gi, "")
+    .replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
 }
 
 async function postTelegramRaw(method, body) {
@@ -136,9 +163,43 @@ export async function sendMessageWithButtons(text, inlineKeyboard) {
   });
 }
 
+// Split a message into ≤limit-char chunks on newline boundaries so an HTML tag
+// (always within a single line in our messages) is never cut mid-tag. A single
+// over-limit line is hard-sliced as a last resort.
+export function splitForTelegram(text, limit = 4096) {
+  const str = String(text);
+  if (str.length <= limit) return [str];
+  const chunks = [];
+  let current = "";
+  for (const line of str.split("\n")) {
+    if (line.length > limit) {
+      if (current) { chunks.push(current); current = ""; }
+      for (let i = 0; i < line.length; i += limit) chunks.push(line.slice(i, i + limit));
+      continue;
+    }
+    const candidate = current ? `${current}\n${line}` : line;
+    if (candidate.length > limit) {
+      chunks.push(current);
+      current = line;
+    } else {
+      current = candidate;
+    }
+  }
+  if (current) chunks.push(current);
+  return chunks;
+}
+
 export async function sendHTML(html) {
-  if (!TOKEN || !chatId) return;
-  return postTelegram("sendMessage", { text: html.slice(0, 4096), parse_mode: "HTML" });
+  if (!TOKEN || !chatId) return null;
+  const chunks = splitForTelegram(html, 4096);
+  let last = null;
+  for (const chunk of chunks) {
+    last = await postTelegram("sendMessage", { text: chunk, parse_mode: "HTML" });
+    // One plain-text resend, so a formatting bug can never silently drop an alert again.
+    if (!last) last = await postTelegram("sendMessage", { text: htmlToPlain(chunk) });
+    if (!last) return null; // a failed chunk → report failure so callers can retry
+  }
+  return last;
 }
 
 export async function editMessage(text, messageId) {
@@ -399,8 +460,15 @@ export function stopPolling() {
 }
 
 // ─── Notification helpers ────────────────────────────────────────
+// Muted while a screening cycle runs: its report already carries the full deploy details,
+// so a separate "Deployed" message would duplicate it.
+let _deployNotifyMuted = false;
+export function setDeployNotifyMuted(muted) {
+  _deployNotifyMuted = !!muted;
+}
+
 export async function notifyDeploy({ pair, amountSol, position, tx, priceRange, rangeCoverage, binStep, baseFee }) {
-  if (hasActiveLiveMessage()) return;
+  if (hasActiveLiveMessage() || _deployNotifyMuted) return;
   const priceStr = priceRange
     ? `Price range: ${priceRange.min < 0.0001 ? priceRange.min.toExponential(3) : priceRange.min.toFixed(6)} – ${priceRange.max < 0.0001 ? priceRange.max.toExponential(3) : priceRange.max.toFixed(6)}\n`
     : "";
@@ -411,7 +479,7 @@ export async function notifyDeploy({ pair, amountSol, position, tx, priceRange, 
     ? `Bin step: ${binStep ?? "?"}  |  Base fee: ${baseFee != null ? baseFee + "%" : "?"}\n`
     : "";
   await sendHTML(
-    `✅ <b>Deployed</b> ${pair}\n` +
+    `✅ <b>Deployed</b> ${escapeHtml(pair)}\n` +
     `Amount: ${amountSol} SOL\n` +
     priceStr +
     coverageStr +
@@ -421,19 +489,38 @@ export async function notifyDeploy({ pair, amountSol, position, tx, priceRange, 
   );
 }
 
-export async function notifyClose({ pair, pnlUsd, pnlPct }) {
-  if (hasActiveLiveMessage()) return;
+// Muted only while the management cycle's own live message is open: that report already lists
+// the closes. Other live messages (chat, /learn) no longer swallow close notifications.
+let _closeNotifyMuted = false;
+export function setCloseNotifyMuted(muted) {
+  _closeNotifyMuted = !!muted;
+}
+
+export async function notifyClose({ pair, pnlUsd, pnlPct, reason }) {
+  if (_closeNotifyMuted) return;
   const sign = pnlUsd >= 0 ? "+" : "";
+  const reasonLine = reason ? `\nReason: ${escapeHtml(reason)}` : "";
   await sendHTML(
-    `🔒 <b>Closed</b> ${pair}\n` +
-    `PnL: ${sign}$${(pnlUsd ?? 0).toFixed(2)} (${sign}${(pnlPct ?? 0).toFixed(2)}%)`
+    `🔒 <b>Closed</b> ${escapeHtml(pair)}\n` +
+    `PnL: ${sign}$${(pnlUsd ?? 0).toFixed(2)} (${sign}${(pnlPct ?? 0).toFixed(2)}%)` +
+    reasonLine
+  );
+}
+
+export async function notifyPartialClose({ pair, pct, lockedUsd, peakPct }) {
+  if (hasActiveLiveMessage()) return;
+  const peakLine = peakPct != null ? ` at peak ${peakPct.toFixed(1)}%` : "";
+  await sendHTML(
+    `⚡ <b>Partial Close</b> ${escapeHtml(pair)}\n` +
+    `Took ${pct}%${peakLine} — locked $${(lockedUsd ?? 0).toFixed(2)} to SOL\n` +
+    `Runner held with tightened trailing stop`
   );
 }
 
 export async function notifySwap({ inputSymbol, outputSymbol, amountIn, amountOut, tx }) {
   if (hasActiveLiveMessage()) return;
   await sendHTML(
-    `🔄 <b>Swapped</b> ${inputSymbol} → ${outputSymbol}\n` +
+    `🔄 <b>Swapped</b> ${escapeHtml(inputSymbol)} → ${escapeHtml(outputSymbol)}\n` +
     `In: ${amountIn ?? "?"} | Out: ${amountOut ?? "?"}\n` +
     `Tx: <code>${tx?.slice(0, 16)}...</code>`
   );
@@ -454,8 +541,8 @@ export async function notifyEmergencyExit({ pair, reason, volume5m, peakVolume5m
     : "?";
   await sendHTML(
     `⚠️ <b>EMERGENCY EXIT</b>\n` +
-    `Pair: ${pair}\n` +
-    `Reason: <code>${reason}</code>\n` +
+    `Pair: ${escapeHtml(pair)}\n` +
+    `Reason: <code>${escapeHtml(reason)}</code>\n` +
     `Volume 5m: $${volume5m?.toFixed(0) ?? "?"} (peak $${peakVolume5m?.toFixed(0) ?? "?"}, ${volumeRatioPct ?? "?"}% of peak)\n` +
     `Price Δ 5m: ${priceLine}\n` +
     `Sell pressure: ${txnSells5m ?? "?"} sells / ${txnBuys5m ?? "?"} buys (${sellRatio}x)\n` +
@@ -463,10 +550,25 @@ export async function notifyEmergencyExit({ pair, reason, volume5m, peakVolume5m
   );
 }
 
-export async function notifyOutOfRange({ pair, minutesOOR }) {
-  if (hasActiveLiveMessage()) return;
+// Not suppressed by an active live message: a failed swap leaves the base token in the wallet,
+// so the next deploy sizes down (or fails minSolToOpen) until it is swapped manually.
+export async function notifyAutoSwapFailed({ pair, mint, error }) {
   await sendHTML(
-    `⚠️ <b>Out of Range</b> ${pair}\n` +
+    `⚠️ <b>Auto-swap gagal</b> ${escapeHtml(pair)}\n` +
+    `Token <code>${String(mint ?? "?").slice(0, 8)}...</code> masih di wallet — deploy berikutnya bisa undersized.\n` +
+    `Error: ${escapeHtml(String(error ?? "unknown").slice(0, 200))}`
+  );
+}
+
+export async function notifyOutOfRange({ pair, minutesOOR, direction = null }) {
+  if (hasActiveLiveMessage()) return;
+  const dirLabel = direction === "ABOVE"
+    ? " (price <b>above</b> range — position idle, still SOL)"
+    : direction === "BELOW"
+    ? " (price <b>below</b> range — cycle complete, now token)"
+    : "";
+  await sendHTML(
+    `⚠️ <b>Out of Range</b> ${escapeHtml(pair)}${dirLabel}\n` +
     `Been OOR for ${minutesOOR} minutes`
   );
 }

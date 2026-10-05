@@ -5,11 +5,12 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { agentLoop } from "./agent.js";
 import { log } from "./logger.js";
-import { getMyPositions, closePosition, getActiveBin } from "./tools/dlmm.js";
+import { getMyPositions, getActiveBin } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
-import { getTopCandidates } from "./tools/screening.js";
+import { getTopCandidates, fetchPoolVolatility, getPoolDetail, dropBelowFeeFloor } from "./tools/screening.js";
+import { assessMarketRegime, isRegimeConfirmed } from "./market-regime.js";
 import { fetchPoolMarketData, getMarketDataStats } from "./tools/market-data.js";
-import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
+import { config, configMeta, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
 import { evolveThresholds, getPerformanceSummary, getDetailedPerformanceAnalysis } from "./lessons.js";
 import { executeTool, registerCronRestarter } from "./tools/executor.js";
 import {
@@ -25,13 +26,15 @@ import {
   notifyEmergencyExit,
   isEnabled as telegramEnabled,
   createLiveMessage,
+  setDeployNotifyMuted,
+  setCloseNotifyMuted,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop, batchUpdateMarketData } from "./state.js";
-import { getActiveStrategy } from "./strategy-library.js";
-import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
+import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop, batchUpdateMarketData, batchUpdateLiveVolatility, getOorDirection, wasRecentlyOorAbove, updateR9GraceZone, isInEntryAccumulation, effectiveStopLossPct, recordTpVeto, resetTpVeto, markTaExitTriggered } from "./state.js";
+import { recordPositionSnapshot, recallForPool, addPoolNote, addVolumeSnapshot, getVolumeWindow, getSnapshotWindow } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
 import { getTokenNarrative, getTokenInfo } from "./tools/token.js";
+import { confirmIndicatorPreset } from "./tools/chart-indicators.js";
 import { stageSignals } from "./signal-tracker.js";
 import { getWeightsSummary } from "./signal-weights.js";
 import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, isHiveMindEnabled, pullHiveMindLessons, pullHiveMindPresets, registerHiveMindAgent, startHiveMindBackgroundSync } from "./hivemind.js";
@@ -46,6 +49,9 @@ if (isMain) {
   log("startup", "DLMM LP Agent starting...");
   log("startup", `Mode: ${process.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE"}`);
   log("startup", `Model: ${process.env.LLM_MODEL || "hermes-3-405b"}`);
+  if (configMeta.lastEvolved) {
+    log("startup", `⚠️  Screening thresholds were auto-evolved by lessons system on ${configMeta.lastEvolved} (after ${configMeta.positionsAtEvolution ?? "?"} closed positions). Active: minFeeActiveTvlRatio=${config.screening.minFeeActiveTvlRatio}, minOrganic=${config.screening.minOrganic}. If screening returns 0 candidates, these may be too strict — reset manually in user-config.json.`);
+  }
   ensureAgentId();
   bootstrapHiveMind().catch((error) => log("hivemind_warn", `Bootstrap failed: ${error.message}`));
   startHiveMindBackgroundSync();
@@ -75,6 +81,22 @@ function formatCountdown(seconds) {
   return m > 0 ? `${m}m ${s}s` : `${s}s`;
 }
 
+// Render where the active price sits inside a position's bin range as a visual bar.
+// Uses bin IDs already on the position object — no SDK call or price conversion.
+// "▲" marks the active bin; 0% = bottom of range, 100% = top edge.
+function renderRangeBar(lowerBin, upperBin, activeBin, width = 20) {
+  if (lowerBin == null || upperBin == null || activeBin == null || upperBin <= lowerBin) return null;
+  const span = upperBin - lowerBin;
+  const rawPct = ((activeBin - lowerBin) / span) * 100;
+  const pct = Math.max(0, Math.min(100, rawPct));
+  // Clamp the marker inside the bar; OOR is flagged by the label, not the bar position.
+  const pos = Math.round((pct / 100) * (width - 1));
+  const cells = Array.from({ length: width }, (_, i) => (i === pos ? "▲" : i < pos ? "█" : "░"));
+  // When price has blown past the range, show the true (>100% / <0%) figure for clarity.
+  const label = rawPct > 100 ? `${Math.round(rawPct)}%↑` : rawPct < 0 ? `${Math.round(rawPct)}%↓` : `${Math.round(rawPct)}%`;
+  return `[${cells.join("")}] ${label} (active ${activeBin} / ${lowerBin}–${upperBin})`;
+}
+
 function buildPrompt() {
   const mgmt = formatCountdown(nextRunIn(timers.managementLastRun, config.schedule.managementIntervalMin));
   const scrn = formatCountdown(nextRunIn(timers.screeningLastRun, config.schedule.screeningIntervalMin));
@@ -88,13 +110,20 @@ let _cronTasks = [];
 let _managementBusy = false; // prevents overlapping management cycles
 let _screeningBusy = false;  // prevents overlapping screening cycles
 let _screeningLastTriggered = 0; // epoch ms — prevents management from spamming screening
-let _pollTriggeredAt = 0; // epoch ms — cooldown for poller-triggered management
+const SCREENING_CYCLE_TOOLS = ["deploy_position", "get_token_holders", "get_token_narrative", "get_token_info"];
+let _noDeployStreak = 0; // consecutive screening cycles that ended without a deploy — drives backoff
+let _entriesPaused = false; // Telegram /pause: skip screening (no new deploys); management + poll keep running
+const _oorNotified = new Set(); // positions already alerted for the current out-of-range episode
+const _pollTriggeredAt = new Map(); // position_address → epoch ms; per-position poll-trigger cooldown (a dump on one position no longer blocks exits on others)
+let _cachedSolPrice = null; // updated each management cycle, reused by PnL poll for Rule 6 grace check
+let _cautionOrigFeeRatio = null; // saved before caution raise, restored in screening cycle finally
+let _lastRegime = "healthy"; // most recent market regime assessment — drives caution screening slowdown
 const _peakConfirmTimers = new Map();
 const _trailingDropConfirmTimers = new Map();
 const TRAILING_PEAK_CONFIRM_DELAY_MS = 15_000;
 const TRAILING_PEAK_CONFIRM_TOLERANCE = 0.85;
 const TRAILING_DROP_CONFIRM_DELAY_MS = 15_000;
-const TRAILING_DROP_CONFIRM_TOLERANCE_PCT = 1.0;
+const TRAILING_DROP_CONFIRM_TOLERANCE_PCT = 0.5;
 
 /** Strip <think>...</think> reasoning blocks that some models leak into output */
 function stripThink(text) {
@@ -140,6 +169,17 @@ function scheduleTrailingDropConfirmation(positionAddress) {
   const timer = setTimeout(async () => {
     _trailingDropConfirmTimers.delete(positionAddress);
     try {
+      // Check price direction first — if price is recovering, cancel trailing exit.
+      // A bounce during the 15s window means the drop may be a wick, not a trend reversal.
+      const poolAddress = getTrackedPosition(positionAddress)?.pool;
+      if (poolAddress) {
+        const md = await fetchPoolMarketData(poolAddress).catch(() => null);
+        if (md?.price_change_5m != null && md.price_change_5m > 0) {
+          log("state", `[Trailing recheck] Price recovering (${md.price_change_5m.toFixed(2)}%) — cancelling trailing exit for ${positionAddress}`);
+          return;
+        }
+      }
+
       const result = await getMyPositions({ force: true, silent: true }).catch(() => null);
       const position = result?.positions?.find((p) => p.position === positionAddress);
       const resolved = resolvePendingTrailingDrop(
@@ -160,12 +200,18 @@ function scheduleTrailingDropConfirmation(positionAddress) {
   _trailingDropConfirmTimers.set(positionAddress, timer);
 }
 
-async function runBriefing() {
+export async function runBriefing() {
   log("cron", "Starting morning briefing");
   try {
     const briefing = await generateBriefing();
     if (telegramEnabled()) {
-      await sendHTML(briefing);
+      const sent = await sendHTML(briefing);
+      if (!sent) {
+        // sendHTML swallows transport/parse errors and returns null. Do NOT mark the
+        // briefing sent — leave the date unset so the 6h watchdog retries it.
+        log("cron_error", "Morning briefing send failed — leaving date unset for watchdog retry");
+        return;
+      }
     }
     setLastBriefingDate();
   } catch (error) {
@@ -198,6 +244,24 @@ function stopCronJobs() {
   _cronTasks = [];
 }
 
+// Effective screening cadence (ms) while the wallet has free capacity (positions < maxPositions).
+// Normally the fast screeningIntervalNoPositionMin; after screeningNoDeployBackoffCount consecutive
+// no-deploy cycles it backs off to the slower screeningIntervalMin until the next successful deploy.
+function isScreeningBackedOff() {
+  return _noDeployStreak >= (config.schedule.screeningNoDeployBackoffCount ?? 2);
+}
+function effectiveScreeningIntervalMs() {
+  const mins = isScreeningBackedOff()
+    ? config.schedule.screeningIntervalMin
+    : config.schedule.screeningIntervalNoPositionMin;
+  let ms = mins * 60 * 1000;
+  // Caution regime: slow the cadence to reduce exposure frequency on soft-market days.
+  if (_lastRegime === "caution" && config.marketRegime?.enabled) {
+    ms *= (config.marketRegime.cautionScreeningMult ?? 2);
+  }
+  return ms;
+}
+
 export async function runManagementCycle({ silent = false } = {}) {
   if (_managementBusy) return null;
   _managementBusy = true;
@@ -206,22 +270,36 @@ export async function runManagementCycle({ silent = false } = {}) {
   let mgmtReport = null;
   let positions = [];
   let liveMessage = null;
-  const screeningCooldownMs = 5 * 60 * 1000;
+  let mgmtFailed = false;
+  let stillOpen = null; // Set of position addresses open after this cycle's actions
   const emergencyExits = [];
 
   try {
-    if (!silent && telegramEnabled()) {
-      liveMessage = await createLiveMessage("🔄 Management Cycle", "Evaluating positions...");
-    }
+    // No Telegram message up front: idle cycles (all STAY) stay silent. The live message is
+    // created only once there is something to act on (see below), or a failure is reported.
     const livePositions = await getMyPositions({ force: true }).catch(() => null);
     positions = livePositions?.positions || [];
 
     if (positions.length === 0) {
-      log("cron", "No open positions — triggering screening cycle");
-      mgmtReport = "No open positions. Triggering screening cycle.";
-      runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
+      const noPosCooldownMs = effectiveScreeningIntervalMs();
+      const msSinceLastScreen = Date.now() - _screeningLastTriggered;
+      if (msSinceLastScreen >= noPosCooldownMs) {
+        const tag = isScreeningBackedOff() ? " (no-deploy backoff)" : "";
+        log("cron", `No open positions — triggering screening cycle${tag}`);
+        mgmtReport = "No open positions. Triggering screening cycle.";
+        runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
+      } else {
+        const waitMin = Math.ceil((noPosCooldownMs - msSinceLastScreen) / 60_000);
+        log("cron", `No open positions — screening cooldown active (~${waitMin}m remaining)`);
+        mgmtReport = `No open positions. Next screening in ~${waitMin}m.`;
+      }
       return mgmtReport;
     }
+
+    // SOL price for SOL-denominated thresholds (Rule 6 fee-growth grace). Best-effort: a null
+    // price simply makes the fee-accrual signal fall back to "any positive accrual counts".
+    const solPriceUsd = (await getWalletBalances().catch(() => null))?.sol_price ?? null;
+    if (solPriceUsd != null) _cachedSolPrice = solPriceUsd;
 
     // Snapshot + load pool memory
     const positionData = positions.map((p) => {
@@ -249,6 +327,45 @@ export async function runManagementCycle({ silent = false } = {}) {
     }
     if (marketUpdates.size > 0) batchUpdateMarketData(marketUpdates);
 
+    // Refresh live volatility from Meteora once per management cycle per unique pool.
+    // Rules 3/7/8/9 use tracked.volatility (set at deploy) to scale their thresholds.
+    // A token whose volatility has changed since deploy (quieted down or spiked) causes
+    // those thresholds to mis-fire for the rest of the position's life. We fetch the
+    // current pool volatility and store it as live_volatility in state; each Rule then
+    // reads live_volatility ?? volatility so the override is graceful and backward-compatible.
+    // Fetches run in parallel and fail-safe (null → falls back to deploy-time value).
+    void (async () => {
+      try {
+        const volResults = await Promise.all(
+          uniquePools.map(async (pool) => [pool, await fetchPoolVolatility(pool)])
+        );
+        const volUpdates = new Map(volResults.filter(([, v]) => v != null));
+        if (volUpdates.size > 0) batchUpdateLiveVolatility(volUpdates);
+      } catch (e) {
+        log("cron_warn", `Live volatility refresh failed: ${e.message}`);
+      }
+    })();
+
+    // Record volume snapshots and update Rule 9 entry-grace zone tracking per position
+    for (const p of positionData) {
+      const md = p._marketData;
+      if (md && md.volume_5m != null) {
+        addVolumeSnapshot(p.pool, { vol_5m: md.volume_5m, buys_5m: md.txn_buys_5m ?? 0, sells_5m: md.txn_sells_5m ?? 0 });
+      }
+      // Track how deep price has fallen into the range. Rule 9 is suppressed while in
+      // the SOL-rich zone; breach must persist for entryGraceConfirmMinutes before firing.
+      const rangeTotal = (p.upper_bin ?? 0) - (p.lower_bin ?? 0);
+      if (rangeTotal > 0 && p.active_bin != null && p.upper_bin != null) {
+        const depthPct = ((p.upper_bin - p.active_bin) / rangeTotal) * 100;
+        const r9tracked = getTrackedPosition(p.position);
+        const pStrat = (r9tracked?.strategy ?? config.strategy.strategy ?? "curve").toLowerCase();
+        const graceDepth = pStrat === "bid_ask"
+          ? (config.management.bidAskEntryGraceDepthPct ?? 80)
+          : (config.management.curveEntryGraceDepthPct ?? 50);
+        updateR9GraceZone(p.position, depthPct, graceDepth);
+      }
+    }
+
     // JS trailing TP check
     const exitMap = new Map();
     for (const p of positionData) {
@@ -259,17 +376,79 @@ export async function runManagementCycle({ silent = false } = {}) {
       ) {
         schedulePeakConfirmation(p.position);
       }
-      const exit = updatePnlAndCheckExits(p.position, p, config.management);
+      const exit = updatePnlAndCheckExits(p.position, p, config.management, config.marketRegime?._activeRegime ?? "healthy");
       if (exit) {
         if (exit.action === "TRAILING_TP" && exit.needs_confirmation && shouldUsePnlRecheck()) {
-          if (queueTrailingDropConfirmation(p.position, exit.peak_pnl_pct, exit.current_pnl_pct, config.management.trailingDropPct)) {
+          if (queueTrailingDropConfirmation(p.position, exit.peak_pnl_pct, exit.current_pnl_pct, exit.effective_drop_pct ?? config.management.trailingDropPct, exit.in_range_exit)) {
             scheduleTrailingDropConfirmation(p.position);
           }
           continue;
         }
-        exitMap.set(p.position, exit.reason);
+        exitMap.set(p.position, exit);
         log("state", `Exit alert for ${p.pair}: ${exit.reason}`);
       }
+    }
+
+    // ── TA exit modulator: RSI overbought → tighten trailing or force TP_PROPOSAL ──
+    // Runs only when taExitEnabled, position is profitable, and price is near/above range.
+    // Fail-safe: API errors are caught per-position; no TA → no change.
+    if (config.indicators.taExitEnabled) {
+      const taExitMinPnl    = config.indicators.taExitMinPnlPct      ?? 2;
+      const taExitRsiLen    = config.indicators.taExitRsiLength       ?? 14;
+      const taExitNearPct   = config.indicators.taExitNearAbovePct    ?? 80;
+      const taModulatorDrop = config.indicators.taExitModulatorDropPct ?? 0.5;
+      const taPreset        = config.indicators.exitPreset             ?? "rsi_reversal";
+      const taIntervals     = config.indicators.intervals;
+
+      const taChecks = positionData
+        .filter((p) => {
+          if (exitMap.has(p.position)) return false; // already flagged
+          const pnl = p.pnl_pct ?? 0;
+          if (pnl < taExitMinPnl) return false;
+          const oorDir = getOorDirection(p);
+          if (oorDir === "ABOVE") return true; // OOR above: always eligible
+          const rangeTotal = (p.upper_bin ?? 0) - (p.lower_bin ?? 0);
+          if (rangeTotal <= 0 || p.active_bin == null) return false;
+          const depthPct = ((p.upper_bin - p.active_bin) / rangeTotal) * 100;
+          return depthPct >= taExitNearPct; // depth% near top → near-above
+        })
+        .map(async (p) => {
+          if (!p.base_mint) return;
+          try {
+            const taResult = await confirmIndicatorPreset({
+              mint: p.base_mint,
+              side: "exit",
+              preset: taPreset,
+              intervals: taIntervals,
+              rsiLength: taExitRsiLen,
+              skipEnabledCheck: true, // TA exit is independent of entry indicator toggle
+            });
+            if (!taResult?.confirmed || taResult.skipped) return;
+            const tracked = getTrackedPosition(p.position);
+            const peak = tracked?.peak_pnl_pct ?? (p.pnl_pct ?? 0);
+            const pnl  = p.pnl_pct ?? 0;
+            const effTrigger = tracked?.trailing_trigger_override ?? config.management.trailingTriggerPct;
+            // Modulator fires when trailing is active AND tightened drop threshold is crossed
+            const modulatorFires = peak >= effTrigger && (peak - pnl) >= taModulatorDrop;
+            const reason = modulatorFires
+              ? `RSI overbought + tightened trailing drop ${taModulatorDrop}% (peak ${peak.toFixed(1)}% → ${pnl.toFixed(1)}%)`
+              : `RSI overbought exit signal — TA-triggered (peak ${peak.toFixed(1)}%, current ${pnl.toFixed(1)}%)`;
+            exitMap.set(p.position, {
+              action: "TRAILING_TP",
+              reason,
+              peak_pnl_pct: peak,
+              current_pnl_pct: pnl,
+              needs_confirmation: false,
+              ta_triggered: true,
+            });
+            markTaExitTriggered(p.position);
+            log("indicators", `TA exit: ${p.pair} — ${taResult.reason} → ${reason}`);
+          } catch (e) {
+            log("indicators_warn", `TA exit check failed for ${p.pair}: ${e.message}`);
+          }
+        });
+
+      await Promise.all(taChecks);
     }
 
     // ── Deterministic rule checks (no LLM) ──────────────────────────
@@ -278,7 +457,49 @@ export async function runManagementCycle({ silent = false } = {}) {
     for (const p of positionData) {
       // Hard exit — highest priority
       if (exitMap.has(p.position)) {
-        actionMap.set(p.position, { action: "CLOSE", rule: "exit", reason: exitMap.get(p.position) });
+        const exit = exitMap.get(p.position);
+        const mgmt = config.management;
+        // Layer A: only TRAILING_TP is vetoable. STOP_LOSS / BREAK_EVEN are non-negotiable
+        // (force-close always exits in profit for trailing; break-even/SL guard against loss).
+        if (exit.action === "TRAILING_TP" && mgmt.allowTpVeto) {
+          const tr = getTrackedPosition(p.position);
+          const peak = exit.peak_pnl_pct ?? tr?.peak_pnl_pct ?? 0;
+          const current = exit.current_pnl_pct ?? p.pnl_pct ?? 0;
+          const dropFromPeak = peak - current;
+          const floorDrop = peak / (mgmt.tpVetoFloorDivisor ?? 2);
+          // Refund the veto budget if a new peak was reached since the last hold (it paid off).
+          let vetoCount = tr?.tp_veto_count ?? 0;
+          if (tr?.tp_veto_peak != null && peak > tr.tp_veto_peak + 0.01) {
+            resetTpVeto(p.position);
+            vetoCount = 0;
+          }
+          const budgetLeft = vetoCount < (mgmt.maxTpVetos ?? 3);
+          const aboveFloor = dropFromPeak < floorDrop;
+          if (budgetLeft && aboveFloor) {
+            // Partial scale-out is offered alongside hold/close once the position has
+            // a meaningful peak AND the leftover runner would still be a real position
+            // (not dust). Emergency rules never reach here — they full-close by construction.
+            const pe = mgmt.partialExit ?? {};
+            const remainderAfterDefault = (p.total_value_usd ?? 0) * (1 - (pe.defaultPct ?? 50) / 100);
+            const partialAvailable = !!pe.enabled
+              && peak >= (pe.minPeakPct ?? 4)
+              && remainderAfterDefault >= (pe.minRemainderUsd ?? 15);
+            actionMap.set(p.position, {
+              action: "TP_PROPOSAL", reason: exit.reason, peak, current, dropFromPeak, vetoCount,
+              ta_triggered: !!exit.ta_triggered,
+              partial_available: partialAvailable,
+              partial_default_pct: pe.defaultPct ?? 50,
+              partial_taken_count: tr?.partial_taken_count ?? 0,
+            });
+            continue;
+          }
+          const forcedWhy = !budgetLeft
+            ? `veto budget exhausted (${vetoCount}/${mgmt.maxTpVetos ?? 3})`
+            : `give-back ${dropFromPeak.toFixed(1)}% >= peak/${mgmt.tpVetoFloorDivisor ?? 2} (${floorDrop.toFixed(1)}%)`;
+          actionMap.set(p.position, { action: "CLOSE", rule: "exit", reason: `${exit.reason} [forced: ${forcedWhy}]` });
+          continue;
+        }
+        actionMap.set(p.position, { action: "CLOSE", rule: "exit", reason: exit.reason });
         continue;
       }
       // Instruction-set — pass to LLM, can't parse in JS
@@ -287,11 +508,13 @@ export async function runManagementCycle({ silent = false } = {}) {
         continue;
       }
 
-      const closeRule = getDeterministicCloseRule(p, config.management, p._marketData);
+      const streakWindowMin = config.emergencyExits.sellPressureStreak?.windowMin ?? 30;
+      const volumeWindow = getVolumeWindow(p.pool, streakWindowMin);
+      const closeRule = getDeterministicCloseRule(p, config.management, p._marketData, volumeWindow, solPriceUsd, config.marketRegime?._activeRegime ?? "healthy");
       if (closeRule) {
         actionMap.set(p.position, closeRule);
-        if (closeRule.rule === 7 || closeRule.rule === 8) {
-          log("market_data", `[mgmt_cycle] Emergency rule ${closeRule.rule} (${closeRule.reason}) triggered for ${p.pair} — price5m=${p._marketData?.price_change_5m ?? "?"}% vol5m=$${p._marketData?.volume_5m ?? "?"}`);
+        if (closeRule.rule === 7 || closeRule.rule === 8 || closeRule.rule === 11) {
+          log("market_data", `[mgmt_cycle] Emergency rule ${closeRule.rule} (${closeRule.reason}) triggered for ${p.pair} — price5m=${p._marketData?.price_change_5m ?? "?"}% vol5m=$${p._marketData?.volume_5m ?? "?"} liq=$${p._marketData?.liquidity_usd ?? "?"}`);
           const tracked = getTrackedPosition(p.position);
           appendDecision({
             type: "emergency_exit",
@@ -309,10 +532,13 @@ export async function runManagementCycle({ silent = false } = {}) {
               txn_buys_5m: p._marketData?.txn_buys_5m,
               txn_sells_5m: p._marketData?.txn_sells_5m,
               liquidity_usd: p._marketData?.liquidity_usd,
+              peak_liquidity_usd: tracked?.peak_liquidity_usd,
               pnl_pct: p.pnl_pct,
               age_minutes: p.age_minutes,
               thresholds: closeRule.rule === 7
                 ? { dropThresholdPct: config.emergencyExits.volumeCollapse.dropThresholdPct, sellPressureRatio: config.emergencyExits.volumeCollapse.sellPressureRatio, minPeakVolumeUsd: config.emergencyExits.volumeCollapse.minPeakVolumeUsd }
+                : closeRule.rule === 11
+                ? { dropThresholdPct: config.emergencyExits.liquidityCollapse.dropThresholdPct, minPeakLiquidityUsd: config.emergencyExits.liquidityCollapse.minPeakLiquidityUsd }
                 : { dropPct5m: config.emergencyExits.rapidPriceDrop.dropPct5m, requireNegativePnl: config.emergencyExits.rapidPriceDrop.requireNegativePnl },
             },
           });
@@ -324,7 +550,30 @@ export async function runManagementCycle({ silent = false } = {}) {
             priceChange5m: p._marketData?.price_change_5m,
             txnBuys5m: p._marketData?.txn_buys_5m,
             txnSells5m: p._marketData?.txn_sells_5m,
+            liquidityUsd: p._marketData?.liquidity_usd,
+            peakLiquidityUsd: tracked?.peak_liquidity_usd,
             pnlPct: p.pnl_pct,
+          });
+        } else if (closeRule.rule === 9) {
+          log("market_data", `[mgmt_cycle] Rule 9 (${closeRule.reason}) triggered for ${p.pair} — pnl=${p.pnl_pct ?? "?"}% sells=${p._marketData?.txn_sells_5m ?? "?"} buys=${p._marketData?.txn_buys_5m ?? "?"}`);
+          appendDecision({
+            type: "tactical_exit",
+            actor: "MANAGER",
+            pool: p.pool,
+            pool_name: p.pair,
+            position: p.position,
+            summary: `Tactical exit Rule 9: ${closeRule.reason}`,
+            reason: closeRule.reason,
+            metrics: {
+              rule: 9,
+              txn_buys_5m: p._marketData?.txn_buys_5m,
+              txn_sells_5m: p._marketData?.txn_sells_5m,
+              volume_5m: p._marketData?.volume_5m,
+              price_change_5m: p._marketData?.price_change_5m,
+              pnl_pct: p.pnl_pct,
+              age_minutes: p.age_minutes,
+              streak_window_snapshots: volumeWindow.length,
+            },
           });
         }
         continue;
@@ -337,18 +586,49 @@ export async function runManagementCycle({ silent = false } = {}) {
       actionMap.set(p.position, { action: "STAY" });
     }
 
+    // Rule 10: regime trim-to-cap — existing positions get trimmed toward cautionMaxPositions
+    // during caution/bearish too, not just new deploys blocked. Rate-limited to 1 position per
+    // cycle (weakest PnL among still-STAY positions) to avoid dumping several at once.
+    // Only on a confirmed regime (2 consecutive non-healthy assessments) — see isRegimeConfirmed.
+    {
+      const activeRegime = config.marketRegime?._activeRegime ?? "healthy";
+      if (config.marketRegime?.enabled && activeRegime !== "healthy" && config.marketRegime._regimeConfirmed) {
+        const cap = config.marketRegime.cautionMaxPositions ?? 3;
+        const stillOpen = positionData.filter((p) => actionMap.get(p.position)?.action === "STAY");
+        const closingCount = positionData.length - stillOpen.length;
+        const projectedOpenCount = positionData.length - closingCount;
+        if (projectedOpenCount > cap && stillOpen.length > 0) {
+          const weakest = stillOpen.reduce((min, p) => (p.pnl_pct ?? 0) < (min.pnl_pct ?? 0) ? p : min);
+          actionMap.set(weakest.position, {
+            action: "CLOSE",
+            rule: 10,
+            reason: `regime trim-to-cap (${activeRegime}, ${projectedOpenCount}>${cap}, weakest PnL ${weakest.pnl_pct ?? "?"}%)`,
+          });
+          log("market_regime", `Rule 10 trim-to-cap: closing ${weakest.pair} (PnL ${weakest.pnl_pct ?? "?"}%) — ${projectedOpenCount} open > cap ${cap} during ${activeRegime}`);
+        }
+      }
+    }
+
     // ── Build JS report ──────────────────────────────────────────────
     const totalValue = positionData.reduce((s, p) => s + (p.total_value_usd ?? 0), 0);
     const totalUnclaimed = positionData.reduce((s, p) => s + (p.unclaimed_fees_usd ?? 0), 0);
 
     const reportLines = positionData.map((p) => {
       const act = actionMap.get(p.position);
-      const inRange = p.in_range ? "🟢 IN" : `🔴 OOR ${p.minutes_out_of_range ?? 0}m`;
+      const oorDir = !p.in_range ? getOorDirection(p) : null;
+      const inRange = p.in_range ? "🟢 IN" : `🔴 OOR${oorDir ? ` ${oorDir}` : ""} ${p.minutes_out_of_range ?? 0}m`;
       const val = config.management.solMode ? `◎${p.total_value_usd ?? "?"}` : `$${p.total_value_usd ?? "?"}`;
       const unclaimed = config.management.solMode ? `◎${p.unclaimed_fees_usd ?? "?"}` : `$${p.unclaimed_fees_usd ?? "?"}`;
-      const statusLabel = act.action === "INSTRUCTION" ? "HOLD (instruction)" : act.action;
-      let line = `**${p.pair}** | Age: ${p.age_minutes ?? "?"}m | Val: ${val} | Unclaimed: ${unclaimed} | PnL: ${p.pnl_pct ?? "?"}% | Yield: ${p.fee_per_tvl_24h ?? "?"}% | ${inRange} | ${statusLabel}`;
+      const statusLabel = act.action === "INSTRUCTION" ? "HOLD (instruction)"
+        : act.action === "TP_PROPOSAL" ? "TP? (LLM decides)"
+        : act.action;
+      const trackedP = getTrackedPosition(p.position);
+      const strat = (trackedP?.strategy ?? config.strategy.strategy ?? "?").toString();
+      let line = `**${p.pair}** | ${strat} | Age: ${p.age_minutes ?? "?"}m | Val: ${val} | Unclaimed: ${unclaimed} | PnL: ${p.pnl_pct ?? "?"}% | Yield: ${p.fee_per_tvl_24h ?? "?"}% | ${inRange} | ${statusLabel}`;
+      const rangeBar = renderRangeBar(p.lower_bin, p.upper_bin, p.active_bin);
+      if (rangeBar) line += `\n${rangeBar}`;
       if (p.instruction) line += `\nNote: "${p.instruction}"`;
+      if (act.action === "TP_PROPOSAL") line += `\n🎯 Trailing TP triggered: peak ${act.peak.toFixed(1)}% → ${act.current.toFixed(1)}% (gave back ${act.dropFromPeak.toFixed(1)}%, veto ${act.vetoCount}/${config.management.maxTpVetos ?? 3}) — LLM hold/close`;
       if (act.action === "CLOSE" && act.rule === "exit") line += `\n⚡ Trailing TP: ${act.reason}`;
       if (act.action === "CLOSE" && act.rule && act.rule !== "exit") line += `\nRule ${act.rule}: ${act.reason}`;
       if (act.action === "CLAIM") line += `\n→ Claiming fees`;
@@ -364,10 +644,47 @@ export async function runManagementCycle({ silent = false } = {}) {
     mgmtReport = reportLines.join("\n\n") +
       `\n\nSummary: 💼 ${positions.length} positions | ${cur}${totalValue.toFixed(4)} | fees: ${cur}${totalUnclaimed.toFixed(4)} | ${actionSummary}`;
 
-    // ── Call LLM only if action needed ──────────────────────────────
+    if (needsAction.length > 0 && !silent && telegramEnabled()) {
+      liveMessage = await createLiveMessage("🔄 Management Cycle", "Executing actions...");
+      if (liveMessage) setCloseNotifyMuted(true); // this report lists the closes; avoid a second "Closed" message
+    }
+
+    // ── Execute deterministic closes directly (no LLM round-trip) ────
+    // Routing CLOSE through the LLM agent loop (up to 5m timeout + fallback retry, then a
+    // 10m poll cooldown on failure) let break-even decisions slide to stop-loss: live data
+    // showed positions flagged for close up to 11 times still ending at -10%+.
+    const directCloseLines = [];
+    for (const p of positionData) {
+      const act = actionMap.get(p.position);
+      if (act?.action !== "CLOSE") continue;
+      const reason = act.rule === "exit" ? act.reason : `Rule ${act.rule}: ${act.reason}`;
+      try {
+        const res = await executeTool("close_position", { position_address: p.position, reason });
+        if (!res || res.error || res.blocked || res.success === false) {
+          throw new Error(res?.error || res?.reason || "close failed");
+        }
+        directCloseLines.push(`${p.pair}: closed — ${reason}`);
+      } catch (e) {
+        // Let the 30s poll retry this position right away instead of waiting out its cooldown.
+        _pollTriggeredAt.delete(p.position);
+        log("cron_error", `Direct close failed for ${p.pair}: ${e.message}`);
+        directCloseLines.push(`${p.pair}: close FAILED (${e.message}) — will retry`);
+      }
+    }
+    // CLAIM is mechanical too (unclaimed >= minClaimAmount). Via the LLM it cost ~59 calls/day.
+    for (const p of positionData) {
+      if (actionMap.get(p.position)?.action !== "CLAIM") continue;
+      const res = await executeTool("claim_fees", { position_address: p.position });
+      const failed = !res || res.error || res.blocked || res.success === false;
+      if (failed) log("cron_error", `Direct claim failed for ${p.pair}: ${res?.error || res?.reason || "claim failed"}`);
+      directCloseLines.push(`${p.pair}: ${failed ? `claim FAILED (${res?.error || res?.reason || "claim failed"})` : "fees claimed"}`);
+    }
+    if (directCloseLines.length > 0) mgmtReport += `\n\n${directCloseLines.join("\n")}`;
+
+    // ── Call LLM only for judgment calls (TP_PROPOSAL / INSTRUCTION) ──
     const actionPositions = positionData.filter(p => {
       const a = actionMap.get(p.position);
-      return a.action !== "STAY";
+      return a.action !== "STAY" && a.action !== "CLOSE" && a.action !== "CLAIM";
     });
 
     if (actionPositions.length > 0) {
@@ -375,10 +692,45 @@ export async function runManagementCycle({ silent = false } = {}) {
 
       const actionBlocks = actionPositions.map((p) => {
         const act = actionMap.get(p.position);
+        if (act.action === "TP_PROPOSAL") {
+          const taNote = act.ta_triggered
+            ? `\n  ta_signal: RSI overbought detected — momentum may be fading; bias strongly toward closing`
+            : "";
+          // Partial scale-out option: present only when available (peak high enough,
+          // runner would not be dust). Bias depends on signal strength.
+          const md = p._marketData;
+          let decisionLine;
+          if (act.partial_available) {
+            const runnerNote = (act.partial_taken_count ?? 0) > 0
+              ? ` (already scaled out ${act.partial_taken_count}× before)`
+              : "";
+            const biasNote = act.ta_triggered
+              ? `RSI overbought + give-back suggests the move is done — prefer a FULL close, or a LARGE partial (>=${act.partial_default_pct}%) if you still see a runner.`
+              : `Signal is mixed — a partial scale-out (~${act.partial_default_pct}%) is often the best play: lock gains, keep a protected runner. Full close if momentum looks clearly done; hold (do nothing) only if continuation is clear.`;
+            decisionLine =
+              `  DECISION (choose ONE):\n` +
+              `    • partial_close_position(pct=${act.partial_default_pct}) — scale out part now, runner kept with tightened trailing stop${runnerNote}\n` +
+              `    • close_position — exit fully\n` +
+              `    • do nothing — hold (burns 1 of ${config.management.maxTpVetos ?? 3} holds, force-closes eventually)\n` +
+              `  GUIDANCE: ${biasNote}`;
+          } else {
+            decisionLine =
+              `  DECISION: take profit now (close_position) OR hold (do nothing) only if there is clear continued upward momentum. Bias toward taking profit — a confirmed give-back usually means the move is done.` + taNote;
+          }
+          return [
+            `POSITION: ${p.pair} (${p.position})`,
+            `  pool: ${p.pool}`,
+            `  action: TP_PROPOSAL — trailing take-profit triggered: ${act.reason}`,
+            `  peak_pnl: ${act.peak.toFixed(2)}% | current_pnl: ${act.current.toFixed(2)}% | given_back: ${act.dropFromPeak.toFixed(2)}% | holds_used: ${act.vetoCount}/${config.management.maxTpVetos ?? 3}`,
+            `  unclaimed_fees: ${cur}${p.unclaimed_fees_usd} | value: ${cur}${p.total_value_usd} | fee_per_tvl_24h: ${p.fee_per_tvl_24h ?? "?"}%`,
+            `  context: in_range=${p.in_range} | bins lower=${p.lower_bin} upper=${p.upper_bin} active=${p.active_bin} | oor_minutes=${p.minutes_out_of_range ?? 0} | price_5m=${md?.price_change_5m ?? "?"}% | price_1h=${md?.price_change_1h ?? "?"}% | vol_5m=$${md?.volume_5m ?? "?"}`,
+            decisionLine,
+          ].join("\n");
+        }
         return [
           `POSITION: ${p.pair} (${p.position})`,
           `  pool: ${p.pool}`,
-          `  action: ${act.action}${act.rule && act.rule !== "exit" ? ` — Rule ${act.rule}: ${act.reason}` : ""}${act.rule === "exit" ? ` — ⚡ Trailing TP: ${act.reason}` : ""}`,
+          `  action: ${act.action}${act.rule && act.rule !== "exit" ? ` — Rule ${act.rule}: ${act.reason}` : ""}${act.rule === "exit" ? ` — ⚡ exit: ${act.reason}` : ""}`,
           `  pnl_pct: ${p.pnl_pct}% | unclaimed_fees: ${cur}${p.unclaimed_fees_usd} | value: ${cur}${p.total_value_usd} | fee_per_tvl_24h: ${p.fee_per_tvl_24h ?? "?"}%`,
           `  bins: lower=${p.lower_bin} upper=${p.upper_bin} active=${p.active_bin} | oor_minutes: ${p.minutes_out_of_range ?? 0}`,
           p.instruction ? `  instruction: "${p.instruction}"` : null,
@@ -392,11 +744,11 @@ ${actionBlocks}
 
 RULES:
 - CLOSE: call close_position only — it handles fee claiming internally, do NOT call claim_fees first
-- CLAIM: call claim_fees with position address
 - INSTRUCTION: evaluate the instruction condition. If met → close_position. If not → HOLD, do nothing.
+- TP_PROPOSAL: this is a JUDGMENT call, the only one where you decide. Follow the per-position DECISION/GUIDANCE lines. If a partial_close_position option is offered, it is a valid middle path — scale out part and keep a protected runner. To hold, simply do nothing for that position. Holds are budget-limited and force-close eventually.
 - ⚡ exit alerts: close immediately, no exceptions
 
-Execute the required actions. Do NOT re-evaluate CLOSE/CLAIM — rules already applied. Just execute.
+Execute the required actions. Do NOT re-evaluate CLOSE — rules already applied. TP_PROPOSAL is the only decision to make. Just execute.
 After executing, write a brief one-line result per position.
       `, config.llm.maxSteps, [], "MANAGER", config.llm.managementModel, 2048, {
         onToolStart: async ({ name }) => { await liveMessage?.toolStart(name); },
@@ -405,34 +757,59 @@ After executing, write a brief one-line result per position.
 
       mgmtReport += `\n\n${content}`;
     } else {
-      log("cron", "Management: all positions STAY — skipping LLM");
-      await liveMessage?.note("No tool actions needed.");
+      log("cron", "Management: no judgment calls needed — skipping LLM");
+      await liveMessage?.note("No LLM judgment needed.");
     }
 
     // Trigger screening after management
     const afterPositions = await getMyPositions({ force: true }).catch(() => null);
     const afterCount = afterPositions?.positions?.length ?? 0;
-    if (afterCount < config.risk.maxPositions && Date.now() - _screeningLastTriggered > screeningCooldownMs) {
-      log("cron", `Post-management: ${afterCount}/${config.risk.maxPositions} positions — triggering screening`);
+    if (afterPositions?.positions) stillOpen = new Set(afterPositions.positions.map((p) => p.position));
+
+    // Layer A: reconcile trailing-TP proposals — any still-open proposal means the LLM
+    // chose to HOLD, so spend a veto. Closed ones were taken (no veto, position is gone).
+    // Exception: if a partial scale-out was taken this cycle the position stays open by
+    // design — that is an exit decision, not a hold, and markPartialExit already reset the
+    // veto budget. Detect it via a fresh partial_taken_at timestamp and skip the veto.
+    const tpProposals = [...actionMap.entries()].filter(([, a]) => a.action === "TP_PROPOSAL");
+    if (tpProposals.length > 0 && stillOpen) {
+      const cycleStartMs = Date.now() - 5 * 60 * 1000; // partial counts as "this cycle" if within 5m
+      for (const [addr, act] of tpProposals) {
+        if (!stillOpen.has(addr)) continue;
+        const tr = getTrackedPosition(addr);
+        const partialThisCycle = tr?.partial_taken_at && new Date(tr.partial_taken_at).getTime() >= cycleStartMs;
+        if (partialThisCycle) {
+          log("state", `Trailing TP partial scale-out for ${addr.slice(0, 8)} — no veto spent (runner kept, budget reset)`);
+          continue;
+        }
+        const n = recordTpVeto(addr, act.peak);
+        log("state", `Trailing TP held by LLM for ${addr.slice(0, 8)} — veto ${n}/${config.management.maxTpVetos ?? 3} (peak ${act.peak.toFixed(1)}%)`);
+      }
+    }
+    if (afterCount < config.risk.maxPositions && Date.now() - _screeningLastTriggered > effectiveScreeningIntervalMs()) {
+      const tag = isScreeningBackedOff() ? " (no-deploy backoff)" : "";
+      log("cron", `Post-management: ${afterCount}/${config.risk.maxPositions} positions — triggering screening${tag}`);
       runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
     }
   } catch (error) {
     log("cron_error", `Management cycle failed: ${error.message}`);
     mgmtReport = `Management cycle failed: ${error.message}`;
+    mgmtFailed = true;
   } finally {
     _managementBusy = false;
+    if (liveMessage) setCloseNotifyMuted(false);
+    pruneGraceLogged(positions);
     if (!silent && telegramEnabled()) {
-      if (mgmtReport) {
+      // Report only cycles where something happened (actions ran or the cycle failed).
+      if (mgmtReport && (liveMessage || mgmtFailed)) {
         if (liveMessage) await liveMessage.finalize(stripThink(mgmtReport)).catch(() => { });
         else sendMessage(`🔄 Management Cycle\n\n${stripThink(mgmtReport)}`).catch(() => { });
       }
       for (const exit of emergencyExits) {
         notifyEmergencyExit(exit).catch(() => { });
       }
-      for (const p of positions) {
-        if (!p.in_range && p.minutes_out_of_range >= config.management.outOfRangeWaitMinutes) {
-          notifyOutOfRange({ pair: p.pair, minutesOOR: p.minutes_out_of_range }).catch(() => { });
-        }
+      for (const p of collectOorAlerts(positions, stillOpen, config.management.outOfRangeWaitMinutes, _oorNotified)) {
+        notifyOutOfRange({ pair: p.pair, minutesOOR: p.minutes_out_of_range, direction: getOorDirection(p) }).catch(() => { });
       }
     }
     drainTelegramQueue().catch(() => { });
@@ -440,7 +817,51 @@ After executing, write a brief one-line result per position.
   return mgmtReport;
 }
 
+// Entry-grace skip logs used to be written on every poll for every rule and position
+// (~20–35k lines/day; logs/ grew to 600 MB). Now a line is written only when a position
+// enters or leaves a rule's entry grace. Keys of closed positions are pruned each cycle.
+const _graceLogged = new Set(); // `${rule}:${position}` currently logged as in-grace
+function graceDetail(binsKnown, depthPct, graceDepth, strategy) {
+  return `${binsKnown ? `depth=${depthPct.toFixed(1)}% vs grace ${graceDepth}%` : "bin data unavailable (fail-safe)"}, strategy=${strategy}`;
+}
+function logGraceTransition(rule, position, inGrace, detail) {
+  const key = `${rule}:${position.position}`;
+  if (inGrace && !_graceLogged.has(key)) {
+    _graceLogged.add(key);
+    log("market_data", `Rule ${rule} skipped for ${position.pair}: entry grace active (${detail})`);
+  } else if (!inGrace && _graceLogged.delete(key)) {
+    log("market_data", `Rule ${rule} entry grace ended for ${position.pair} (${detail})`);
+  }
+}
+function pruneGraceLogged(openPositions) {
+  const open = new Set(openPositions.map((p) => p.position));
+  for (const key of _graceLogged) if (!open.has(key.slice(key.indexOf(":") + 1))) _graceLogged.delete(key);
+}
+
+// OOR alerts fire once per out-of-range episode (they used to repeat every management cycle,
+// including for positions closed in that same cycle). `notified` is mutated: a position is
+// re-armed when it comes back in range or is closed. openSet=null (fetch failed) → assume open.
+function collectOorAlerts(positions, openSet, waitMin, notified) {
+  const alerts = [];
+  const seen = new Set();
+  for (const p of positions) {
+    seen.add(p.position);
+    const open = !openSet || openSet.has(p.position);
+    if (!open || p.in_range) { notified.delete(p.position); continue; }
+    if (p.minutes_out_of_range >= waitMin && !notified.has(p.position)) {
+      notified.add(p.position);
+      alerts.push(p);
+    }
+  }
+  for (const addr of notified) if (!seen.has(addr)) notified.delete(addr);
+  return alerts;
+}
+
 export async function runScreeningCycle({ silent = false } = {}) {
+  if (_entriesPaused) {
+    log("cron", "Screening skipped — deploys paused via /pause");
+    return null;
+  }
   if (_screeningBusy) {
     log("cron", "Screening skipped — previous cycle still running");
     return null;
@@ -450,8 +871,9 @@ export async function runScreeningCycle({ silent = false } = {}) {
 
   // Hard guards — don't even run the agent if preconditions aren't met
   let prePositions, preBalance;
-  let liveMessage = null;
   let screenReport = null;
+  let screenFailed = false;
+  let deployAttempted = false; // function scope: the finally block reports only cycles that tried to deploy
   try {
     [prePositions, preBalance] = await Promise.all([getMyPositions({ force: true }), getWalletBalances()]);
     if (prePositions.total_positions >= config.risk.maxPositions) {
@@ -489,41 +911,116 @@ export async function runScreeningCycle({ silent = false } = {}) {
     _screeningBusy = false;
     return screenReport;
   }
-  if (!silent && telegramEnabled()) {
-    liveMessage = await createLiveMessage("🔍 Screening Cycle", "Scanning candidates...");
-  }
+  // No live Telegram message: a screening cycle that ends in NO DEPLOY is silent (it used to post
+  // every cycle). Deploys still notify via notifyDeploy; the report follows only if a deploy was tried.
   timers.screeningLastRun = Date.now();
   log("cron", `Starting screening cycle [model: ${config.llm.screeningModel}]`);
   try {
-    // Reuse pre-fetched balance — no extra RPC call needed
+    // Reuse pre-fetched balance — no extra RPC call needed.
+    // NOTE: deployAmount is computed AFTER the market-regime block below, so equity fair-share
+    // sizing can read this cycle's regime (config.marketRegime._activeRegime).
     const currentBalance = preBalance;
-    const deployAmount = computeDeployAmount(currentBalance.sol);
-    log("cron", `Computed deploy amount: ${deployAmount} SOL (wallet: ${currentBalance.sol} SOL)`);
 
-    // Load active strategy
-    const activeStrategy = getActiveStrategy();
-    const strategyBlock = activeStrategy
-      ? `ACTIVE STRATEGY: ${activeStrategy.name} — LP: ${activeStrategy.lp_strategy} | bins_above: ${activeStrategy.range?.bins_above ?? 0} (FIXED — never change) | deposit: ${activeStrategy.entry?.single_side === "sol" ? "SOL only (amount_y, amount_x=0)" : "dual-sided"} | best for: ${activeStrategy.best_for}`
-      : `No active strategy — use default bid_ask, bins_above: 0, SOL only.`;
+    // Not the strategy-library entry: its "spot"/dual-sided/fixed-bins text contradicted the
+    // executor (spot rejected, SOL-only) and caused ~28 blocked deploy_position calls a day.
+    const strategyBlock = `Deposit: SOL only (amount_y, amount_x=0). Strategy and bins: follow DEPLOY RULES in the system prompt.`;
 
     // Fetch top candidates, then recon each sequentially with a small delay to avoid 429s
     const topCandidates = await getTopCandidates({ limit: 10 }).catch(() => null);
     const candidates = (topCandidates?.candidates || topCandidates?.pools || []).slice(0, 10);
     const earlyFilteredExamples = topCandidates?.filtered_examples || [];
 
+    // Market regime check — uses 50 unfiltered trending pools (5m + 1h) + DexScreener flow
+    // Skip screening if market is broadly bearish to avoid deploying into hostile conditions
+    if (config.marketRegime?.enabled) {
+      const regime = await assessMarketRegime(candidates, currentBalance?.sol_price ?? null);
+      config.marketRegime._regimeConfirmed = isRegimeConfirmed(_lastRegime, regime.regime); // gates Rule 10 trim-to-cap
+      _lastRegime = regime.regime; // drives caution screening slowdown on the next cycle
+      config.marketRegime._activeRegime = regime.regime; // shared with computeDeployAmount (fair-share size modulation)
+      if (regime.regime === "bearish" && config.marketRegime.skipOnBearish) {
+        const s = regime.signals;
+        const msg =
+          `⏸️ <b>Screening paused — market bearish</b>\n` +
+          `Score: ${regime.score}/5.5\n` +
+          `Breadth: 5m ${s.breadth5m ?? "?"}% | 1h ${s.breadth1h ?? "?"}% (${s.poolsSampled5m ?? 0} pools)\n` +
+          `Volume trend: ${s.avgVolChangePct ?? "?"}% | Acceleration: ${s.avgAccel ?? "?"}x\n` +
+          `SOL momentum: 30m ${s.solChg30m ?? "?"}% | 60m ${s.solChg60m ?? "?"}%\n` +
+          `Signals: breadth=${s.breadthScore} vol=${s.volumeScore} flow=${s.flowScore} sol=${s.solMomentumScore}`;
+        log("market_regime", `Screening skipped — bearish regime (score=${regime.score})`);
+        appendDecision({ type: "skip", actor: "SCREENER", summary: "Market bearish — screening paused", reason: msg });
+        if (config.marketRegime.notifyOnSkip && telegramEnabled()) await sendHTML(msg).catch(() => {});
+        // Set screenReport so the finally block finalizes the live message — otherwise
+        // hasActiveLiveMessage() stays true and suppresses all later close/deploy notifications.
+        screenReport = "Screening skipped — market regime bearish.";
+        return screenReport;
+      }
+      if (regime.regime === "caution") {
+        // Deployment throttle: cap concurrent positions below maxPositions to limit
+        // correlated exposure on soft-market days (when tokens dump together in-range).
+        // Existing positions also get defended faster (regime-aware SL/trailing tightening
+        // in effectiveStopLossPct + updatePnlAndCheckExits, and Rule 10 trim-to-cap above) —
+        // we don't just stop new deploys anymore.
+        const cautionCap = config.marketRegime.cautionMaxPositions ?? 3;
+        if (prePositions.total_positions >= cautionCap) {
+          const msg =
+            `⏸️ <b>Screening throttled — caution regime</b>\n` +
+            `Score: ${regime.score}/5.5 — at caution capacity (${prePositions.total_positions}/${cautionCap})\n` +
+            `New deploys paused to limit correlated exposure. Existing positions unaffected.`;
+          log("market_regime", `Screening throttled — caution at capacity (${prePositions.total_positions}/${cautionCap}, score=${regime.score})`);
+          appendDecision({ type: "skip", actor: "SCREENER", summary: "Caution regime — at capacity", reason: msg });
+          if (config.marketRegime.notifyOnSkip && telegramEnabled()) await sendHTML(msg).catch(() => {});
+          // Set screenReport so the finally block finalizes the live message — otherwise
+          // hasActiveLiveMessage() stays true and suppresses all later close/deploy notifications.
+          screenReport = "Screening throttled — caution regime at capacity.";
+          return screenReport;
+        }
+        // Below caution cap: still allowed to deploy, but raise the fee/TVL floor for this cycle only.
+        // Saved so it can be restored in the finally block; without the restore, repeated caution
+        // cycles compound the multiplier (0.05 → 0.07 → 0.098 → ...) until no pool passes.
+        // Only fee/TVL is raised. Raising organic, mcap and token age here never reached the candidates
+        // (they are fetched before this block) and the 60-day data does not support them: the positions
+        // that bar would have removed made +1.10% (n=25), and caution deploys did better than healthy ones.
+        _cautionOrigFeeRatio = config.screening.minFeeActiveTvlRatio;
+        config.screening.minFeeActiveTvlRatio = +(_cautionOrigFeeRatio * 1.4).toFixed(4);
+        log("market_regime", `Caution regime — fee/TVL floor raised for this cycle (minFeeActiveTvlRatio=${config.screening.minFeeActiveTvlRatio}), capacity ${prePositions.total_positions}/${cautionCap}`);
+      }
+    } else {
+      config.marketRegime._activeRegime = "healthy"; // regime detection off — never modulate deploy size
+      config.marketRegime._regimeConfirmed = false;
+    }
+
+    // Equity Fair-Share sizing: each position targets equity/maxPositions, scaled by regime.
+    // Computed here (after regime assessment) so this cycle's regime modulates the size.
+    const openPositionsValueSol = sumOpenPositionsValueSol(prePositions, currentBalance.sol_price);
+    const deployAmount = computeDeployAmount(currentBalance.sol, { openPositionsValueSol });
+    log("cron", `Computed deploy amount: ${deployAmount} SOL (wallet: ${currentBalance.sol} SOL, open-pos: ${openPositionsValueSol.toFixed(3)} SOL, regime: ${config.marketRegime._activeRegime})`);
+
+    // The executor enforces the (possibly caution-raised) fee/TVL floor at deploy time, so apply it here
+    // too: otherwise the LLM is offered a candidate that the executor then blocks.
+    const { kept: candidatesAboveFloor, dropped: belowFloor } = dropBelowFeeFloor(candidates, config.screening.minFeeActiveTvlRatio);
+    for (const pool of belowFloor) {
+      log("screening", `Fee floor: dropped ${pool.name} — fee/TVL ${pool.fee_active_tvl_ratio} < ${config.screening.minFeeActiveTvlRatio} (${config.marketRegime._activeRegime})`);
+      earlyFilteredExamples.push({ name: pool.name, reason: `fee/TVL ${pool.fee_active_tvl_ratio} below ${config.screening.minFeeActiveTvlRatio}` });
+    }
+
     const allCandidates = [];
-    for (const pool of candidates) {
+    for (const pool of candidatesAboveFloor) {
       const mint = pool.base?.mint;
-      const [smartWallets, narrative, tokenInfo] = await Promise.allSettled([
+      const [smartWallets, narrative, tokenInfo, screenMd, detail24h] = await Promise.allSettled([
         checkSmartWalletsOnPool({ pool_address: pool.pool }),
         mint ? getTokenNarrative({ mint }) : Promise.resolve(null),
         mint ? getTokenInfo({ query: mint }) : Promise.resolve(null),
+        fetchPoolMarketData(pool.pool),
+        getPoolDetail({ pool_address: pool.pool, timeframe: "24h" }), // record-only: fee/TVL over 24h, to compare with the screening timeframe
       ]);
+      const feeTvl24h = Number(detail24h.status === "fulfilled" ? detail24h.value?.fee_active_tvl_ratio : null);
       allCandidates.push({
         pool,
+        fee_tvl_24h: Number.isFinite(feeTvl24h) ? feeTvl24h : null,
         sw: smartWallets.status === "fulfilled" ? smartWallets.value : null,
         n: narrative.status === "fulfilled" ? narrative.value : null,
         ti: tokenInfo.status === "fulfilled" ? tokenInfo.value?.results?.[0] : null,
+        md: screenMd.status === "fulfilled" ? screenMd.value : null,
         mem: recallForPool(pool.pool),
       });
       await new Promise(r => setTimeout(r, 150)); // avoid 429s
@@ -531,26 +1028,76 @@ export async function runScreeningCycle({ silent = false } = {}) {
 
     // Hard filters after token recon — block launchpads and excessive Jupiter bot holders
     const filteredOut = [];
-    const passing = allCandidates.filter(({ pool, ti }) => {
-      // 🆕 RULE: minimum pool age — rug risk paling tinggi di jam-jam awal
+    const passing = allCandidates.filter(({ pool, ti, sw, md }) => {
+      // RULE: minimum token age — null = disabled (default). Set to 1-2h for safety net
+      // against very new tokens without blocking most trending pools.
+      // Note: token_age_hours measures the base TOKEN creation time, not when the LP pool was created.
       const ageHours = pool.token_age_hours ?? null;
-      const minAge = config.screening.minPoolAgeHours ?? 6;
-      if (ageHours != null && ageHours < minAge) {
-        log("screening", `Age filter: dropped ${pool.name} — age ${ageHours}h < ${minAge}h`);
-        filteredOut.push({ name: pool.name, reason: `pool too young (${ageHours}h < ${minAge}h)` });
+      const minAge = config.screening.minPoolAgeHours ?? null;
+      if (minAge != null && ageHours != null && ageHours < minAge) {
+        log("screening", `Age filter: dropped ${pool.name} — token age ${ageHours}h < min ${minAge}h`);
+        filteredOut.push({ name: pool.name, reason: `token too young (${ageHours}h < ${minAge}h)` });
         return false;
       }
 
-      // 🆕 RULE: anti-FOMO — skip pool yang pump tinggi 1 jam terakhir
-      const pump1h = ti?.stats_1h?.price_change ?? null;
-      const maxPump = config.screening.maxPump1hPct ?? 40;
-      if (pump1h != null && pump1h > maxPump) {
+      // RULE: anti-FOMO short-term pump — blocks extreme 1h pumps before they reach the LLM.
+      // Primary: DexScreener price_change_1h (direct market data); fallback: Jupiter token stats.
+      const pump1h = md?.price_change_1h ?? ti?.stats_1h?.price_change ?? null;
+      const maxPump = config.screening.maxPump1hPct ?? null;
+      if (maxPump != null && pump1h != null && pump1h > maxPump) {
         log("screening", `FOMO filter: dropped ${pool.name} — 1h +${pump1h}% > ${maxPump}%`);
         filteredOut.push({ name: pool.name, reason: `1h pump ${pump1h}% > ${maxPump}%` });
         return false;
       }
 
-      const launchpad = ti?.launchpad ?? null;
+      // RULE: anti-dump / falling-knife hard floor — drop tokens in severe 1h freefall.
+      // Smart-wallet presence overrides (accumulation by KOLs can accompany a dip).
+      const maxDump = config.screening.maxDump1hPct ?? null;
+      if (maxDump != null && pump1h != null && pump1h < maxDump) {
+        const smartWalletsDump = Math.max(sw?.in_pool?.length ?? 0, Number(pool.gmgn_smart_wallets ?? 0) || 0);
+        if (smartWalletsDump === 0) {
+          log("screening", `Dump filter: dropped ${pool.name} — 1h ${pump1h}% < ${maxDump}% (no smart wallets)`);
+          filteredOut.push({ name: pool.name, reason: `1h dump ${pump1h}% < ${maxDump}%` });
+          return false;
+        }
+        log("screening", `Dump filter: kept ${pool.name} — 1h ${pump1h}% but smart wallets present (${smartWalletsDump})`);
+      }
+
+      // 🆕 RULE: rugpull + PVP hard filter — applied uniformly to all candidates.
+      // Override only when smart wallets are present in the pool.
+      const smartWalletCount = Math.max(sw?.in_pool?.length ?? 0, Number(pool.gmgn_smart_wallets ?? 0) || 0);
+      if (pool.is_rugpull && smartWalletCount === 0) {
+        log("screening", `Rugpull filter: dropped ${pool.name} — OKX rugpull flag with no smart wallets`);
+        filteredOut.push({ name: pool.name, reason: "rugpull flagged with no smart wallets" });
+        return false;
+      }
+      if (pool.is_pvp && smartWalletCount === 0) {
+        log("screening", `PVP filter: dropped ${pool.name} — PVP symbol conflict with no smart wallets`);
+        filteredOut.push({ name: pool.name, reason: "PVP symbol conflict with no smart wallets" });
+        return false;
+      }
+
+      // 🆕 RULE: minimum token fees — low fees = bundled/scam. No smart-wallet override.
+      // Only enforced when fees data is available (null fallback = let LLM decide).
+      const feeSol = Number(ti?.global_fees_sol ?? pool.gmgn_total_fee_sol);
+      const minFeeSol = config.screening.minTokenFeesSol;
+      if (Number.isFinite(feeSol) && Number.isFinite(minFeeSol) && feeSol < minFeeSol) {
+        log("screening", `Fee filter: dropped ${pool.name} — token fees ${feeSol} SOL < min ${minFeeSol} SOL`);
+        filteredOut.push({ name: pool.name, reason: `token fees ${feeSol} SOL below minimum ${minFeeSol} SOL` });
+        return false;
+      }
+
+      // 🆕 RULE: top10 holder concentration — applied uniformly to all candidates.
+      // Only enforced when top10 data is available (null fallback = let LLM decide).
+      const top10Pct = Number(ti?.audit?.top_holders_pct ?? pool.gmgn_token_info_top10_pct ?? pool.gmgn_top10_holder_pct);
+      const maxTop10 = config.screening.maxTop10Pct;
+      if (Number.isFinite(top10Pct) && Number.isFinite(maxTop10) && top10Pct > maxTop10) {
+        log("screening", `Top10 filter: dropped ${pool.name} — top10 ${top10Pct}% > max ${maxTop10}%`);
+        filteredOut.push({ name: pool.name, reason: `top10 concentration ${top10Pct}% above maximum ${maxTop10}%` });
+        return false;
+      }
+
+      const launchpad = pool.launchpad ?? ti?.launchpad ?? null;
       if (launchpad && config.screening.allowedLaunchpads?.length > 0 && !config.screening.allowedLaunchpads.includes(launchpad)) {
         log("screening", `Skipping ${pool.name} — launchpad ${launchpad} not in allow-list`);
         filteredOut.push({ name: pool.name, reason: `launchpad ${launchpad} not in allow-list` });
@@ -568,6 +1115,33 @@ export async function runScreeningCycle({ silent = false } = {}) {
         filteredOut.push({ name: pool.name, reason: `bot holders ${botPct}% > ${maxBotHoldersPct}%` });
         return false;
       }
+      // RULE: bundle concentration — coordinated wallets funded by the same source at launch.
+      // Orthogonal to top10/bot/wash. Only enforced when OKX bundle data is available
+      // (null fallback = let LLM decide). No smart-wallet override — bundling is a launch red flag.
+      const bundlePct = pool.bundle_pct;
+      const maxBundlePct = config.screening.maxBundlePct;
+      if (bundlePct != null && maxBundlePct != null && bundlePct > maxBundlePct) {
+        log("screening", `Bundle filter: dropped ${pool.name} — bundle ${bundlePct}% > ${maxBundlePct}%`);
+        filteredOut.push({ name: pool.name, reason: `bundle concentration ${bundlePct}% > ${maxBundlePct}%` });
+        return false;
+      }
+      // RULE: entry flow filter — drop candidates whose multi-timeframe flow is bearish (default:
+      // DISTRIBUTION = active selling into bids, the precursor to in-range dumps like NEIL -16%).
+      // Smart-wallet presence overrides (accumulation can absorb the selling). Missing market data
+      // → NEUTRAL → not blocked (fail-safe). Enforces what prompt.js already recommends softly.
+      if (config.screening.entryFlowFilterEnabled) {
+        const blockRegimes = new Set(config.screening.entryFlowBlockRegimes ?? ["DISTRIBUTION"]);
+        const consensus = computeCandidateFlow(pool, md);
+        if (blockRegimes.has(consensus)) {
+          const smartPresent = (Number(pool?.gmgn_smart_wallets) || 0) > 0 || (sw?.in_pool?.length ?? 0) > 0;
+          if (!(config.screening.entryFlowFilterSmartMoneyOverride && smartPresent)) {
+            log("screening", `Entry flow filter: dropped ${pool.name} — flow ${consensus}`);
+            filteredOut.push({ name: pool.name, reason: `entry flow ${consensus}` });
+            return false;
+          }
+          log("screening", `Entry flow filter: kept ${pool.name} — flow ${consensus} but smart wallets present`);
+        }
+      }
       return true;
     });
 
@@ -578,7 +1152,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
         .join("\n");
       screenReport = combinedExamples
         ? `No candidates available.\nFiltered examples:\n${combinedExamples}`
-        : `No candidates available (all filtered by launchpad / holder-quality rules).`;
+        : `No candidates available (Meteora API returned 0 pools matching current filter criteria — check logs for filter query).`;
       appendDecision({
         type: "no_deploy",
         actor: "SCREENER",
@@ -619,18 +1193,61 @@ export async function runScreeningCycle({ silent = false } = {}) {
       }
     }
 
+    // Last Pool Standing guard: when the majority of candidates have CAPITULATION/DISTRIBUTION
+    // flow and only ONE has MARKUP, that lone token is likely the next to crash after a broad
+    // market selloff — deploying it is the anti-pattern that produced ANSEM -24.97%.
+    // Guard fires when: bearish-flow pools >= lastPoolStandingMinBearish AND exactly 1 MARKUP.
+    if (config.screening.lastPoolStandingGuard && passing.length > 1) {
+      const bearishFlowLabels = new Set(["CAPITULATION", "DISTRIBUTION"]);
+      const candidateFlows = passing.map(({ pool, md: pmd }) => ({
+        pool,
+        consensus: computeCandidateFlow(pool, pmd),
+      }));
+      const bearishCandidates = candidateFlows.filter(c => bearishFlowLabels.has(c.consensus));
+      const markupCandidates  = candidateFlows.filter(c => c.consensus === "MARKUP");
+      const minBearish = config.screening.lastPoolStandingMinBearish ?? 3;
+      if (bearishCandidates.length >= minBearish && markupCandidates.length === 1) {
+        const lone = markupCandidates[0];
+        const bearishNames = bearishCandidates.map(c => c.pool.name).join(", ");
+        const reason = `Last pool standing: ${lone.pool.name} is the only MARKUP candidate (${bearishCandidates.length} bearish-flow pools: ${bearishNames})`;
+        log("screening", reason);
+        screenReport = [
+          "⛔ NO DEPLOY",
+          "",
+          "Cycle finished with no valid entry.",
+          "",
+          "BEST LOOKING CANDIDATE",
+          lone.pool.name,
+          "",
+          "WHY SKIPPED",
+          `Last-pool-standing guard: ${lone.pool.name} is the sole MARKUP survivor among ${bearishCandidates.length} CAPITULATION/DISTRIBUTION pools. Deploying the only token still pumping during a market selloff is the pattern that preceded ANSEM -24.97%.`,
+          "",
+          "REJECTED",
+          `- ${lone.pool.name}: last pool standing (${bearishCandidates.length}/${candidateFlows.length} candidates bearish-flow)`,
+        ].join("\n");
+        appendDecision({
+          type: "no_deploy",
+          actor: "SCREENER",
+          summary: "Last pool standing — skipped",
+          reason,
+          pool: lone.pool.pool,
+          pool_name: lone.pool.name,
+        });
+        return screenReport;
+      }
+    }
+
     // Pre-fetch active_bin for all passing candidates in parallel
     const activeBinResults = await Promise.allSettled(
       passing.map(({ pool }) => getActiveBin({ pool_address: pool.pool }))
     );
 
     // Build compact candidate blocks
-    const candidateBlocks = passing.map(({ pool, sw, n, ti, mem }, i) => {
+    const candidateBlocks = passing.map(({ pool, sw, n, ti, md, mem, fee_tvl_24h }, i) => {
       const botPct = ti?.audit?.bot_holders_pct ?? "?";
       const top10Pct = ti?.audit?.top_holders_pct ?? "?";
       const feesSol = ti?.global_fees_sol ?? "?";
       const launchpad = ti?.launchpad ?? null;
-      const priceChange = ti?.stats_1h?.price_change;
       const netBuyers = ti?.stats_1h?.net_buyers;
       const activeBin = activeBinResults[i]?.status === "fulfilled" ? activeBinResults[i].value?.binId : null;
 
@@ -657,17 +1274,71 @@ export async function runScreeningCycle({ silent = false } = {}) {
         ? `  pvp: HIGH — rival ${pool.pvp_rival_name || pool.pvp_symbol} (${pool.pvp_rival_mint?.slice(0, 8)}...) has pool ${pool.pvp_rival_pool?.slice(0, 8)}..., tvl=$${pool.pvp_rival_tvl}, holders=${pool.pvp_rival_holders}, fees=${pool.pvp_rival_fees}SOL`
         : null;
 
+      // Multi-timeframe flow regime: volume × price composite signal
+      // Each TF: volRatio = current-period-vol / baseline (next-longer TF average)
+      // 5m baseline = 1h/12, 1h baseline = 6h/6, 6h baseline = 24h/4
+      const vol5m  = md?.volume_5m;
+      const vol1h  = md?.volume_1h;
+      const vol6h  = md?.volume_6h;
+      const vol24h = md?.volume_24h;
+      const volRatio5m = vol5m  != null && vol1h  > 0 ? vol5m  / (vol1h  / 12) : null;
+      const volRatio1h = vol1h  != null && vol6h  > 0 ? vol1h  / (vol6h  / 6)  : null;
+      const volRatio6h = vol6h  != null && vol24h > 0 ? vol6h  / (vol24h / 4)  : null;
+      const r5m  = md ? tfFlowRegime(md.price_change_5m, volRatio5m, 0.5) : null;
+      const r1h  = md ? tfFlowRegime(md.price_change_1h, volRatio1h, 1.5) : null;
+      const r6h  = md ? tfFlowRegime(md.price_change_6h, volRatio6h, 3.0) : null;
+      const regimeConsensus = flowConsensus([r5m, r1h, r6h]);
+
+      // Microstructure: txn buy/sell count (5m) as confirmation layer
+      let orderFlowLabel = null;
+      if (md?.txn_buys_5m != null && md?.txn_sells_5m != null) {
+        const total = md.txn_buys_5m + md.txn_sells_5m;
+        const bsRatio = config.screening.entryBuySellRatio ?? 1.5;
+        if (total >= 10) {
+          if (md.txn_sells_5m > md.txn_buys_5m * bsRatio)
+            orderFlowLabel = `BEARISH(S:${md.txn_sells_5m}/B:${md.txn_buys_5m})`;
+          else if (md.txn_buys_5m > md.txn_sells_5m * bsRatio)
+            orderFlowLabel = `BULLISH(B:${md.txn_buys_5m}/S:${md.txn_sells_5m})`;
+          else
+            orderFlowLabel = `BALANCED(B:${md.txn_buys_5m}/S:${md.txn_sells_5m})`;
+        }
+      }
+
+      // Long-window volume trend (Meteora API, volatility timeframe ≥30m) — separate source
+      const longVolPct = pool.volume_change_pct;
+      let longVolLabel = null;
+      if (longVolPct != null) {
+        const tr = 1 + longVolPct / 100;
+        const dt = config.screening.volumeTrendDeclineThreshold ?? 0.6;
+        const et = config.screening.volumeTrendExpandThreshold ?? 1.4;
+        if (tr < dt) longVolLabel = `long_vol=DECLINING(${longVolPct}%)`;
+        else if (tr > et) longVolLabel = `long_vol=EXPANDING(${longVolPct}%)`;
+      }
+
+      const flowParts = [
+        r5m  ? `5m=${r5m}(${md.price_change_5m >= 0 ? "+" : ""}${(md.price_change_5m ?? 0).toFixed(1)}%,vol×${volRatio5m != null ? volRatio5m.toFixed(1) : "?"})` : null,
+        r1h  ? `1h=${r1h}(${md.price_change_1h >= 0 ? "+" : ""}${(md.price_change_1h ?? 0).toFixed(1)}%,vol×${volRatio1h != null ? volRatio1h.toFixed(1) : "?"})` : null,
+        r6h  ? `6h=${r6h}(${md.price_change_6h >= 0 ? "+" : ""}${(md.price_change_6h ?? 0).toFixed(1)}%,vol×${volRatio6h != null ? volRatio6h.toFixed(1) : "?"})` : null,
+        orderFlowLabel ? `order_flow=${orderFlowLabel}` : null,
+        netBuyers != null ? `net_buyers_1h=${netBuyers}` : null,
+        longVolLabel,
+      ].filter(Boolean);
+      const flowRegimeLine = flowParts.length > 0
+        ? `  flow_regime: ${flowParts.join(", ")} → ${regimeConsensus}`
+        : null;
+
       const block = [
-        `POOL: ${pool.name} (${pool.pool})`,
+        `POOL #${i + 1} of ${passing.length}: ${pool.name} (${pool.pool})`,
         `  metrics: bin_step=${pool.bin_step}, fee_pct=${pool.fee_pct}%, fee_tvl=${pool.fee_active_tvl_ratio}, vol=$${pool.volume_window}, tvl=$${pool.tvl ?? pool.active_tvl}, volatility_${pool.volatility_timeframe || "30m"}=${pool.volatility}, mcap=$${pool.mcap}, organic=${pool.organic_score}${pool.token_age_hours != null ? `, age=${pool.token_age_hours}h` : ""}`,
         `  audit: top10=${top10Pct}%, bots=${botPct}%, fees=${feesSol}SOL${launchpad ? `, launchpad=${launchpad}` : ""}`,
+        (pool.active_pct != null || pool.unique_traders != null) ? `  structure:${pool.active_pct != null ? ` active_liq=${pool.active_pct}%` : ""}${pool.unique_traders != null ? ` unique_traders=${pool.unique_traders}` : ""}`.trimEnd() : null,
         pvpLine,
+        flowRegimeLine,
         okxParts ? `  okx: ${okxParts}` : okxUnavailable ? `  okx: unavailable` : null,
         okxTags ? `  tags: ${okxTags}` : null,
         pool.price_vs_ath_pct != null ? `  ath: price_vs_ath=${pool.price_vs_ath_pct}%${pool.top_cluster_trend ? `, top_cluster=${pool.top_cluster_trend}` : ""}` : null,
         `  smart_wallets: ${sw?.in_pool?.length ?? 0} present${sw?.in_pool?.length ? ` → CONFIDENCE BOOST (${sw.in_pool.map(w => w.name).join(", ")})` : ""}`,
         activeBin != null ? `  active_bin: ${activeBin}` : null,
-        priceChange != null ? `  1h: price${priceChange >= 0 ? "+" : ""}${priceChange}%, net_buyers=${netBuyers ?? "?"}` : null,
         n?.narrative ? `  narrative_untrusted: ${sanitizeUntrustedPromptText(n.narrative, 500)}` : `  narrative_untrusted: none`,
         mem ? `  memory_untrusted: ${sanitizeUntrustedPromptText(mem, 500)}` : null,
       ].filter(Boolean).join("\n");
@@ -685,6 +1356,32 @@ export async function runScreeningCycle({ silent = false } = {}) {
           smart_wallets_present: (sw?.in_pool?.length ?? 0) > 0,
           narrative_quality: n?.narrative ? "present" : "absent",
           volatility: pool.volatility ?? null,
+          // Record-only (not a Darwin weight): lets us check later whether entries near ATH lose more
+          // before turning on athFilterPct. OKX price as % of ATH; null when OKX had no data.
+          price_vs_ath_pct: pool.price_vs_ath_pct ?? null,
+          // Record-only, same purpose: which of the flow/transaction lines the screener sees
+          // actually separate winners from losers.
+          flow_consensus: md ? regimeConsensus : null,
+          txn_buys_5m: md?.txn_buys_5m ?? null,
+          txn_sells_5m: md?.txn_sells_5m ?? null,
+          net_buyers_1h: netBuyers ?? null,
+          // Record-only, for the fee/TVL prioritisation check: pool TVL, the same ratio over 24h, and
+          // where this candidate stood in its cycle (rank 1 = highest fee_tvl × organic).
+          tvl: pool.tvl ?? pool.active_tvl ?? null,
+          fee_tvl_24h: fee_tvl_24h ?? null,
+          candidate_rank: i + 1,
+          candidate_count: passing.length,
+          top_fee_tvl: passing[0]?.pool?.fee_active_tvl_ratio ?? null,
+          // Record-only, so the rug-hygiene filters and the pool-structure lines can be evaluated later.
+          // Raw values (null when the source had none), not the "?" placeholders used in the prompt block.
+          top10_pct: ti?.audit?.top_holders_pct ?? null,
+          bot_holders_pct: ti?.audit?.bot_holders_pct ?? null,
+          bundle_pct: pool.bundle_pct ?? null,
+          token_fees_sol: ti?.global_fees_sol ?? null,
+          token_age_hours: pool.token_age_hours ?? null,
+          active_pct: pool.active_pct ?? null,
+          unique_traders: pool.unique_traders ?? null,
+          regime_at_entry: config.marketRegime?._activeRegime ?? null,
         });
       }
 
@@ -693,8 +1390,12 @@ export async function runScreeningCycle({ silent = false } = {}) {
 
     const weightsSummary = config.darwin?.enabled ? getWeightsSummary() : null;
 
-    let deployAttempted = false;
+    // One line per cycle: the order the LLM saw, so the pick's rank can be measured later.
+    log("screening", `Candidates (best first): ${passing.map(({ pool }, i) => `#${i + 1} ${pool.name} fee_tvl=${pool.fee_active_tvl_ratio} org=${pool.organic_score}`).join(" | ")}`);
+
     let deploySucceeded = false;
+    // The screening report (sent whenever a deploy was attempted) replaces notifyDeploy here.
+    if (!silent && telegramEnabled()) setDeployNotifyMuted(true);
     const { content } = await agentLoop(`
 SCREENING CYCLE
 ${strategyBlock}
@@ -705,12 +1406,9 @@ ${candidateBlocks.join("\n\n")}
 
 STEPS:
 1. Decide if any candidate is actually worth deploying. One surviving candidate is not automatically good enough.
-2. Pick the best candidate based on narrative quality, smart wallets, and pool metrics.
+2. Pick the candidate by CANDIDATE ORDER in your system prompt. The list above is already ordered best-first by fee_tvl × organic; narrative and smart wallets are skip signals and tie-breaks, not the ranking.
 3. Call deploy_position (active_bin is pre-fetched above — no need to call get_active_bin).
-   bins_below = round(${config.strategy.minBinsBelow} + (candidate volatility/5)*(${config.strategy.maxBinsBelow - config.strategy.minBinsBelow})) clamped to [${config.strategy.minBinsBelow},${config.strategy.maxBinsBelow}].
-   pass deploy_position.volatility = the candidate volatility value.
-   For single-side SOL deploys: set amount_y only, keep amount_x = 0.
-   Set bins_above to ~25% of bins_below (e.g. bins_below=40 → bins_above=10), capped at 30% of bins_below.
+   Compute bins_below and bins_above using the strategy-specific guidance in your system prompt (DEPLOY RULES section). Pass deploy_position.volatility = the candidate volatility value.
 4. Report in this exact format (no tables, no extra sections):
    🚀 DEPLOYED
 
@@ -749,7 +1447,7 @@ STEPS:
    <If OKX enrichment is missing, write exactly: OKX: unavailable>
 
    WHY THIS WON
-   <2-4 concise sentences on why this pool won, key risks, and why it still beat the alternatives>
+   <2-4 concise sentences: start with its rank (#k of n) and fee_tvl; if it is not #1, name the skip signal or tie-break that moved it. Then key risks and why it still beat the alternatives>
 5. If no pool qualifies, report in this exact format instead:
    ⛔ NO DEPLOY
 
@@ -766,28 +1464,40 @@ STEPS:
 IMPORTANT:
 - Never write "unknown" for OKX. Use real values, omit missing fields, or write exactly "OKX: unavailable".
 - Keep the whole report compact and highly scannable for Telegram.
-      `, config.llm.maxSteps, [], "SCREENER", config.llm.screeningModel, 2048, {
-      onToolStart: async ({ name }) => {
-        if (name === "deploy_position") deployAttempted = true;
-        await liveMessage?.toolStart(name);
+      `, config.llm.maxSteps, [], "SCREENER", config.llm.screeningModel, 4096, {
+      // Candidates already carry pool memory, smart wallets, active bin and balance: tools for
+      // those only added LLM round-trips (live: get_pool_memory 93×, smart wallets 21× in 3 days).
+      // NO DEPLOY is a valid text-only answer, so no forced tool call on step 1.
+      allowedTools: SCREENING_CYCLE_TOOLS,
+      requireToolUse: false,
+      onToolStart: async ({ name, args }) => {
+        if (name === "deploy_position") {
+          deployAttempted = true;
+          const k = passing.findIndex(({ pool }) => pool.pool === args?.pool_address);
+          if (k >= 0) log("screening", `Screener pick: ${passing[k].pool.name} rank #${k + 1} of ${passing.length} (fee_tvl=${passing[k].pool.fee_active_tvl_ratio}, top=${passing[0].pool.fee_active_tvl_ratio})`);
+        }
       },
       onToolFinish: async ({ name, result, success }) => {
         if (name === "deploy_position") {
           deployAttempted = true;
           deploySucceeded = Boolean(success && result?.success !== false && !result?.error && !result?.blocked);
         }
-        await liveMessage?.toolFinish(name, result, success);
       },
     });
     screenReport = content;
-    if (/⛔\s*NO DEPLOY/i.test(content)) {
+    if (deploySucceeded) {
+      // A fresh deploy means opportunities exist again — restore the fast screening cadence.
+      _noDeployStreak = 0;
+    } else if (/⛔\s*NO DEPLOY/i.test(content)) {
+      _noDeployStreak++;
       appendDecision({
         type: "no_deploy",
         actor: "SCREENER",
         summary: "LLM chose no deploy",
         reason: stripThink(content).slice(0, 500),
       });
-    } else if (!deploySucceeded) {
+    } else {
+      _noDeployStreak++;
       appendDecision({
         type: "no_deploy",
         actor: "SCREENER",
@@ -795,15 +1505,25 @@ IMPORTANT:
         reason: stripThink(content).slice(0, 500),
       });
     }
+    if (!deploySucceeded) {
+      const backoffCount = config.schedule.screeningNoDeployBackoffCount ?? 2;
+      log("cron", `Screener no-deploy streak: ${_noDeployStreak}/${backoffCount}${isScreeningBackedOff() ? " — backed off to screeningIntervalMin" : ""}`);
+    }
   } catch (error) {
     log("cron_error", `Screening cycle failed: ${error.message}`);
     screenReport = `Screening cycle failed: ${error.message}`;
+    screenFailed = true;
   } finally {
+    setDeployNotifyMuted(false);
+    // Restore the caution-raised fee/TVL floor so it doesn't compound across cycles
+    if (_cautionOrigFeeRatio != null) {
+      config.screening.minFeeActiveTvlRatio = _cautionOrigFeeRatio;
+      _cautionOrigFeeRatio = null;
+    }
     _screeningBusy = false;
     if (!silent && telegramEnabled()) {
-      if (screenReport) {
-        if (liveMessage) await liveMessage.finalize(stripThink(screenReport)).catch(() => { });
-        else sendMessage(`🔍 Screening Cycle\n\n${stripThink(screenReport)}`).catch(() => { });
+      if (screenReport && (deployAttempted || screenFailed)) {
+        sendMessage(`🔍 Screening Cycle\n\n${stripThink(screenReport)}`).catch(() => { });
       }
     }
     drainTelegramQueue().catch(() => { });
@@ -822,23 +1542,6 @@ export function startCronJobs() {
 
   const screenTask = cron.schedule(`*/${Math.max(1, config.schedule.screeningIntervalMin)} * * * *`, runScreeningCycle);
 
-  const healthTask = cron.schedule(`0 * * * *`, async () => {
-    if (_managementBusy) return;
-    _managementBusy = true;
-    log("cron", "Starting health check");
-    try {
-      await agentLoop(`
-HEALTH CHECK
-
-Summarize the current portfolio health, total fees earned, and performance of all open positions. Recommend any high-level adjustments if needed.
-      `, config.llm.maxSteps, [], "MANAGER");
-    } catch (error) {
-      log("cron_error", `Health check failed: ${error.message}`);
-    } finally {
-      _managementBusy = false;
-    }
-  });
-
   // Morning Briefing at 8:00 AM UTC+7 (1:00 AM UTC)
   const briefingTask = cron.schedule(`0 1 * * *`, async () => {
     await runBriefing();
@@ -852,12 +1555,17 @@ Summarize the current portfolio health, total fees earned, and performance of al
   // Lightweight 30s PnL poller — updates trailing TP state between management cycles, no LLM
   let _pnlPollBusy = false;
   const pnlPollInterval = setInterval(async () => {
-    if (_managementBusy || _screeningBusy || _pnlPollBusy) return;
+    // Not gated on _screeningBusy: screening is a multi-minute LLM loop, and pausing the poll
+    // for it left open positions unwatched (the cron management cycle already runs alongside it).
+    if (_managementBusy || _pnlPollBusy) return;
     if (getTrackedPositions(true).length === 0) return;
     _pnlPollBusy = true;
     try {
       const result = await getMyPositions({ force: true, silent: true }).catch(() => null);
       if (!result?.positions?.length) return;
+      // Prune cooldown entries for positions that are no longer open (keeps the Map bounded).
+      const activeIds = new Set(result.positions.map((p) => p.position));
+      for (const id of _pollTriggeredAt.keys()) if (!activeIds.has(id)) _pollTriggeredAt.delete(id);
       for (const p of result.positions) {
         if (
           !p.pnl_pct_suspicious &&
@@ -866,43 +1574,49 @@ Summarize the current portfolio health, total fees earned, and performance of al
         ) {
           schedulePeakConfirmation(p.position);
         }
-        const exit = updatePnlAndCheckExits(p.position, p, config.management);
+        const exit = updatePnlAndCheckExits(p.position, p, config.management, config.marketRegime?._activeRegime ?? "healthy");
         if (exit) {
           if (exit.action === "TRAILING_TP" && exit.needs_confirmation && shouldUsePnlRecheck()) {
-            if (queueTrailingDropConfirmation(p.position, exit.peak_pnl_pct, exit.current_pnl_pct, config.management.trailingDropPct)) {
+            if (queueTrailingDropConfirmation(p.position, exit.peak_pnl_pct, exit.current_pnl_pct, exit.effective_drop_pct ?? config.management.trailingDropPct, exit.in_range_exit)) {
               scheduleTrailingDropConfirmation(p.position);
             }
             continue;
           }
           const cooldownMs = config.schedule.managementIntervalMin * 60 * 1000;
-          const sinceLastTrigger = Date.now() - _pollTriggeredAt;
+          const sinceLastTrigger = Date.now() - (_pollTriggeredAt.get(p.position) ?? 0);
           if (sinceLastTrigger >= cooldownMs) {
-            _pollTriggeredAt = Date.now();
+            _pollTriggeredAt.set(p.position, Date.now());
             log("state", `[PnL poll] Exit alert: ${p.pair} — ${exit.reason} — triggering management`);
             runManagementCycle({ silent: true }).catch((e) => log("cron_error", `Poll-triggered management failed: ${e.message}`));
-          } else {
-            log("state", `[PnL poll] Exit alert: ${p.pair} — ${exit.reason} — cooldown (${Math.round((cooldownMs - sinceLastTrigger) / 1000)}s left)`);
+            break;
           }
-          break;
+          // This position is in cooldown — keep scanning others rather than aborting the poll tick.
+          log("state", `[PnL poll] Exit alert: ${p.pair} — ${exit.reason} — cooldown (${Math.round((cooldownMs - sinceLastTrigger) / 1000)}s left)`);
+          continue;
         }
         // BUG FIX: fetch market data so Rules 7 & 8 can evaluate in the fast 30s poll path
         const pollMd = await fetchPoolMarketData(p.pool).catch(() => null);
-        const closeRule = getDeterministicCloseRule(p, config.management, pollMd);
+        if (pollMd?.volume_5m != null) {
+          addVolumeSnapshot(p.pool, { vol_5m: pollMd.volume_5m, buys_5m: pollMd.txn_buys_5m ?? 0, sells_5m: pollMd.txn_sells_5m ?? 0 });
+        }
+        const pollVolumeWindow = getVolumeWindow(p.pool, config.emergencyExits.sellPressureStreak?.windowMin ?? 30);
+        const closeRule = getDeterministicCloseRule(p, config.management, pollMd, pollVolumeWindow, _cachedSolPrice, config.marketRegime?._activeRegime ?? "healthy");
         if (closeRule) {
-          const isEmergency = closeRule.rule === 7 || closeRule.rule === 8;
+          const isEmergency = closeRule.rule === 7 || closeRule.rule === 8 || closeRule.rule === 11;
           if (isEmergency) {
             log("market_data", `[pnl_poll] Emergency rule ${closeRule.rule} (${closeRule.reason}) triggered for ${p.pair} — price5m=${pollMd?.price_change_5m ?? "?"}% vol5m=$${pollMd?.volume_5m ?? "?"}`);
           }
           const cooldownMs = config.schedule.managementIntervalMin * 60 * 1000;
-          const sinceLastTrigger = Date.now() - _pollTriggeredAt;
+          const sinceLastTrigger = Date.now() - (_pollTriggeredAt.get(p.position) ?? 0);
           if (sinceLastTrigger >= cooldownMs) {
-            _pollTriggeredAt = Date.now();
+            _pollTriggeredAt.set(p.position, Date.now());
             log("state", `[PnL poll] Deterministic close rule: ${p.pair} — Rule ${closeRule.rule}: ${closeRule.reason} — triggering management`);
             runManagementCycle({ silent: true }).catch((e) => log("cron_error", `Poll-triggered management failed: ${e.message}`));
-          } else {
-            log("state", `[PnL poll] Deterministic close rule: ${p.pair} — Rule ${closeRule.rule}: ${closeRule.reason} — cooldown (${Math.round((cooldownMs - sinceLastTrigger) / 1000)}s left)`);
+            break;
           }
-          break;
+          // This position is in cooldown — keep scanning others rather than aborting the poll tick.
+          log("state", `[PnL poll] Deterministic close rule: ${p.pair} — Rule ${closeRule.rule}: ${closeRule.reason} — cooldown (${Math.round((cooldownMs - sinceLastTrigger) / 1000)}s left)`);
+          continue;
         }
       }
     } finally {
@@ -910,10 +1624,21 @@ Summarize the current portfolio health, total fees earned, and performance of al
     }
   }, 30_000);
 
-  _cronTasks = [mgmtTask, screenTask, healthTask, briefingTask, briefingWatchdog];
+  _cronTasks = [mgmtTask, screenTask, briefingTask, briefingWatchdog];
   // Store interval ref so stopCronJobs can clear it
   _cronTasks._pnlPollInterval = pnlPollInterval;
   log("cron", `Cycles started — management every ${config.schedule.managementIntervalMin}m, screening every ${config.schedule.screeningIntervalMin}m`);
+
+  // Validate Rule 9 window vs interval — misconfigured values can silently disable the rule
+  const spCfg = config.emergencyExits?.sellPressureStreak;
+  if (spCfg?.enabled) {
+    const streakWindowMin = spCfg.windowMin ?? 30;
+    const streakNeeded   = spCfg.streakCount ?? 3;
+    const maxSnapshots   = Math.floor(streakWindowMin / config.schedule.managementIntervalMin);
+    if (maxSnapshots < streakNeeded) {
+      log("cron_warn", `Rule 9 misconfiguration: windowMin=${streakWindowMin} / managementIntervalMin=${config.schedule.managementIntervalMin} = ~${maxSnapshots} snapshots, but streakCount=${streakNeeded}. Rule 9 will never fire. Increase windowMin or decrease streakCount.`);
+    }
+  }
 }
 
 // ═══════════════════════════════════════════
@@ -984,7 +1709,106 @@ function formatCandidates(candidates) {
   ].join("\n");
 }
 
-function getDeterministicCloseRule(position, managementConfig, marketData = null) {
+// ── Flow-regime helpers ──────────────────────────────────────────────────────
+// Classify a single timeframe as MARKUP / DISTRIBUTION / EXHAUSTION / CAPITULATION / NEUTRAL.
+// priceChangePct: % move (positive = up). volRatio: current-vol / baseline-vol (>1 = expanding).
+// priceThreshold: minimum absolute % to call the move "directional" (filters out noise).
+function tfFlowRegime(priceChangePct, volRatio, priceThreshold) {
+  if (priceChangePct == null) return null;
+  const up   = priceChangePct >  priceThreshold;
+  const down = priceChangePct < -priceThreshold;
+  if (!up && !down) return "NEUTRAL";
+  if (volRatio == null) return up ? "UP" : "DOWN"; // price signal only, no vol context
+  const volHigh = volRatio > 1.1;
+  if (up   && volHigh)  return "MARKUP";
+  if (down && volHigh)  return "DISTRIBUTION";
+  if (up   && !volHigh) return "EXHAUSTION";
+  return "CAPITULATION"; // down && !volHigh
+}
+
+// Derive consensus label from an array of per-TF regimes.
+// Returns the dominant regime name, or MIXED/NEUTRAL.
+function flowConsensus(regimes) {
+  const defined = regimes.filter((r) => r != null && r !== "NEUTRAL");
+  if (defined.length === 0) return "NEUTRAL";
+  const counts = {};
+  for (const r of defined) counts[r] = (counts[r] || 0) + 1;
+  // Specific regime majority
+  for (const label of ["DISTRIBUTION", "MARKUP", "CAPITULATION", "EXHAUSTION"]) {
+    if ((counts[label] || 0) >= 2) return label;
+  }
+  // Directional majority (weaker signal names)
+  const bearish = (counts.DISTRIBUTION || 0) + (counts.CAPITULATION || 0) + (counts.DOWN || 0);
+  const bullish  = (counts.MARKUP || 0) + (counts.EXHAUSTION || 0) + (counts.UP || 0);
+  if (bearish > bullish) return "BEARISH_MIXED";
+  if (bullish > bearish) return "BULLISH_MIXED";
+  return "MIXED";
+}
+
+// Compute a pool's multi-timeframe flow consensus from DexScreener market data (md).
+// Shared by the entry flow filter (per-candidate) and the last-pool-standing guard (aggregate).
+// Returns "NEUTRAL" when data is missing (fail-safe: callers treat NEUTRAL as "not bearish").
+export function computeCandidateFlow(pool, md) {
+  if (!md) return "NEUTRAL";
+  const v5m = md.volume_5m, v1h = md.volume_1h, v6h = md.volume_6h, v24h = md.volume_24h;
+  const vr5m = v5m != null && v1h  > 0 ? v5m / (v1h  / 12) : null;
+  const vr1h = v1h != null && v6h  > 0 ? v1h / (v6h  / 6)  : null;
+  const vr6h = v6h != null && v24h > 0 ? v6h / (v24h / 4)  : null;
+  const r5m = tfFlowRegime(md.price_change_5m, vr5m, 0.5);
+  const r1h = tfFlowRegime(md.price_change_1h, vr1h, 1.5);
+  const r6h = tfFlowRegime(md.price_change_6h, vr6h, 3.0);
+  return flowConsensus([r5m, r1h, r6h]);
+}
+
+/**
+ * Rule 6 grace check: is an over-age position still actively earning?
+ * Reads the last `lookbackMin` of position snapshots and treats the position as
+ * "earning" when PnL is still drifting up OR unclaimed fees are still accruing past
+ * a SOL-denominated floor. A claim resets unclaimed fees to ~0, so a negative fee
+ * delta is ignored and the PnL-drift signal carries the decision. Returns false when
+ * there is too little snapshot history to judge — an over-age position must PROVE it
+ * is still working to earn a grace extension, otherwise it closes.
+ */
+function isOverageStillEarning(position, lookbackMin, minGrowthSol, solPriceUsd, managementConfig = {}) {
+  // Signal 1: current yield — the clearest indicator the pool is still actively earning fees.
+  // If fee_per_tvl_24h is above the same threshold used by Rule 5, the position is earning well.
+  const currentYield = position.fee_per_tvl_24h ?? null;
+  const yieldFloor = managementConfig.minFeePerTvl24h ?? 7;
+  if (currentYield != null && currentYield >= yieldFloor) {
+    return true;
+  }
+
+  // Signal 2: unclaimed fees absolute — if there is meaningful accrued value sitting in the
+  // position, close is premature regardless of the marginal rate this cycle.
+  const unclaimedUsd = position.unclaimed_fees_usd ?? null;
+  const minUnclaimedUsd = solPriceUsd != null && solPriceUsd > 0 ? (minGrowthSol * 3) * solPriceUsd : 0;
+  if (unclaimedUsd != null && minUnclaimedUsd > 0 && unclaimedUsd >= minUnclaimedUsd) {
+    return true;
+  }
+
+  const snaps = getSnapshotWindow(position.pool, lookbackMin);
+  if (snaps.length < 2) return false;
+  const earliest = snaps[0];
+  const latest = snaps[snaps.length - 1];
+
+  // Signal 3: PnL drift positive over the lookback window.
+  if (latest.pnl_pct != null && earliest.pnl_pct != null && (latest.pnl_pct - earliest.pnl_pct) > 0) {
+    return true;
+  }
+
+  // Signal 4: unclaimed fees growing past the minimum threshold over the lookback window.
+  if (latest.unclaimed_fees_usd != null && earliest.unclaimed_fees_usd != null) {
+    const feeDeltaUsd = latest.unclaimed_fees_usd - earliest.unclaimed_fees_usd;
+    if (feeDeltaUsd > 0) {
+      const minGrowthUsd = solPriceUsd != null && solPriceUsd > 0 ? minGrowthSol * solPriceUsd : 0;
+      if (feeDeltaUsd >= minGrowthUsd) return true;
+    }
+  }
+
+  return false;
+}
+
+function getDeterministicCloseRule(position, managementConfig, marketData = null, volumeWindow = [], solPriceUsd = null, regime = "healthy") {
   const tracked = getTrackedPosition(position.position);
   const pnlSuspect = (() => {
     if (position.pnl_pct == null) return false;
@@ -1004,68 +1828,377 @@ function getDeterministicCloseRule(position, managementConfig, marketData = null
     return { action: "CLOSE", rule: 1, reason: "break-even stop" };
   }
 
-  if (!pnlSuspect && position.pnl_pct != null && position.pnl_pct <= managementConfig.stopLossPct && posAgeMin >= minAgeForStopLoss) {
-    return { action: "CLOSE", rule: 1, reason: "stop loss" };
+  const effSL1 = effectiveStopLossPct(tracked, managementConfig, regime);
+  if (!pnlSuspect && position.pnl_pct != null && effSL1 != null && position.pnl_pct <= effSL1 && posAgeMin >= minAgeForStopLoss) {
+    return { action: "CLOSE", rule: 1, reason: `stop loss (<=${effSL1}%)` };
   }
-  if (!pnlSuspect && position.pnl_pct != null && position.pnl_pct >= managementConfig.takeProfitPct) {
+  // Skip hard take profit when trailing TP is enabled — let trailing handle it.
+  // Bid_ask positions can run 8-15% via fee accumulation; hard TP at 5% caps profit prematurely.
+  if (!pnlSuspect && !managementConfig.trailingTakeProfit && position.pnl_pct != null && position.pnl_pct >= managementConfig.takeProfitPct) {
     return { action: "CLOSE", rule: 2, reason: "take profit" };
   }
   if (
     position.active_bin != null &&
-    position.upper_bin != null &&
-    position.active_bin > position.upper_bin + managementConfig.outOfRangeBinsToClose
+    position.upper_bin != null
   ) {
-    return { action: "CLOSE", rule: 3, reason: "pumped far above range" };
+    // Scale outOfRangeBinsToClose with current pool volatility.
+    // Vol ≤ 2 → 1× base (no change). Vol 4.6 → 2.3× base. Vol 6+ → 3× base (cap).
+    // Prevents premature close on high-volatility pools where 10 bins = normal oscillation.
+    // live_volatility is refreshed each cycle; falls back to deploy-time value if unavailable.
+    const r3Vol = tracked?.live_volatility ?? tracked?.volatility ?? 0;
+    const volMult = r3Vol > 0 ? Math.max(1, Math.min(3, r3Vol / 2)) : 1;
+    const effectiveBinsToClose = Math.round(managementConfig.outOfRangeBinsToClose * volMult);
+    if (position.active_bin > position.upper_bin + effectiveBinsToClose) {
+      return { action: "CLOSE", rule: 3, reason: `pumped far above range (>${effectiveBinsToClose} bins, vol=${r3Vol}×${volMult.toFixed(2)})` };
+    }
   }
+  const oorAboveWaitMin = managementConfig.outOfRangeWaitMinutesAbove ?? managementConfig.outOfRangeWaitMinutes;
   if (
     position.active_bin != null &&
     position.upper_bin != null &&
     position.active_bin > position.upper_bin &&
+    (position.minutes_out_of_range ?? 0) >= oorAboveWaitMin
+  ) {
+    return { action: "CLOSE", rule: 4, reason: `OOR above (idle, ${position.minutes_out_of_range}m)` };
+  }
+  if (
+    position.active_bin != null &&
+    position.lower_bin != null &&
+    position.active_bin < position.lower_bin &&
     (position.minutes_out_of_range ?? 0) >= managementConfig.outOfRangeWaitMinutes
   ) {
-    return { action: "CLOSE", rule: 4, reason: "OOR" };
+    // Skip close this cycle if buys are dominating — price may be recovering back into range.
+    // The next management cycle will re-evaluate; this prevents closing into a bounce.
+    const oorBelowBuys = marketData?.txn_buys_5m ?? 0;
+    const oorBelowSells = marketData?.txn_sells_5m ?? 0;
+    if ((oorBelowBuys + oorBelowSells) >= 3 && oorBelowBuys > oorBelowSells) {
+      log("cron_warn", `Rule 4 OOR below deferred for ${position.pair}: buy pressure detected (buys=${oorBelowBuys} sells=${oorBelowSells})`);
+    } else {
+      return { action: "CLOSE", rule: 4, reason: `OOR below (cycle complete, ${position.minutes_out_of_range}m)` };
+    }
   }
   if (
     position.fee_per_tvl_24h != null &&
     position.fee_per_tvl_24h < managementConfig.minFeePerTvl24h &&
-    (position.age_minutes ?? 0) >= 60
+    (position.age_minutes ?? 0) >= (managementConfig.minAgeBeforeYieldCheck ?? 60)
   ) {
-    return { action: "CLOSE", rule: 5, reason: "low yield" };
+    // Depth-aware entry grace (mirrors Rule 7/8/9): a position still in its SOL-rich
+    // accumulation zone has not had price drop into the range yet, so fees naturally
+    // haven't accrued — low yield here is EXPECTED, not a dying pool. Suppress Rule 5
+    // until price breaches the grace depth and the breach persists past confirm window.
+    // FAIL-SAFE: keep grace active when bin data is unavailable.
+    const r5tracked = getTrackedPosition(position.position);
+    const {
+      active: inEntryAccumulation5,
+      binsKnown: binsKnown5,
+      depthPct: depthPct5,
+      graceDepth: graceDepth5,
+      strategy: deployStrategy5,
+    } = isInEntryAccumulation(r5tracked, position, managementConfig, config.strategy.strategy);
+    logGraceTransition(5, position, inEntryAccumulation5, graceDetail(binsKnown5, depthPct5, graceDepth5, deployStrategy5));
+    if (!inEntryAccumulation5) {
+      return { action: "CLOSE", rule: 5, reason: `low yield (depth=${depthPct5.toFixed(0)}% strat=${deployStrategy5})` };
+    }
   }
   if (!pnlSuspect && (position.age_minutes ?? 0) >= (managementConfig.maxPositionAgeMinutes ?? 2880)) {
-    const ageHours = Math.round((position.age_minutes ?? 0) / 60);
-    return { action: "CLOSE", rule: 6, reason: `max age reached (${ageHours}h)` };
+    const ageMin = position.age_minutes ?? 0;
+    const ageHours = Math.round(ageMin / 60);
+    const maxAge = managementConfig.maxPositionAgeMinutes ?? 2880;
+    const maxExt = managementConfig.maxAgeExtensions ?? 3;
+    const extMin = managementConfig.ageExtensionMinutes ?? 45;
+    const ceilingMin = maxAge + maxExt * extMin;
+    // Hard ceiling: once every grace block is spent, close unconditionally.
+    if (ageMin >= ceilingMin) {
+      return { action: "CLOSE", rule: 6, reason: `max age reached (${ageHours}h, grace exhausted)` };
+    }
+    // Soft cap: defer the close while the position is still actively earning. Re-checked every
+    // cycle, so it closes the moment earning stops rather than waiting out the full grace block.
+    const lookbackMin = managementConfig.feeGrowthLookbackMinutes ?? 20;
+    const minGrowthSol = managementConfig.feeGrowthMinSol ?? 0.01;
+    if (isOverageStillEarning(position, lookbackMin, minGrowthSol, solPriceUsd, managementConfig)) {
+      const extNum = Math.floor((ageMin - maxAge) / extMin) + 1;
+      log("market_data", `Rule 6 deferred for ${position.pair}: past max age (${ageHours}h) but still earning — grace ${extNum}/${maxExt}`);
+      // fall through: no close this cycle; emergency rules below still apply.
+    } else {
+      return { action: "CLOSE", rule: 6, reason: `max age reached (${ageHours}h, no longer earning)` };
+    }
   }
 
   // Rule 7: volume collapse — pool liquidity drying up with dominant sell pressure
+  // Skip when:
+  //   - OOR ABOVE: price above range, SOL is idle — no capital at risk from a dying pool
+  //   - In range AND PnL >= 0: still earning fees, a volume dip may be temporary
+  //   - Entry accumulation zone: SOL-rich position is absorbing sells, not bleeding out
   if (marketData) {
     const vcCfg = config.emergencyExits.volumeCollapse;
     if (vcCfg.enabled) {
-      const tracked = getTrackedPosition(position.position);
+      const vc7tracked = getTrackedPosition(position.position);
       const ageMin = position.age_minutes ?? 0;
-      const peakVol = tracked?.peak_volume_5m_usd ?? 0;
+      // Reference volume for collapse detection. The all-time peak_volume_5m_usd never decays
+      // and can stay pinned to an early outlier spike, making the collapse threshold relative to
+      // a volume level the pool may not have seen in hours. Prefer a recent rolling-window peak
+      // (last few cycles of volume_history) so the reference tracks the pool's current regime;
+      // fall back to the all-time peak only while history is too sparse to be meaningful.
+      const volHist7 = Array.isArray(vc7tracked?.volume_history) ? vc7tracked.volume_history : [];
+      const recentVols7 = volHist7.map((v) => v?.volume_5m).filter((v) => v != null);
+      const peakVol = recentVols7.length >= 3
+        ? Math.max(...recentVols7)
+        : (vc7tracked?.peak_volume_5m_usd ?? 0);
       const curVol = marketData.volume_5m;
       const sells = marketData.txn_sells_5m;
       const buys = marketData.txn_buys_5m;
+      const oorDir7 = getOorDirection(position);
+      const inRangeAndGreen = position.in_range !== false && (position.pnl_pct ?? 0) >= 0;
+      // Scale sell-pressure threshold with current pool volatility. The screener prefers
+      // volatile tokens (vol>=3), where elevated sells:buys is normal oscillation, not collapse.
+      // Vol <= 2 → 1× (no change). Vol 4 → 1.5× (cap). Requires 3:1 sells instead of 2:1.
+      // live_volatility is refreshed each cycle; falls back to deploy-time value if unavailable.
+      const r7Vol = vc7tracked?.live_volatility ?? vc7tracked?.volatility ?? 0;
+      const volMult7 = r7Vol > 0 ? Math.max(1, Math.min(1.5, r7Vol / 2)) : 1;
+      const effectiveSellRatio7 = vcCfg.sellPressureRatio * volMult7;
+
+      // Depth-aware entry grace (mirrors Rule 8/9): a SOL-rich position experiencing a
+      // volume collapse is still in its token-accumulation phase — not a capital-loss event.
+      // FAIL-SAFE: keep grace active when bin data is unavailable.
+      const binsKnown7 = position.active_bin != null && position.upper_bin != null && position.lower_bin != null;
+      const rangeTotal7 = binsKnown7 ? (position.upper_bin - position.lower_bin) : 0;
+      const depthPct7 = binsKnown7 && rangeTotal7 > 0
+        ? ((position.upper_bin - position.active_bin) / rangeTotal7) * 100
+        : 0;
+      const deployStrategy7 = (vc7tracked?.strategy ?? config.strategy.strategy ?? "curve").toLowerCase();
+      const graceDepth7 = deployStrategy7 === "bid_ask"
+        ? (managementConfig.bidAskEntryGraceDepthPct ?? 80)
+        : (managementConfig.curveEntryGraceDepthPct ?? 50);
+      const confirmMs7 = (managementConfig.entryGraceConfirmMinutes ?? 15) * 60_000;
+      const graceExitedAt7 = vc7tracked?.r9_grace_exited_at;
+      const inEntryAccumulation7 =
+        !binsKnown7 ||
+        (position.in_range !== false && (
+          depthPct7 < graceDepth7 ||
+          graceExitedAt7 == null ||
+          (Date.now() - new Date(graceExitedAt7).getTime()) < confirmMs7
+        ));
+
+      logGraceTransition(7, position, inEntryAccumulation7, graceDetail(binsKnown7, depthPct7, graceDepth7, deployStrategy7));
+
+      // Minimum absolute transaction floor: a sell/buy ratio is meaningless in a near-dead
+      // window (e.g. 1 sell vs 0 buys). Require enough total txns to be a valid signal.
+      const minTxns7 = vcCfg.minSellConfirmTxns ?? 5;
       if (
+        oorDir7 !== "ABOVE" &&
+        !inRangeAndGreen &&
+        !inEntryAccumulation7 &&
         ageMin >= vcCfg.minPositionAgeMin &&
         peakVol >= vcCfg.minPeakVolumeUsd &&
         curVol != null && curVol < peakVol * (vcCfg.dropThresholdPct / 100) &&
-        sells != null && buys != null && sells > buys * vcCfg.sellPressureRatio
+        sells != null && buys != null && (sells + buys) >= minTxns7 && sells > buys * effectiveSellRatio7
       ) {
-        return { action: "CLOSE", rule: 7, reason: "volume collapse" };
+        return { action: "CLOSE", rule: 7, reason: `volume collapse (sells>${effectiveSellRatio7.toFixed(2)}× buys, vol=${r7Vol}×${volMult7.toFixed(2)} depth=${depthPct7.toFixed(0)}% strat=${deployStrategy7})` };
+      }
+    }
+  }
+
+  // Rule 11: liquidity collapse — pool liquidity pulled sharply (classic rug signature).
+  // Unlike Rule 7, does NOT require sell-pressure confirmation: a genuine LP pull can happen
+  // via direct liquidity removal with near-zero swap activity, so requiring buys/sells would
+  // blind us to exactly the fastest, most dangerous rugs. A sharp drop from the recent peak is
+  // sufficient on its own. Skip conditions mirror Rule 7/8/9 (OOR ABOVE, in-range and green,
+  // entry accumulation grace).
+  if (marketData) {
+    const lcCfg = config.emergencyExits.liquidityCollapse;
+    if (lcCfg?.enabled) {
+      const lc11tracked = getTrackedPosition(position.position);
+      const ageMin11 = position.age_minutes ?? 0;
+      const liqHist11 = Array.isArray(lc11tracked?.liquidity_history) ? lc11tracked.liquidity_history : [];
+      const recentLiq11 = liqHist11.map((v) => v?.liquidity_usd).filter((v) => v != null);
+      const peakLiq11 = recentLiq11.length >= 3
+        ? Math.max(...recentLiq11)
+        : (lc11tracked?.peak_liquidity_usd ?? 0);
+      const curLiq11 = marketData.liquidity_usd;
+      const oorDir11 = getOorDirection(position);
+      const inRangeAndGreen11 = position.in_range !== false && (position.pnl_pct ?? 0) >= 0;
+
+      const binsKnown11 = position.active_bin != null && position.upper_bin != null && position.lower_bin != null;
+      const rangeTotal11 = binsKnown11 ? (position.upper_bin - position.lower_bin) : 0;
+      const depthPct11 = binsKnown11 && rangeTotal11 > 0
+        ? ((position.upper_bin - position.active_bin) / rangeTotal11) * 100
+        : 0;
+      const deployStrategy11 = (lc11tracked?.strategy ?? config.strategy.strategy ?? "curve").toLowerCase();
+      const graceDepth11 = deployStrategy11 === "bid_ask"
+        ? (managementConfig.bidAskEntryGraceDepthPct ?? 80)
+        : (managementConfig.curveEntryGraceDepthPct ?? 50);
+      const confirmMs11 = (managementConfig.entryGraceConfirmMinutes ?? 15) * 60_000;
+      const graceExitedAt11 = lc11tracked?.r9_grace_exited_at;
+      const inEntryAccumulation11 =
+        !binsKnown11 ||
+        (position.in_range !== false && (
+          depthPct11 < graceDepth11 ||
+          graceExitedAt11 == null ||
+          (Date.now() - new Date(graceExitedAt11).getTime()) < confirmMs11
+        ));
+
+      logGraceTransition(11, position, inEntryAccumulation11, graceDetail(binsKnown11, depthPct11, graceDepth11, deployStrategy11));
+
+      if (
+        oorDir11 !== "ABOVE" &&
+        !inRangeAndGreen11 &&
+        !inEntryAccumulation11 &&
+        ageMin11 >= (lcCfg.minPositionAgeMin ?? 5) &&
+        peakLiq11 >= (lcCfg.minPeakLiquidityUsd ?? 1000) &&
+        curLiq11 != null && curLiq11 < peakLiq11 * (lcCfg.dropThresholdPct / 100)
+      ) {
+        return { action: "CLOSE", rule: 11, reason: `liquidity collapse ($${curLiq11.toFixed(0)} < ${lcCfg.dropThresholdPct}% of peak $${peakLiq11.toFixed(0)}, depth=${depthPct11.toFixed(0)}% strat=${deployStrategy11})` };
       }
     }
   }
 
   // Rule 8: rapid price dump — sharp 5m drop with negative PnL position
+  // Skip when:
+  //   - OOR ABOVE now: position still idle SOL, the dump IS the entry signal
+  //   - Recently OOR ABOVE (within grace window): bid_ask just entered range from a dump,
+  //     continued dumping = continued token accumulation, not a loss event yet
   if (marketData) {
     const rpCfg = config.emergencyExits.rapidPriceDrop;
     if (rpCfg.enabled) {
-      const priceChange5m = marketData.price_change_5m;
-      const pnlOk = !rpCfg.requireNegativePnl || (!pnlSuspect && (position.pnl_pct ?? 0) < 0);
-      if (priceChange5m != null && priceChange5m < rpCfg.dropPct5m && pnlOk) {
-        return { action: "CLOSE", rule: 8, reason: "rapid dump" };
+      const oorDir8 = getOorDirection(position);
+      const ageOk8 = (position.age_minutes ?? 0) >= (rpCfg.minPositionAgeMin ?? 0);
+      const graceMs8 = (managementConfig.oorAboveGraceMin ?? 15) * 60_000;
+      const recentOorAbove8 = wasRecentlyOorAbove(position.position, graceMs8);
+
+      // Depth-aware entry grace (mirrors Rule 9): a SOL-rich position dumping is
+      // accumulating cheap tokens, not realizing a loss. Suppress Rule 8 while still
+      // in the entry zone. FAIL-SAFE: keep grace active when bin data is unavailable.
+      const rp8tracked = getTrackedPosition(position.position);
+      const binsKnown8 = position.active_bin != null && position.upper_bin != null && position.lower_bin != null;
+      const rangeTotal8 = binsKnown8 ? (position.upper_bin - position.lower_bin) : 0;
+      const depthPct8 = binsKnown8 && rangeTotal8 > 0
+        ? ((position.upper_bin - position.active_bin) / rangeTotal8) * 100
+        : 0;
+      const deployStrategy8 = (rp8tracked?.strategy ?? config.strategy.strategy ?? "curve").toLowerCase();
+      const graceDepth8 = deployStrategy8 === "bid_ask"
+        ? (managementConfig.bidAskEntryGraceDepthPct ?? 80)
+        : (managementConfig.curveEntryGraceDepthPct ?? 50);
+      const confirmMs8 = (managementConfig.entryGraceConfirmMinutes ?? 15) * 60_000;
+      const graceExitedAt8 = rp8tracked?.r9_grace_exited_at;
+      const inEntryAccumulation8 =
+        !binsKnown8 ||
+        (position.in_range !== false && (
+          depthPct8 < graceDepth8 ||
+          graceExitedAt8 == null ||
+          (Date.now() - new Date(graceExitedAt8).getTime()) < confirmMs8
+        ));
+
+      logGraceTransition(8, position, inEntryAccumulation8, graceDetail(binsKnown8, depthPct8, graceDepth8, deployStrategy8));
+
+      if (oorDir8 !== "ABOVE" && !recentOorAbove8 && ageOk8 && !inEntryAccumulation8) {
+        const priceChange5m = marketData.price_change_5m;
+        const priceChange1h = marketData.price_change_1h;
+        const pnlOk = !rpCfg.requireNegativePnl || (!pnlSuspect && (position.pnl_pct ?? 0) < 0);
+        // Scale the 5m drop threshold with current pool volatility. For tokens the screener
+        // deliberately selected for high volatility, a -8% 5m candle is normal oscillation.
+        // Vol <= 2 → 1× (-8%). Vol 4 → 2× (-16%, cap). dropPct5m is negative, so ×mult widens it.
+        // live_volatility is refreshed each cycle; falls back to deploy-time value if unavailable.
+        const r8Vol = rp8tracked?.live_volatility ?? rp8tracked?.volatility ?? 0;
+        const volMult8 = r8Vol > 0 ? Math.max(1, Math.min(2, r8Vol / 2)) : 1;
+        const effectiveDrop5m = rpCfg.dropPct5m * volMult8;
+        // 1h confirmation: if dropPct1h is set, require 1h trend to also be below that threshold.
+        // Prevents closing on a 5m spike-dump while the broader 1h trend is still bullish/flat.
+        const dropPct1h = rpCfg.dropPct1h ?? null;
+        const confirmed1h = dropPct1h == null || priceChange1h == null || priceChange1h <= dropPct1h;
+        if (!confirmed1h) {
+          log("market_data", `Rule 8 skipped: 5m dump ${priceChange5m}% but 1h trend ${priceChange1h}% > threshold ${dropPct1h}% — likely spike, not sustained dump`);
+        } else if (priceChange5m != null && priceChange5m < effectiveDrop5m && pnlOk) {
+          if (rpCfg.requireSellConfirm) {
+            const sells = marketData.txn_sells_5m;
+            const buys = marketData.txn_buys_5m;
+            const ratio = rpCfg.minSellBuyRatio ?? 1.5;
+            // Minimum absolute transaction floor: a sell/buy ratio is meaningless in a
+            // near-dead window (e.g. 2 sells vs 0 buys). Require enough txns to be signal.
+            const minTxns = rpCfg.minSellConfirmTxns ?? 5;
+            if (sells == null || buys == null || (sells + buys) < minTxns || sells <= buys * ratio) {
+              log("market_data", `Rule 8 skipped: price ${priceChange5m}% but sell pressure insufficient (sells=${sells ?? "?"} buys=${buys ?? "?"} total<${minTxns}? minRatio=${ratio})`);
+            } else {
+              return { action: "CLOSE", rule: 8, reason: `rapid dump + sell pressure (sells=${sells} buys=${buys} ratio=${ratio}, drop<${effectiveDrop5m.toFixed(1)}% vol=${rp8tracked?.volatility ?? "?"}×${volMult8.toFixed(2)} depth=${depthPct8.toFixed(0)}% strat=${deployStrategy8})` };
+            }
+          } else {
+            return { action: "CLOSE", rule: 8, reason: `rapid dump (drop<${effectiveDrop5m.toFixed(1)}% vol=${rp8tracked?.volatility ?? "?"}×${volMult8.toFixed(2)} depth=${depthPct8.toFixed(0)}% strat=${deployStrategy8})` };
+          }
+        }
+      }
+    }
+  }
+
+  // Rule 9: sell-pressure streak — fills the gap between acute violence (Rule 7/8) and stop loss (Rule 1)
+  // Catches the slow bleed: 15+ consecutive minutes of sell dominance, no single-candle trigger needed
+  // Skip when OOR ABOVE (now) or recently OOR ABOVE (within grace window): sustained selling
+  // while bid_ask is in its entry phase is exactly the price action we want
+  if (marketData && volumeWindow.length > 0) {
+    const spCfg = config.emergencyExits.sellPressureStreak;
+    if (spCfg?.enabled) {
+      const oorDir9 = getOorDirection(position);
+      const graceMs9 = (managementConfig.oorAboveGraceMin ?? 15) * 60_000;
+      const recentOorAbove9 = wasRecentlyOorAbove(position.position, graceMs9);
+      const streakNeeded = spCfg.streakCount ?? 3;
+      // Scale streak sell:buy ratio with deploy-time volatility. Volatile tokens (screener
+      // prefers vol>=3) naturally produce sell-heavy windows; raise the bar before counting.
+      // Vol <= 3 → 1× (no change). Vol 4.5+ → 1.5× (cap).
+      const sp9tracked = getTrackedPosition(position.position);
+      // live_volatility is refreshed each cycle; falls back to deploy-time value if unavailable.
+      const r9Vol = sp9tracked?.live_volatility ?? sp9tracked?.volatility ?? 0;
+      const volMult9 = r9Vol > 0 ? Math.max(1, Math.min(1.5, r9Vol / 3)) : 1;
+      const ratio = (spCfg.ratio ?? 1.2) * volMult9;
+      const safetyPnlPct = spCfg.safetyPnlPct ?? 5;
+      const minAgeMin = spCfg.minPositionAgeMin ?? 0;
+
+      // Depth-aware entry grace: Rule 9 is suppressed while the position is still in the
+      // SOL-rich zone of the range (significant buying power remaining). Thresholds differ
+      // by strategy: curve concentrates SOL near the top (grace ≤ 35% depth) while bid_ask
+      // distributes heavily toward the bottom (grace ≤ 80% depth).
+      // Once the grace zone is breached, the breach must persist for entryGraceConfirmMinutes
+      // to filter out wick candles that briefly cross the boundary and immediately recover.
+      // FAIL-SAFE: if bin data is unavailable we cannot assess depth — keep grace active
+      // (skip Rule 9) rather than firing blind, so a transient API miss can't force a close.
+      const binsKnown9 = position.active_bin != null && position.upper_bin != null && position.lower_bin != null;
+      const rangeTotal9 = binsKnown9 ? (position.upper_bin - position.lower_bin) : 0;
+      const depthPct9 = binsKnown9 && rangeTotal9 > 0
+        ? ((position.upper_bin - position.active_bin) / rangeTotal9) * 100
+        : 0;
+      const deployStrategy9 = (sp9tracked?.strategy ?? config.strategy.strategy ?? "curve").toLowerCase();
+      const graceDepth9 = deployStrategy9 === "bid_ask"
+        ? (managementConfig.bidAskEntryGraceDepthPct ?? 80)
+        : (managementConfig.curveEntryGraceDepthPct ?? 50);
+      const confirmMs9 = (managementConfig.entryGraceConfirmMinutes ?? 15) * 60_000;
+      const graceExitedAt9 = sp9tracked?.r9_grace_exited_at;
+      const inEntryAccumulation9 =
+        !binsKnown9 ||
+        (position.in_range !== false && (
+          depthPct9 < graceDepth9 ||
+          graceExitedAt9 == null ||
+          (Date.now() - new Date(graceExitedAt9).getTime()) < confirmMs9
+        ));
+
+      // Safety guards: don't exit if we're profiting, price is going up, position is too young,
+      // OOR above (idle SOL), recently transitioned from OOR ABOVE, or still in entry accumulation zone
+      const pnlBelowSafety = (position.pnl_pct ?? 0) < safetyPnlPct;
+      const priceFalling = (marketData.price_change_5m ?? 0) <= 0;
+      const ageOk = (position.age_minutes ?? 0) >= minAgeMin;
+      logGraceTransition(9, position, inEntryAccumulation9, graceDetail(binsKnown9, depthPct9, graceDepth9, deployStrategy9));
+      if (!pnlSuspect && ageOk && !inEntryAccumulation9 && oorDir9 !== "ABOVE" && !recentOorAbove9 && pnlBelowSafety && priceFalling && volumeWindow.length >= streakNeeded) {
+        let streak = 0;
+        for (let i = volumeWindow.length - 1; i >= 0; i--) {
+          const s = volumeWindow[i];
+          const buys = s.buys_5m ?? 0;
+          const sells = s.sells_5m ?? 0;
+          // Require minimum sample size to avoid noise from near-dead pools
+          if (buys + sells >= 5 && sells > buys * ratio) {
+            streak++;
+          } else {
+            break;
+          }
+        }
+        if (streak >= streakNeeded) {
+          return { action: "CLOSE", rule: 9, reason: `sell pressure streak (${streak} windows, ratio>${ratio.toFixed(2)} vol=${sp9tracked?.volatility ?? "?"}×${volMult9.toFixed(2)} depth=${depthPct9.toFixed(0)}% strat=${deployStrategy9})` };
+        }
       }
     }
   }
@@ -1113,7 +2246,8 @@ function describeLatestCandidates(limit = 5) {
 }
 
 function formatWalletStatus(wallet, positions) {
-  const deployAmount = computeDeployAmount(wallet.sol);
+  const openPositionsValueSol = sumOpenPositionsValueSol(positions, wallet.sol_price);
+  const deployAmount = computeDeployAmount(wallet.sol, { openPositionsValueSol });
   const hive = isHiveMindEnabled() ? "on" : "off";
   return [
     `Wallet: ${wallet.sol} SOL ($${wallet.sol_usd})`,
@@ -1405,7 +2539,7 @@ function formatHelpText() {
     "/positions — list open positions",
     "/pool <n> — detailed info for one open position",
     "/close <n> — close one position by index",
-    "/closeall — close all open positions",
+    "/closeall confirm — close all open positions",
     "/set <n> <note> — set note/instruction on position",
     "/config — show important runtime config",
     "/settings — button menu for common config",
@@ -1420,12 +2554,15 @@ function formatHelpText() {
     "/learn [pool] — study top LPers (specific pool or top candidates)",
     "/hive — HiveMind sync status",
     "/hive pull — manual HiveMind pull now",
-    "/test-emergency-exit <n> — simulate emergency exit check for position n (dry run, no close)",
-    "/test-pnl-poll <n> — simulate 30s PnL poll for position n including Rules 7 & 8",
-    "/pause — stop cron cycles",
-    "/resume — start cron cycles again",
-    "/stop — shut down agent",
+    "/check <n> — simulate exit checks for position n (trailing/SL + Rules 1-11, no close)",
+    "/pause — stop new deploys (open positions are still managed)",
+    "/resume — resume deploys",
   ].join("\n");
+}
+
+// Same failure predicate as the management direct-close loop.
+function manualCloseFailed(res) {
+  return !res || !!res.error || !!res.blocked || res.success === false;
 }
 
 async function runDeterministicScreen(limit = 5) {
@@ -1479,7 +2616,9 @@ async function deployLatestCandidate(index) {
       throw new Error(`NO DEPLOY: only cached candidate ${candidate.name} is not worth deploying — ${skipReason}`);
     }
   }
-  const deployAmount = computeDeployAmount((await getWalletBalances()).sol);
+  const [balance, positions] = await Promise.all([getWalletBalances(), getMyPositions({ force: true })]);
+  const openPositionsValueSol = sumOpenPositionsValueSol(positions, balance.sol_price);
+  const deployAmount = computeDeployAmount(balance.sol, { openPositionsValueSol });
   const binsBelow = computeBinsBelow(candidate.volatility);
   const binsAbove = Math.ceil(binsBelow * 0.25);
   const result = await executeTool("deploy_position", {
@@ -1622,42 +2761,9 @@ async function telegramHandler(msg) {
     return;
   }
 
-  const emergencyTestMatch = text.match(/^\/test-emergency-exit\s+(\d+)$/i);
-  if (emergencyTestMatch) {
-    try {
-      const idx = parseInt(emergencyTestMatch[1]) - 1;
-      const { positions } = await getMyPositions({ force: true });
-      if (idx < 0 || idx >= positions.length) { await sendMessage("Invalid number. Use /positions first."); return; }
-      const pos = positions[idx];
-      const md = await fetchPoolMarketData(pos.pool);
-      if (!md) { await sendMessage(`⚠️ DexScreener returned no data for ${pos.pair} (${pos.pool.slice(0, 8)})`); return; }
-      const tracked = getTrackedPosition(pos.position);
-      const rule = getDeterministicCloseRule(pos, config.management, md);
-      const cur = config.management.solMode ? "◎" : "$";
-      const lines = [
-        `🧪 Emergency Exit Simulation: ${pos.pair}`,
-        ``,
-        `Market Data (DexScreener):`,
-        `  vol_5m: ${cur}${md.volume_5m ?? "?"}`,
-        `  price_5m: ${md.price_change_5m != null ? `${md.price_change_5m > 0 ? "+" : ""}${md.price_change_5m}%` : "?"}`,
-        `  buys/sells (5m): ${md.txn_buys_5m ?? "?"}/${md.txn_sells_5m ?? "?"}`,
-        `  liquidity: ${cur}${md.liquidity_usd ?? "?"}`,
-        ``,
-        `Position State:`,
-        `  peak_vol_5m: ${cur}${tracked?.peak_volume_5m_usd ?? "none (first cycle)"}`,
-        `  age: ${pos.age_minutes ?? "?"}m`,
-        `  pnl: ${pos.pnl_pct ?? "?"}%`,
-        ``,
-        rule ? `🔴 WOULD CLOSE — Rule ${rule.rule}: ${rule.reason}` : `🟢 No emergency exit triggered`,
-      ];
-      await sendMessage(lines.join("\n"));
-    } catch (e) {
-      await sendMessage(`Error: ${e.message}`).catch(() => { });
-    }
-    return;
-  }
-
-  const pnlPollTestMatch = text.match(/^\/test-pnl-poll\s+(\d+)$/i);
+  // /check <n>: one simulation for all exit checks. Old names kept as silent aliases
+  // (/test-emergency-exit was a subset of this — Rules 7/8 run inside getDeterministicCloseRule).
+  const pnlPollTestMatch = text.match(/^\/(?:check|test-pnl-poll|test-emergency-exit)\s+(\d+)$/i);
   if (pnlPollTestMatch) {
     try {
       const idx = parseInt(pnlPollTestMatch[1]) - 1;
@@ -1674,8 +2780,8 @@ async function telegramHandler(msg) {
       const hitRateStr = stats.hitRatePct != null ? `${stats.hitRatePct}%` : "n/a";
 
       const tracked = getTrackedPosition(pos.position);
-      const trailingExit = updatePnlAndCheckExits(pos.position, pos, config.management);
-      const closeRule = getDeterministicCloseRule(pos, config.management, md);
+      const trailingExit = updatePnlAndCheckExits(pos.position, pos, config.management, config.marketRegime?._activeRegime ?? "healthy");
+      const closeRule = getDeterministicCloseRule(pos, config.management, md, [], null, config.marketRegime?._activeRegime ?? "healthy");
 
       const mdLines = md ? [
         `DexScreener (${fetchMs < 10 ? `cache HIT` : `cache MISS, ${fetchMs}ms`}):`,
@@ -1716,28 +2822,35 @@ async function telegramHandler(msg) {
       if (idx < 0 || idx >= positions.length) { await sendMessage("Invalid number. Use /positions first."); return; }
       const pos = positions[idx];
       await sendMessage(`Closing ${pos.pair}...`);
-      const result = await closePosition({ position_address: pos.position });
-      if (result.success) {
+      // Same path as the agent (executeTool) so auto-swap to SOL, close notification and a real
+      // close reason all apply — calling closePosition() directly skipped all three.
+      const result = await executeTool("close_position", { position_address: pos.position, reason: "manual close (Telegram /close)" });
+      if (!manualCloseFailed(result)) {
         const closeTxs = result.close_txs?.length ? result.close_txs : result.txs;
-        const claimNote = result.claim_txs?.length ? `\nClaim txs: ${result.claim_txs.join(", ")}` : "";
-        await sendMessage(`✅ Closed ${pos.pair}\nPnL: ${config.management.solMode ? "◎" : "$"}${result.pnl_usd ?? "?"} | close txs: ${closeTxs?.join(", ") || "n/a"}${claimNote}`);
+        const swapNote = result.auto_swap_failed ? "\n⚠️ Auto-swap to SOL failed — token still in wallet" : result.auto_swapped ? "\nToken swapped back to SOL" : "";
+        await sendMessage(`✅ Closed ${pos.pair} | close txs: ${closeTxs?.join(", ") || "n/a"}${swapNote}`);
       } else {
-        await sendMessage(`❌ Close failed: ${JSON.stringify(result)}`);
+        await sendMessage(`❌ Close failed: ${result?.error || result?.reason || JSON.stringify(result)}`);
       }
     } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => { }); }
     return;
   }
 
-  if (text === "/closeall") {
+  const closeAllMatch = text.match(/^\/closeall(\s+confirm)?$/i);
+  if (closeAllMatch) {
     try {
       const { positions } = await getMyPositions({ force: true });
       if (!positions.length) { await sendMessage("No open positions."); return; }
+      if (!closeAllMatch[1]) {
+        await sendMessage(`Ketik /closeall confirm untuk menutup ${positions.length} posisi.`);
+        return;
+      }
       await sendMessage(`Closing ${positions.length} position(s)...`);
       const results = [];
       for (const pos of positions) {
         try {
-          const result = await closePosition({ position_address: pos.position });
-          results.push(`${pos.pair}: ${result.success ? "closed" : `failed (${result.error || "unknown"})`}`);
+          const result = await executeTool("close_position", { position_address: pos.position, reason: "manual close (Telegram /closeall)" });
+          results.push(`${pos.pair}: ${!manualCloseFailed(result) ? "closed" : `failed (${result?.error || result?.reason || "unknown"})`}`);
         } catch (error) {
           results.push(`${pos.pair}: failed (${error.message})`);
         }
@@ -1819,14 +2932,17 @@ async function telegramHandler(msg) {
     return;
   }
 
+  // /pause stops new entries only. It used to stop every cron job including the 30s PnL poll,
+  // which left open positions with no stop-loss / trailing / emergency exits while paused.
   if (text === "/pause") {
-    stopCronJobs();
-    cronStarted = false;
-    await sendMessage("⏸ Paused autonomous cycles. Telegram control still works. Use /resume to start again.").catch(() => { });
+    _entriesPaused = true;
+    await sendMessage("⏸ New deploys paused. Open positions are still managed (SL, trailing, exits). Use /resume to deploy again.").catch(() => { });
     return;
   }
 
   if (text === "/resume") {
+    const wasPaused = _entriesPaused;
+    _entriesPaused = false;
     if (!cronStarted) {
       cronStarted = true;
       timers.managementLastRun = Date.now();
@@ -1834,7 +2950,7 @@ async function telegramHandler(msg) {
       startCronJobs();
       await sendMessage("▶️ Autonomous cycles resumed.").catch(() => { });
     } else {
-      await sendMessage("Autonomous cycles are already running.").catch(() => { });
+      await sendMessage(wasPaused ? "▶️ Deploys resumed." : "Autonomous cycles are already running.").catch(() => { });
     }
     return;
   }
@@ -1998,6 +3114,12 @@ async function telegramHandler(msg) {
     return;
   }
 
+  // Unmatched slash commands (typos, /stop, removed commands) must not start an LLM loop.
+  if (text.startsWith("/")) {
+    await sendMessage(`Unknown command: ${text.split(/\s+/)[0]} — see /help`).catch(() => { });
+    return;
+  }
+
   busy = true;
   let liveMessage = null;
   try {
@@ -2030,28 +3152,23 @@ function fmtPct(value) {
   return Number.isFinite(n) ? `${n.toFixed(2)}%` : "?";
 }
 
-function getLoneCandidateSkipReason({ pool, sw, n, ti } = {}) {
+function getLoneCandidateSkipReason({ pool, sw, n } = {}) {
   if (!pool) return "missing candidate data";
   const smartWalletCount = Math.max(sw?.in_pool?.length ?? 0, Number(pool.gmgn_smart_wallets ?? 0) || 0);
-  const tokenInfo = ti || {};
   const hasNarrative = !!n?.narrative;
-  const globalFeesSol = Number(tokenInfo.global_fees_sol ?? pool.gmgn_total_fee_sol);
-  const top10Pct = Number(tokenInfo.audit?.top_holders_pct ?? pool.gmgn_token_info_top10_pct ?? pool.gmgn_top10_holder_pct);
-  const botPct = Number(tokenInfo.audit?.bot_holders_pct ?? pool.gmgn_bot_degen_pct);
-  if (pool.is_wash) return "wash trading was flagged";
-  if (pool.is_rugpull && smartWalletCount === 0) return "rugpull risk was flagged and no smart wallets offset it";
-  if (pool.is_pvp && smartWalletCount === 0) return "PVP symbol conflict and no smart-wallet confirmation";
-  if (Number.isFinite(globalFeesSol) && globalFeesSol < config.screening.minTokenFeesSol) {
-    return `token fees ${globalFeesSol} SOL below minimum ${config.screening.minTokenFeesSol} SOL`;
-  }
-  if (Number.isFinite(top10Pct) && top10Pct > config.screening.maxTop10Pct) {
-    return `top10 concentration ${top10Pct}% above maximum ${config.screening.maxTop10Pct}%`;
-  }
-  if (Number.isFinite(botPct) && botPct > config.screening.maxBotHoldersPct) {
-    return `bot holders ${botPct}% above maximum ${config.screening.maxBotHoldersPct}%`;
-  }
   if (!hasNarrative && smartWalletCount === 0) return "only candidate has no narrative and no smart-wallet confirmation";
   return null;
+}
+
+// Sum open-position value in SOL for equity fair-share sizing. Uses total_value_true_usd
+// (always USD, regardless of solMode) ÷ sol_price. Returns 0 if data is missing so the
+// caller's equity degrades conservatively to wallet-only.
+function sumOpenPositionsValueSol(positions, solPrice) {
+  const price = Number(solPrice);
+  if (!Number.isFinite(price) || price <= 0) return 0;
+  const list = positions?.positions ?? [];
+  const usd = list.reduce((sum, p) => sum + (Number(p?.total_value_true_usd ?? p?.total_value_usd) || 0), 0);
+  return usd > 0 ? usd / price : 0;
 }
 
 function computeBinsBelow(volatility) {
@@ -2194,7 +3311,7 @@ Commands:
       await runBusy(async () => {
         console.log("\nAgent is picking and deploying...\n");
         const { content: reply } = await agentLoop(
-          `get_top_candidates and deploy only if a candidate is clearly worth it. If there is only one weak candidate, report NO DEPLOY. For a valid deploy, use amount_y=${DEPLOY}, amount_x=0, bins_below from positive volatility, and bins_above=~25% of bins_below (capped at 30%). Execute now, don't ask.`,
+          `get_top_candidates and deploy only if a candidate is clearly worth it. If there is only one weak candidate, report NO DEPLOY. For a valid deploy, use amount_y=${DEPLOY}, amount_x=0. Compute bins_below and bins_above using the strategy-specific guidance in your system prompt (DEPLOY RULES section). Execute now, don't ask.`,
           config.llm.maxSteps,
           [],
           "SCREENER"

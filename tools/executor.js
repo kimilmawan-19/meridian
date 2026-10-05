@@ -7,6 +7,7 @@ import {
   getPositionPnl,
   claimFees,
   closePosition,
+  partialClosePosition,
   searchPools,
 } from "./dlmm.js";
 import { getWalletBalances, swapToken } from "./wallet.js";
@@ -14,12 +15,13 @@ import { studyTopLPers } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
 import { setPositionInstruction } from "../state.js";
 
-import { getPoolMemory, addPoolNote } from "../pool-memory.js";
+import { getPoolMemory, addPoolNote, forgetPool, clearVolumeSnapshots } from "../pool-memory.js";
 import { addStrategy, listStrategies, getStrategy, setActiveStrategy, removeStrategy } from "../strategy-library.js";
 import { addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-blacklist.js";
 import { blockDev, unblockDev, listBlockedDevs } from "../dev-blocklist.js";
 import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsOnPool } from "../smart-wallets.js";
 import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
+import { fetchPoolMarketData } from "./market-data.js";
 import { config, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW, computeDeployAmount } from "../config.js";
 import { getRecentDecisions } from "../decision-log.js";
 import fs from "fs";
@@ -42,7 +44,7 @@ const TIMEFRAME_MINUTES = {
   "24h": 1440,
 };
 import { log, logAction } from "../logger.js";
-import { notifyDeploy, notifyClose, notifySwap } from "../telegram.js";
+import { notifyDeploy, notifyClose, notifyPartialClose, notifySwap, notifyAutoSwapFailed } from "../telegram.js";
 
 function numberOrNull(value) {
   const n = Number(value);
@@ -150,6 +152,35 @@ async function validateDeployPoolThresholds(args) {
     };
   }
 
+  // Strategy must match volatility band. Curve concentrates SOL near the active bin where
+  // price spends most of its time — best fee capture and lowest bag-holding risk at every
+  // volatility level. bid_ask only pays off on extreme oscillation that genuinely reaches the
+  // deep accumulation skirt; below the floor it strands the bulk of capital in idle bins.
+  //
+  // Exception: top_cluster_trend="bullish" (OKX smart-money buying) signals upward price
+  // pressure where curve goes OOR above quickly. Allow bid_ask down to (curveMaxVol - 1.0)
+  // in that case — but never below 1.5 absolute, where even bid_ask bins go idle.
+  const chosenStrategy = (args.strategy ?? config.strategy.strategy ?? "curve").toLowerCase();
+  const curveMaxVol = numberOrNull(config.strategy.curveMaxVolatility) ?? 3;
+  const bullishOverride = args.top_cluster_trend === "bullish";
+  const bidAskVolFloor = bullishOverride
+    ? Math.max(1.5, curveMaxVol - 1.0)
+    : curveMaxVol;
+  if (chosenStrategy === "spot") {
+    return {
+      pass: false,
+      reason: `strategy="spot" is not used for auto-deploys — curve is strictly better (more fee, less idle capital) at every volatility level. Deploy with strategy="curve".`,
+    };
+  }
+  if (chosenStrategy === "bid_ask" && volatility <= bidAskVolFloor) {
+    return {
+      pass: false,
+      reason: bullishOverride
+        ? `strategy="bid_ask" requested with bullish cluster override, but volatility ${volatility} is still below floor ${bidAskVolFloor.toFixed(1)} (curveMaxVol ${curveMaxVol} − 1.0, min 1.5). Deploy with strategy="curve".`
+        : `Pool ${volatilityTimeframe} volatility ${volatility} is at or below curveMaxVolatility ${curveMaxVol}. Deploy with strategy="curve" (bid_ask strands capital in deep bins that rarely activate at this volatility).`,
+    };
+  }
+
   const actualBinStep = poolDetailBinStep(detail);
   const minStep = numberOrNull(config.screening.minBinStep);
   const maxStep = numberOrNull(config.screening.maxBinStep);
@@ -163,6 +194,23 @@ async function validateDeployPoolThresholds(args) {
     return {
       pass: false,
       reason: `Pool bin_step ${actualBinStep} is above configured maxBinStep ${maxStep}.`,
+    };
+  }
+
+  // fee_per_bin_step guard: bid_ask at wide bins (≥100) with low fee density strands capital
+  // in deep accumulation bins that price rarely reaches. 17 days of data: bid_ask+bin_step≥100
+  // averaged -0.7% to -0.9% PnL over 4 consecutive days (n=46). Force curve in those cases.
+  const feePerBinStep = (feeActiveTvlRatio != null && actualBinStep != null && actualBinStep > 0)
+    ? feeActiveTvlRatio / actualBinStep
+    : null;
+  if (
+    chosenStrategy === "bid_ask" &&
+    actualBinStep != null && actualBinStep >= 100 &&
+    feePerBinStep != null && feePerBinStep < 0.001
+  ) {
+    return {
+      pass: false,
+      reason: `strategy="bid_ask" with bin_step=${actualBinStep} and fee_per_bin_step=${feePerBinStep.toFixed(6)} < 0.001. Fee density too low for bid_ask deep-bin accumulation — use strategy="curve".`,
     };
   }
 
@@ -254,6 +302,7 @@ const toolMap = {
   check_smart_wallets_on_pool: checkSmartWalletsOnPool,
   claim_fees: claimFees,
   close_position: closePosition,
+  partial_close_position: partialClosePosition,
   get_wallet_balance: getWalletBalances,
   swap_token: swapToken,
   get_top_lpers: studyTopLPers,
@@ -298,6 +347,7 @@ const toolMap = {
   remove_strategy:     removeStrategy,
   get_pool_memory: getPoolMemory,
   add_pool_note: addPoolNote,
+  forget_pool: forgetPool,
   add_to_blacklist: addToBlacklist,
   remove_from_blacklist: removeFromBlacklist,
   list_blacklist: listBlacklist,
@@ -335,6 +385,10 @@ const toolMap = {
     const CONFIG_MAP = {
       // screening
       minFeeActiveTvlRatio: ["screening", "minFeeActiveTvlRatio"],
+      minFeePerBinStep: ["screening", "minFeePerBinStep"],
+      entryFlowFilterEnabled: ["screening", "entryFlowFilterEnabled"],
+      entryFlowBlockRegimes: ["screening", "entryFlowBlockRegimes"],
+      entryFlowFilterSmartMoneyOverride: ["screening", "entryFlowFilterSmartMoneyOverride"],
       excludeHighSupplyConcentration: ["screening", "excludeHighSupplyConcentration"],
       minTvl: ["screening", "minTvl"],
       maxTvl: ["screening", "maxTvl"],
@@ -367,6 +421,7 @@ const toolMap = {
       autoSwapAfterClaim: ["management", "autoSwapAfterClaim"],
       outOfRangeBinsToClose: ["management", "outOfRangeBinsToClose"],
       outOfRangeWaitMinutes: ["management", "outOfRangeWaitMinutes"],
+      outOfRangeWaitMinutesAbove: ["management", "outOfRangeWaitMinutesAbove"],
       oorCooldownTriggerCount: ["management", "oorCooldownTriggerCount"],
       oorCooldownHours: ["management", "oorCooldownHours"],
       repeatDeployCooldownEnabled: ["management", "repeatDeployCooldownEnabled"],
@@ -391,9 +446,22 @@ const toolMap = {
       // risk
       maxPositions: ["risk", "maxPositions"],
       maxDeployAmount: ["risk", "maxDeployAmount"],
+      maxSwapAmount: ["risk", "maxSwapAmount"],
+      swapSlippageBps: ["risk", "swapSlippageBps"],
+      // market regime
+      cautionMaxPositions: ["marketRegime", "cautionMaxPositions"],
+      cautionScreeningMult: ["marketRegime", "cautionScreeningMult"],
+      cautionPositionSizeMult: ["marketRegime", "cautionPositionSizeMult"],
+      bearishScoreThreshold: ["marketRegime", "bearishScoreThreshold"],
+      cautionScoreThreshold: ["marketRegime", "cautionScoreThreshold"],
+      marketRegimeCautionSlMult: ["management", "marketRegimeCautionSlMult"],
+      marketRegimeBearishSlMult: ["management", "marketRegimeBearishSlMult"],
+      marketRegimeCautionTrailMult: ["management", "marketRegimeCautionTrailMult"],
+      marketRegimeBearishTrailMult: ["management", "marketRegimeBearishTrailMult"],
       // schedule
       managementIntervalMin: ["schedule", "managementIntervalMin"],
       screeningIntervalMin: ["schedule", "screeningIntervalMin"],
+      screeningIntervalNoPositionMin: ["schedule", "screeningIntervalNoPositionMin"],
       healthCheckIntervalMin: ["schedule", "healthCheckIntervalMin"],
       // models
       managementModel: ["llm", "managementModel"],
@@ -408,6 +476,12 @@ const toolMap = {
       minBinsBelow: ["strategy", "minBinsBelow"],
       maxBinsBelow: ["strategy", "maxBinsBelow"],
       defaultBinsBelow: ["strategy", "defaultBinsBelow"],
+      bidAskMinVolatility: ["strategy", "bidAskMinVolatility"],
+      curveMaxVolatility: ["strategy", "curveMaxVolatility"],
+      // entry grace
+      curveEntryGraceDepthPct:  ["management", "curveEntryGraceDepthPct"],
+      bidAskEntryGraceDepthPct: ["management", "bidAskEntryGraceDepthPct"],
+      entryGraceConfirmMinutes: ["management", "entryGraceConfirmMinutes"],
       // hivemind
       hiveMindUrl: ["hiveMind", "url"],
       hiveMindApiKey: ["hiveMind", "apiKey"],
@@ -517,6 +591,7 @@ const toolMap = {
     }
     userConfig._lastAgentTune = new Date().toISOString();
     fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify(userConfig, null, 2));
+    try { fs.chmodSync(USER_CONFIG_PATH, 0o600); } catch (_) { /* best-effort on non-POSIX FS */ }
 
     // Restart cron jobs if intervals changed
     const intervalChanged = applied.managementIntervalMin != null || applied.screeningIntervalMin != null;
@@ -544,6 +619,7 @@ const WRITE_TOOLS = new Set([
   "deploy_position",
   "claim_fees",
   "close_position",
+  "partial_close_position",
   "swap_token",
 ]);
 const PROTECTED_TOOLS = new Set([
@@ -580,6 +656,39 @@ export async function executeTool(name, args) {
     }
   }
 
+  // ─── Volatility-adaptive SL: inject when absent, cap when too wide ──────────────
+  // Auto-SL computes the loosest acceptable stop for the pool's volatility tier.
+  // - If the LLM omitted sl_pct → inject the auto-SL value.
+  // - If the LLM set a WIDER (more negative) stop than auto-SL → cap it. A token in
+  //   distribution should not be allowed to bleed past the tier limit (WOC -22.9% with a
+  //   self-set -25% stop is exactly the failure this prevents; auto-SL -12% would have cut it).
+  // - If the LLM set a TIGHTER stop → keep it (high-conviction override is allowed).
+  if (name === "deploy_position" && config.management.autoSlEnabled !== false) {
+    const vol = Number(args.volatility ?? 0);
+    if (Number.isFinite(vol) && vol > 0) {
+      const mgmt = config.management;
+      const lowMax  = mgmt.autoSlLowVolMax  ?? 2;
+      const midMax  = mgmt.autoSlMidVolMax  ?? 4;
+      const floor   = mgmt.stopLossFloorPct   ?? -50;
+      const tightest = mgmt.stopLossTightestPct ?? -8;
+      let autoSl, tier;
+      if (vol <= lowMax)      { autoSl = mgmt.autoSlLowVolPct  ?? -8;  tier = "low";  }
+      else if (vol <= midMax) { autoSl = mgmt.autoSlMidVolPct  ?? -12; tier = "mid";  }
+      else                    { autoSl = mgmt.autoSlHighVolPct ?? -15; tier = "high"; }
+      autoSl = Math.min(tightest, Math.max(floor, autoSl));
+
+      if (args.sl_pct == null) {
+        args.sl_pct = autoSl;
+        log("executor", `Auto-SL: vol=${vol} (${tier}-vol) → sl_pct=${autoSl}%`);
+      } else if (Number(args.sl_pct) < autoSl) {
+        log("executor", `Auto-SL cap: LLM sl_pct=${args.sl_pct}% wider than auto-SL=${autoSl}% (vol=${vol}, ${tier}-vol) → capped to ${autoSl}%`);
+        args.sl_pct = autoSl;
+      } else {
+        log("executor", `Auto-SL: LLM sl_pct=${args.sl_pct}% tighter than auto-SL=${autoSl}% (vol=${vol}, ${tier}-vol) → kept`);
+      }
+    }
+  }
+
   // ─── Execute ──────────────────────────────
   try {
     const result = await fn(args);
@@ -599,8 +708,10 @@ export async function executeTool(name, args) {
         notifySwap({ inputSymbol: args.input_mint?.slice(0, 8), outputSymbol: args.output_mint === "So11111111111111111111111111111111111111112" || args.output_mint === "SOL" ? "SOL" : args.output_mint?.slice(0, 8), amountIn: result.amount_in, amountOut: result.amount_out, tx: result.tx }).catch(() => {});
       } else if (name === "deploy_position") {
         notifyDeploy({ pair: result.pool_name || args.pool_name || args.pool_address?.slice(0, 8), amountSol: args.amount_y ?? args.amount_sol ?? 0, position: result.position, tx: result.txs?.[0] ?? result.tx, priceRange: result.price_range, rangeCoverage: result.range_coverage, binStep: result.bin_step, baseFee: result.base_fee }).catch(() => {});
+        // Clear stale volume snapshots so Rule 9 starts fresh on this pool
+        if (args.pool_address) clearVolumeSnapshots(args.pool_address);
       } else if (name === "close_position") {
-        notifyClose({ pair: result.pool_name || args.position_address?.slice(0, 8), pnlUsd: result.pnl_usd ?? 0, pnlPct: result.pnl_pct ?? 0 }).catch(() => {});
+        notifyClose({ pair: result.pool_name || args.position_address?.slice(0, 8), pnlUsd: result.pnl_usd ?? 0, pnlPct: result.pnl_pct ?? 0, reason: args.reason || result.close_reason || null }).catch(() => {});
         // Note low-yield closes in pool memory so screener avoids redeploying
         if (args.reason && args.reason.toLowerCase().includes("yield")) {
           const poolAddr = result.pool || args.pool_address;
@@ -614,13 +725,43 @@ export async function executeTool(name, args) {
             if (token && token.usd >= 0.10) {
               log("executor", `Auto-swapping ${token.symbol || result.base_mint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to SOL`);
               const swapResult = await swapToken({ input_mint: result.base_mint, output_mint: "SOL", amount: token.balance });
+              // swapToken reports failure as { success:false, error } rather than throwing.
+              if (!swapResult || swapResult.success === false || swapResult.error) throw new Error(swapResult?.error || "swap returned no result");
               // Tell the model the swap already happened so it doesn't call swap_token again
               result.auto_swapped = true;
               result.auto_swap_note = `Base token already auto-swapped back to SOL (${token.symbol || result.base_mint.slice(0, 8)} → SOL). Do NOT call swap_token again.`;
               if (swapResult?.amount_out) result.sol_received = swapResult.amount_out;
             }
           } catch (e) {
+            // Surface the failure to the model: the base token is still sitting in the wallet,
+            // so the next deploy would see an understated SOL balance and size down (or fail
+            // minSolToOpen). Tell the agent to recover the SOL with a manual swap.
             log("executor_warn", `Auto-swap after close failed: ${e.message}`);
+            notifyAutoSwapFailed({ pair: result.pool_name || args.position_address?.slice(0, 8), mint: result.base_mint, error: e.message }).catch(() => {});
+            result.auto_swapped = false;
+            result.auto_swap_failed = true;
+            result.auto_swap_note = `Auto-swap of base token (${result.base_mint.slice(0, 8)}) back to SOL FAILED: ${e.message}. The base token is still in the wallet — call swap_token (input_mint=base_mint, output_mint=SOL) to recover SOL before deploying again.`;
+          }
+        }
+      } else if (name === "partial_close_position" && result.success) {
+        notifyPartialClose({ pair: result.pool_name || args.position_address?.slice(0, 8), pct: result.pct, lockedUsd: result.locked_usd ?? 0, peakPct: result.peak_pnl_pct ?? null }).catch(() => {});
+        // Auto-swap the scaled-out base token back to SOL so it is immediately redeployable.
+        if (!args.skip_swap && result.base_mint) {
+          try {
+            const balances = await getWalletBalances({});
+            const token = balances.tokens?.find(t => t.mint === result.base_mint);
+            if (token && token.usd >= 0.10) {
+              log("executor", `Auto-swapping partial scale-out ${token.symbol || result.base_mint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to SOL`);
+              const swapResult = await swapToken({ input_mint: result.base_mint, output_mint: "SOL", amount: token.balance });
+              if (!swapResult || swapResult.success === false || swapResult.error) throw new Error(swapResult?.error || "swap returned no result");
+              result.auto_swapped = true;
+              result.auto_swap_note = `Scaled-out base token already auto-swapped back to SOL. Do NOT call swap_token again. The runner (remaining position) is still open with a tightened trailing stop.`;
+            }
+          } catch (e) {
+            log("executor_warn", `Auto-swap after partial close failed: ${e.message}`);
+            notifyAutoSwapFailed({ pair: result.pool_name || args.position_address?.slice(0, 8), mint: result.base_mint, error: e.message }).catch(() => {});
+            result.auto_swap_failed = true;
+            result.auto_swap_note = `Auto-swap of scaled-out base token FAILED: ${e.message}. Call swap_token (input_mint=base_mint, output_mint=SOL) to recover SOL.`;
           }
         }
       } else if (name === "claim_fees" && config.management.autoSwapAfterClaim && result.base_mint) {
@@ -801,9 +942,14 @@ async function runSafetyChecks(name, args) {
           };
         }
         // Prevent LLM from deploying significantly less than computeDeployAmount recommends.
-        // Allows 10% rounding tolerance (e.g. 0.13 computed → 0.12 minimum accepted).
-        const expectedDeploy = computeDeployAmount(balance.sol);
-        const minAcceptable = parseFloat((expectedDeploy * 0.9).toFixed(2));
+        // Use the same equity fair-share inputs as the screener prompt (open-position value +
+        // shared regime via config.marketRegime._activeRegime) so this guard stays consistent.
+        // 15% tolerance absorbs position-value drift between prompt-time and guard-time.
+        const openPosUsd = (positions?.positions ?? []).reduce(
+          (sum, p) => sum + (Number(p?.total_value_true_usd ?? p?.total_value_usd) || 0), 0);
+        const openPositionsValueSol = balance.sol_price > 0 ? openPosUsd / balance.sol_price : 0;
+        const expectedDeploy = computeDeployAmount(balance.sol, { openPositionsValueSol });
+        const minAcceptable = parseFloat((expectedDeploy * 0.85).toFixed(2));
         if (amountY < minAcceptable) {
           return {
             pass: false,
@@ -812,12 +958,40 @@ async function runSafetyChecks(name, args) {
         }
       }
 
+      // Reject deploy if price is actively pumping — bid_ask single-sided SOL will go OOR ABOVE immediately
+      if (config.strategy.strategy === "bid_ask" && isSingleSidedSol) {
+        const PUMP_GUARD_PCT = 8;
+        try {
+          const md = await fetchPoolMarketData(args.pool_address);
+          const price5m = md?.price_change_5m;
+          if (price5m != null && price5m > PUMP_GUARD_PCT) {
+            return {
+              pass: false,
+              reason: `Price is actively pumping (+${price5m.toFixed(1)}% in 5m) — bid_ask position would go out-of-range above immediately. Wait for price to stabilise.`,
+            };
+          }
+        } catch (_) {
+          // Market data unavailable — proceed, don't block on best-effort check
+        }
+      }
+
       return { pass: true };
     }
 
     case "swap_token": {
-      // Basic check — prevent swapping when DRY_RUN is true
-      // (handled inside swapToken itself, but belt-and-suspenders)
+      if (!(args.amount > 0)) {
+        return { pass: false, reason: "swap_token amount must be a positive number." };
+      }
+      const solMint = config.tokens.SOL;
+      const inputIsSol = args.input_mint === solMint || args.input_mint === "SOL";
+      // Only cap when SOL is leaving the wallet — swapping a stray base token back to SOL
+      // (the auto-swap-after-close path) is bounded by the actual token balance already.
+      if (inputIsSol && args.amount > config.risk.maxSwapAmount) {
+        return {
+          pass: false,
+          reason: `Swap amount ${args.amount} SOL exceeds maximum allowed per swap (${config.risk.maxSwapAmount}).`,
+        };
+      }
       return { pass: true };
     }
 
