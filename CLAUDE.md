@@ -15,7 +15,8 @@ state.js            Position registry (state.json): tracks bin ranges, OOR times
 lessons.js          Learning engine: records closed-position perf, derives lessons, evolves thresholds
 pool-memory.js      Per-pool deploy history + snapshots (pool-memory.json)
 strategy-library.js Saved LP strategies (strategy-library.json)
-briefing.js         Daily Telegram briefing (HTML)
+briefing.js         Daily Telegram briefing (text) + shared 24h stats
+report-html.js      HTML report file: morning briefing attachment, /briefing, /viz
 telegram.js         Telegram bot: polling, notifications (deploy/close/swap/OOR)
 hivemind.js         Agent Meridian HiveMind sync
 smart-wallets.js    KOL/alpha wallet tracker (smart-wallets.json)
@@ -232,6 +233,8 @@ Handled directly in `index.js` (bypass LLM):
 | `/set <n> <note>` | Set note on position by list index |
 | `/check <n>` | Simulate exit checks for position n (aliases: `/test-pnl-poll`, `/test-emergency-exit`) |
 | `/pause` / `/resume` | Stop / resume **new deploys** only |
+| `/viz` | HTML report snapshot as one file with a 3-line caption (see "HTML Report") |
+| `/briefing` | Morning briefing text, then the same HTML report as a file |
 
 Full list: `formatHelpText()` in index.js.
 
@@ -249,6 +252,23 @@ Progress bar format: `[████████░░░░░░░░░░░
   - `notifyClose` is muted only while the management cycle's own live message is open (`setCloseNotifyMuted`), since that report lists the closes. A chat or `/learn` live message no longer swallows close notifications.
 - **OOR alerts fire once per out-of-range episode** (`collectOorAlerts`, `_oorNotified`). A position is re-armed when it returns in range. Positions closed in the same cycle are skipped.
 - **Auto-swap after close or partial close.** `swapToken` returns `{ success:false, error }` instead of throwing, so the executor now checks the result. A failure sends `notifyAutoSwapFailed`, which is never suppressed by a live message. Previously a failed swap was marked `auto_swapped: true`, and the failure branch never ran.
+
+---
+
+## HTML Report (report-html.js, since 2026-10-13)
+
+One self-contained `.html` file with three entry points: the morning briefing sends it after the text, `/briefing` sends text + file, `/viz` sends only the file with a 3-line caption (open positions, regime, 24h PnL / closes / win rate). Read-only: it reads `state.json`, `lessons.json`, `decision-log.json` and the position list, and touches no trading logic. Tests: `test:report-html` (data, periods, escaping, drift guard), `test:report-send` (upload, retries, commands, briefing flow).
+
+- **Static file.** Inline CSS, inline SVG charts, no JavaScript, no outside request (font stack is the system one). It was built that way because it is not known how Telegram on a given phone opens an `.html` document. Chart values are `<title>` tooltips plus a table under each chart. Light and dark follow `prefers-color-scheme`. About 150 KB with all periods (4,000 closes: 116 KB, built in about 30 ms).
+- **Period selector without JS.** Radio buttons + CSS: every period is rendered into the file and the checked one is shown. Periods: 1 day, 7, 30, 60 days (default), "Sejak 30 Sep" (`SINCE_FIX`, the exit-fix date, for the 2026-10-16 evaluation), all. Free date ranges are not possible without JS. Bars are hourly for 1 day, daily up to 31 days, weekly beyond. Days are WIB calendar days; the 1-day period is a rolling 24h with clock-hour buckets (first bucket partial). The current day counts in 7 days and up.
+- **Same numbers as the text.** `collectBriefingStats()` (briefing.js) computes the 24h figures once for both; the report's 1-day panel is the same window (`recorded_at` in the last 24h). "Dibuka / ditutup" come from `state.json` positions, as the text always did.
+- **Open positions** use `getMyPositions()` without `force` (cache TTL 5 min, refreshed by the 30s poll), so there is normally no extra RPC call. If the call throws or returns `error`, the report says live data is unavailable and shows cards from `state.json` without PnL. Stop loss comes from `effectiveStopLossPct` with the live regime. The trailing levels are a copy of the formula in `updatePnlAndCheckExits` (`trailingLevels`): "Trailing" is where the trigger starts, "Lantai give-back" is the level that closes at once in range. `test:report-html` [2] compares both against the real function, so a change to the trailing rules there fails the test.
+- **Decisions come from `decision-log.json`, which keeps the newest 100 entries.** Live that is roughly a day or less, so the timeline can start later than 24h ago; the report says so when the log is full and its oldest entry is newer than the window. Deploy entries only carry strategy, SOL, volatility and fee/TVL; the candidate rank is joined from `signal_snapshot` in `state.json` (kept 7 days). Why a pool was picked and which candidates were rejected are not stored, except the `rejected` list of a "No candidates available" entry. Consecutive identical skips are grouped (`Skip ×N`).
+- **Delivery and failure.** `sendDocument` (telegram.js) uploads multipart with the same network retry as `postTelegram` (1s, 3s); a caption Telegram rejects (400) is resent once as plain text; other HTTP errors are not retried. In `runBriefing` the date is stamped right after the **text** is sent, and the file is best-effort and only logged (`HTML report failed`): a file failure must never leave the date unset, or the 6h watchdog would resend the text. `/viz` and `/briefing` reply with the reason when the file fails.
+- **Commands.** `/viz` is answered before the busy gate (read-only, no LLM, no state writes), so it does not queue behind a screening or management cycle; `/briefing` stays behind it. A 30s cooldown is shared by both (`reportCooldownLeftMs`), plus a busy flag. Only the configured chat can send commands (`isAuthorizedIncomingMessage`).
+- **Lessons in the briefing text were shortened.** The block used to list every lesson of the last 24h in full (110–240 chars each, no cap). Per-close lessons are written for closes with PnL ≥ +5% (or ≥ 0 with fee yield ≥ 2%) or < −5%, and `AGGREGATE` lessons (strategy × bin_step statistics, up to 4) are recomputed every 20 closes with a fresh `created_at`, so they counted as "new" almost every day. Now the text shows `Lessons: N new (type counts)`, the two lessons with the largest |PnL| cut at a word boundary (about 90 chars; operator-written and auto-evolved lessons always first), and a pointer to the report. `AGGREGATE` is not counted in the text; the report lists the per-close lessons in full and the aggregates as a small table. The real number of lessons per day was estimated from the code, not measured: count them with `node -e "const L=JSON.parse(require('fs').readFileSync('lessons.json','utf8')).lessons;const c=Date.now()-864e5;const r=L.filter(l=>Date.parse(l.created_at)>c);const by={};for(const l of r){const k=(l.tags||[]).includes('aggregate')?'AGGREGATE':String(l.rule).split(':')[0];by[k]=(by[k]||0)+1}console.log(r.length,by)"`.
+- **Known quirk, not changed:** a negative net PnL prints as `$-23.39` in the text, because the `+` is added only for non-negative values.
+- **Check at the 2026-10-16 evaluation:** the morning files arrived (log lines `HTML report sent` vs `HTML report failed`); file size in the log; whether the decision-log window covers 24h (the report note appears when it does not; raising `MAX_DECISIONS` in decision-log.js is a one-number change); the real lessons-per-day count above; whether `/viz` is used (then consider `/viz 7` to open on another period, which only changes the checked radio).
 
 ---
 

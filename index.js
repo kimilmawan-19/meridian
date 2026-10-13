@@ -19,6 +19,7 @@ import {
   sendMessage,
   sendMessageWithButtons,
   sendHTML,
+  sendDocument,
   editMessage,
   editMessageWithButtons,
   answerCallbackQuery,
@@ -30,6 +31,7 @@ import {
   setCloseNotifyMuted,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
+import { generateReport } from "./report-html.js";
 import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop, batchUpdateMarketData, batchUpdateLiveVolatility, getOorDirection, wasRecentlyOorAbove, updateR9GraceZone, isInEntryAccumulation, effectiveStopLossPct, recordTpVeto, resetTpVeto, markTaExitTriggered } from "./state.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote, addVolumeSnapshot, getVolumeWindow, getSnapshotWindow } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
@@ -213,10 +215,75 @@ export async function runBriefing() {
         return;
       }
     }
+    // "Sent today" is decided by the text alone. The HTML report below is best-effort: it must never
+    // leave the date unset, or the 6h watchdog would resend the text briefing.
     setLastBriefingDate();
+    if (telegramEnabled()) await sendReportFile("briefing");
   } catch (error) {
     log("cron_error", `Morning briefing failed: ${error.message}`);
   }
+}
+
+// ─── HTML report (morning briefing, /briefing, /viz) ───────────────────────────────────────────────
+// One file, three entry points: the morning briefing sends it after the text (best-effort), /briefing
+// sends text + file, /viz sends the file alone with a short caption. Read-only: it only reads state.json,
+// lessons.json, decision-log.json and the cached position list (getMyPositions without force, TTL 5 min,
+// refreshed by the 30s PnL poll), so it adds no RPC call in the usual case.
+const REPORT_COOLDOWN_MS = 30_000; // shared by /briefing and /viz so alternating them does not bypass it
+let _reportLastAt = 0;
+let _reportBusy = false;
+
+export function reportCooldownLeftMs(now = Date.now()) {
+  return Math.max(0, _reportLastAt + REPORT_COOLDOWN_MS - now);
+}
+
+/**
+ * Build the report and upload it. Never throws. `replyOnError` sends the reason to the chat (manual
+ * commands); the morning briefing only logs it. Returns true when Telegram accepted the file.
+ */
+export async function sendReportFile(mode, { replyOnError = false, getPositions = getMyPositions } = {}) {
+  try {
+    let positions = null; // null → the report says live data is unavailable instead of "no positions"
+    try {
+      const res = await getPositions();
+      if (res && !res.error && Array.isArray(res.positions)) positions = res.positions;
+    } catch (e) {
+      log("report_warn", `Live positions unavailable for the report: ${e.message}`);
+    }
+    const { html, fileName, caption } = generateReport({ mode, positions });
+    const sent = await sendDocument(html, fileName, caption);
+    if (!sent) throw new Error("Telegram did not accept the file (see telegram_error in the log)");
+    log("cron", `HTML report sent: ${fileName} (${Math.round(Buffer.byteLength(html) / 1024)} KB)`);
+    return true;
+  } catch (e) {
+    log("cron_error", `HTML report failed: ${e.message}`);
+    if (replyOnError) await sendMessage(`⚠️ Gagal mengirim file laporan: ${e.message}`).catch(() => { });
+    return false;
+  }
+}
+
+/** Telegram /viz (file only) and /briefing (text, then file). */
+export async function handleReportCommand(command, { getPositions } = {}) {
+  if (_reportBusy) {
+    await sendMessage("Laporan sebelumnya masih dibuat. Tunggu sebentar.").catch(() => { });
+    return false;
+  }
+  const left = reportCooldownLeftMs();
+  if (left > 0) {
+    await sendMessage(`Tunggu ${Math.ceil(left / 1000)} detik sebelum meminta laporan lagi.`).catch(() => { });
+    return false;
+  }
+  _reportBusy = true;
+  try {
+    if (command === "briefing") await sendHTML(await generateBriefing());
+    await sendReportFile(command === "viz" ? "viz" : "briefing", { replyOnError: true, getPositions });
+  } catch (e) {
+    await sendMessage(`Error: ${e.message}`).catch(() => { });
+  } finally {
+    _reportLastAt = Date.now();
+    _reportBusy = false;
+  }
+  return true;
 }
 
 /**
@@ -2547,7 +2614,8 @@ function formatHelpText() {
     "/screen — refresh deterministic candidate list",
     "/candidates — show latest cached candidates",
     "/deploy <n> — deploy candidate by cached index",
-    "/briefing — morning briefing",
+    "/briefing — morning briefing (text + HTML report)",
+    "/viz — HTML report snapshot (positions, decisions, performance)",
     "/thresholds — show current screening thresholds + performance summary",
     "/evolve — evolve thresholds from closed position performance data",
     "/performance — detailed analysis of all closed positions",
@@ -2679,6 +2747,11 @@ async function telegramHandler(msg) {
     await showSettingsMenu().catch((e) => sendMessage(`Settings error: ${e.message}`).catch(() => { }));
     return;
   }
+  // Read-only, no LLM and no state writes: answer right away instead of queueing behind a cycle.
+  if (text === "/viz") {
+    await handleReportCommand("viz");
+    return;
+  }
   if (_managementBusy || _screeningBusy || busy) {
     if (_telegramQueue.length < 5) {
       _telegramQueue.push(msg);
@@ -2690,12 +2763,7 @@ async function telegramHandler(msg) {
   }
 
   if (text === "/briefing") {
-    try {
-      const briefing = await generateBriefing();
-      await sendHTML(briefing);
-    } catch (e) {
-      await sendMessage(`Error: ${e.message}`).catch(() => { });
-    }
+    await handleReportCommand("briefing");
     return;
   }
 

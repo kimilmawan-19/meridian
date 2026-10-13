@@ -202,6 +202,42 @@ export async function sendHTML(html) {
   return last;
 }
 
+// Upload a file (the HTML report) as a document. multipart/form-data with the same network-retry
+// policy as postTelegram: a dropped connection is retried after 1s and 3s, an HTTP error is not.
+// A caption Telegram rejects (400, e.g. broken HTML) is resent once as plain text.
+// Returns Telegram's response, or null on failure.
+export async function sendDocument(content, filename, caption = "") {
+  if (!TOKEN || !chatId) return null;
+  let plainCaption = false;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      // A FormData body is consumed by fetch, so it is rebuilt for every attempt.
+      const form = new FormData();
+      form.append("chat_id", chatId);
+      if (caption) {
+        form.append("caption", (plainCaption ? htmlToPlain(caption) : String(caption)).slice(0, 1024));
+        if (!plainCaption) form.append("parse_mode", "HTML");
+      }
+      form.append("document", new Blob([content], { type: "text/html; charset=utf-8" }), filename);
+      const res = await fetch(`${BASE}/sendDocument`, { method: "POST", body: form });
+      if (!res.ok) {
+        const err = await res.text();
+        log("telegram_error", `sendDocument ${res.status}: ${err.slice(0, 200)}`);
+        if (res.status === 400 && caption && !plainCaption) { plainCaption = true; attempt--; continue; }
+        return null;
+      }
+      return await res.json();
+    } catch (e) {
+      if (attempt < NETWORK_RETRY_DELAYS_MS.length) {
+        await sleep(NETWORK_RETRY_DELAYS_MS[attempt]);
+        continue;
+      }
+      log("telegram_error", `sendDocument failed: ${e.message}`);
+      return null;
+    }
+  }
+}
+
 export async function editMessage(text, messageId) {
   if (!TOKEN || !chatId || !messageId) return null;
   return postTelegram("editMessageText", {
