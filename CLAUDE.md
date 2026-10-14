@@ -227,7 +227,7 @@ Handled directly in `index.js` (bypass LLM):
 
 | Command | Action |
 |---------|--------|
-| `/positions` | List open positions with progress bar |
+| `/positions` | List open positions, one line each, then a total across all of them (value, PnL, unclaimed fees) |
 | `/close <n>` | Close position by list index |
 | `/closeall confirm` | Close all positions (bare `/closeall` only asks for confirmation) |
 | `/set <n> <note>` | Set note on position by list index |
@@ -251,6 +251,7 @@ Progress bar format: `[████████░░░░░░░░░░░
   - `postTelegram` retries network failures (`fetch` threw) after 1s and then 3s. `sendChatAction` is not retried, and neither are HTTP errors. The server's route to Telegram drops often: 23 `sendMessage failed` in 3 days.
   - `notifyClose` is muted only while the management cycle's own live message is open (`setCloseNotifyMuted`), since that report lists the closes. A chat or `/learn` live message no longer swallows close notifications.
 - **OOR alerts fire once per out-of-range episode** (`collectOorAlerts`, `_oorNotified`). A position is re-armed when it returns in range. Positions closed in the same cycle are skipped.
+- **`/positions` ends with a total line** (`formatPositionsMessage`, index.js): `Total (3): $402.70 | PnL: -$0.90 | fees: $4.20`, in ◎ with 4 decimals when `solMode` is on. A position with a missing figure is left out of the sum and counted as `data kurang: N posisi`, so a gap never reads as zero. The total sums the listed positions, while the header count is the `total_positions` the caller passes. Test: `test:positions-total`.
 - **Auto-swap after close or partial close.** `swapToken` returns `{ success:false, error }` instead of throwing, so the executor now checks the result. A failure sends `notifyAutoSwapFailed`, which is never suppressed by a live message. Previously a failed swap was marked `auto_swapped: true`, and the failure branch never ran.
 
 ---

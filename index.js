@@ -2312,6 +2312,33 @@ function describeLatestCandidates(limit = 5) {
   return `Latest candidates (${_latestCandidates.length}) — updated ${age}\n\n${lines.join("\n")}`;
 }
 
+/**
+ * Telegram /positions message: one line per open position, then the total across all of them
+ * (value, PnL, unclaimed fees). Amounts are in SOL when solMode is on, otherwise USD. A position with a
+ * missing figure is left out of that sum and counted in "data kurang", so a gap never reads as zero.
+ */
+export function formatPositionsMessage(positions, totalPositions = positions.length, { solMode = false } = {}) {
+  const cur = solMode ? "◎" : "$";
+  const decimals = solMode ? 4 : 2;
+  const round = (v) => Math.round(v * 10 ** decimals) / 10 ** decimals; // also strips float noise from the sum
+  const signed = (v) => (v >= 0 ? `+${cur}${v}` : `-${cur}${Math.abs(v)}`);
+  const lines = positions.map((p, i) => {
+    const pnl = signed(p.pnl_usd);
+    const age = p.age_minutes != null ? `${p.age_minutes}m` : "?";
+    const oor = !p.in_range ? " ⚠️OOR" : "";
+    return `${i + 1}. ${p.pair} | ${cur}${p.total_value_usd} | PnL: ${pnl} | fees: ${cur}${p.unclaimed_fees_usd} | ${age}${oor}`;
+  });
+  const keys = ["total_value_usd", "pnl_usd", "unclaimed_fees_usd"];
+  const have = (v) => v != null && Number.isFinite(Number(v));
+  const total = (key) => round(positions.reduce((sum, p) => sum + (have(p[key]) ? Number(p[key]) : 0), 0));
+  const incomplete = positions.filter((p) => keys.some((k) => !have(p[k]))).length;
+  const fixed = (v) => `${cur}${Math.abs(v).toFixed(decimals)}`; // totals keep a fixed number of decimals
+  const pnlTotal = total("pnl_usd");
+  const totalLine = `Total (${positions.length}): ${fixed(total("total_value_usd"))} | PnL: ${pnlTotal >= 0 ? "+" : "-"}${fixed(pnlTotal)} | fees: ${fixed(total("unclaimed_fees_usd"))}`
+    + (incomplete ? ` | data kurang: ${incomplete} posisi` : "");
+  return `📊 Open Positions (${totalPositions}):\n\n${lines.join("\n")}\n────────────────\n${totalLine}\n\n/close <n> to close | /set <n> <note> to set instruction`;
+}
+
 function formatWalletStatus(wallet, positions) {
   const openPositionsValueSol = sumOpenPositionsValueSol(positions, wallet.sol_price);
   const deployAmount = computeDeployAmount(wallet.sol, { openPositionsValueSol });
@@ -2794,14 +2821,7 @@ async function telegramHandler(msg) {
     try {
       const { positions, total_positions } = await getMyPositions({ force: true });
       if (total_positions === 0) { await sendMessage("No open positions."); return; }
-      const cur = config.management.solMode ? "◎" : "$";
-      const lines = positions.map((p, i) => {
-        const pnl = p.pnl_usd >= 0 ? `+${cur}${p.pnl_usd}` : `-${cur}${Math.abs(p.pnl_usd)}`;
-        const age = p.age_minutes != null ? `${p.age_minutes}m` : "?";
-        const oor = !p.in_range ? " ⚠️OOR" : "";
-        return `${i + 1}. ${p.pair} | ${cur}${p.total_value_usd} | PnL: ${pnl} | fees: ${cur}${p.unclaimed_fees_usd} | ${age}${oor}`;
-      });
-      await sendMessage(`📊 Open Positions (${total_positions}):\n\n${lines.join("\n")}\n\n/close <n> to close | /set <n> <note> to set instruction`);
+      await sendMessage(formatPositionsMessage(positions, total_positions, { solMode: config.management.solMode }));
     } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => { }); }
     return;
   }
