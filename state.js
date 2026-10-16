@@ -16,6 +16,8 @@ const STATE_FILE = "./state.json";
 
 const MAX_RECENT_EVENTS = 20;
 const MAX_INSTRUCTION_LENGTH = 280;
+// Shadow break-even levels recorded per position (record-only; live breakEvenTriggerPct is 5).
+const BE_PROBE_LEVELS = [1, 2, 3];
 
 function sanitizeStoredText(text, maxLen = MAX_INSTRUCTION_LENGTH) {
   if (text == null) return null;
@@ -130,6 +132,8 @@ export function trackPosition({
     confirmed_trailing_exit_until: null,
     trailing_active: false,
     break_even_active: false,
+    // Record-only: what a break-even armed at 1/2/3% would have done (see updatePnlAndCheckExits).
+    be_probe: {},
     top_cluster_trend: top_cluster_trend ?? null,
     // Layer B: per-position risk overrides (raw; clamped at read time)
     sl_pct_override: sl_pct_override ?? null,
@@ -752,6 +756,29 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
     pos.break_even_active = true;
     changed = true;
     log("state", `Position ${position_address} break-even stop activated (confirmed peak: ${pos.peak_pnl_pct}%)`);
+  }
+
+  // Record-only shadow break-even (2026-10-16). Live breakEvenTriggerPct is 5, where trailing
+  // always closes first, so break-even never closed a position and peaks of 1–3% had no
+  // protection. For each level, arm on the same condition as the real break-even above; the first
+  // reading at PnL <= 0 afterwards is the one Rule 1 would close on. No exit reads this.
+  if (pos.be_probe && !pnl_pct_suspicious && currentPnlPct != null) {
+    const nowIso = new Date().toISOString();
+    for (const level of BE_PROBE_LEVELS) {
+      const key = String(level);
+      let probe = pos.be_probe[key];
+      if (!probe && (pos.peak_pnl_pct ?? 0) >= level && oorDirForBreakEven !== "ABOVE") {
+        probe = { armed_at: nowIso, hit_at: null, hit_pnl: null, hit_in_range: null };
+        pos.be_probe[key] = probe;
+        changed = true;
+      }
+      if (probe && probe.hit_at == null && currentPnlPct <= 0) {
+        probe.hit_at = nowIso;
+        probe.hit_pnl = Math.round(currentPnlPct * 100) / 100;
+        probe.hit_in_range = in_range ?? null;
+        changed = true;
+      }
+    }
   }
 
   // Update OOR state

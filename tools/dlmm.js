@@ -1918,6 +1918,8 @@ export async function closePosition({ position_address, reason }) {
             // allTimeWithdrawals, which accumulates partial withdrawals; do NOT re-add).
             partial_taken_count: tracked.partial_taken_count ?? 0,
             partial_taken_pct:   tracked.partial_taken_pct   ?? 0,
+            // Record-only shadow break-even at 1/2/3% (state.js updatePnlAndCheckExits).
+            be_probe:            tracked.be_probe            ?? null,
           });
         } catch (e) {
           log("close_warn", `recordPerformance (relay) failed — close succeeded but not recorded: ${e.message}`);
@@ -2258,6 +2260,8 @@ export async function closePosition({ position_address, reason }) {
           // allTimeWithdrawals, which accumulates partial withdrawals; do NOT re-add).
           partial_taken_count: tracked.partial_taken_count ?? 0,
           partial_taken_pct:   tracked.partial_taken_pct   ?? 0,
+          // Record-only shadow break-even at 1/2/3% (state.js updatePnlAndCheckExits).
+          be_probe:            tracked.be_probe            ?? null,
         });
       } catch (e) {
         log("close_warn", `recordPerformance (SDK) failed — close succeeded but not recorded: ${e.message}`);
