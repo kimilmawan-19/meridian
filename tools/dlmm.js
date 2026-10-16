@@ -946,6 +946,8 @@ export async function cleanupOrphanPosition(pool, positionPubKey, wallet,
 }
 
 const POSITIONS_CACHE_TTL = 5 * 60_000; // 5 minutes
+// A PnL reading of <= -99% on a position younger than this is treated as not yet indexed.
+const UNINDEXED_PNL_MAX_AGE_MIN = 10;
 
 let _positionsCache = null;
 let _positionsCacheAt = 0;
@@ -1301,8 +1303,18 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
         const pnlPctDiff = reportedPnlPct != null && derivedPnlPct != null
           ? Math.abs(reportedPnlPct - derivedPnlPct)
           : null;
-        const pnlPctSuspicious = pnlPctDiff != null && pnlPctDiff > (config.management.pnlSanityMaxDiffPct ?? 5);
-        if (pnlPctSuspicious) {
+        const ageMinutes = binData?.createdAt ? Math.floor((Date.now() - binData.createdAt * 1000) / 60000) : ageFromState;
+        // Right after a deploy the PnL API can return a reading before the position's balance (or
+        // deposit) is indexed: PnL reads -100%, and the derived value is -100% too (or null), so the
+        // diff check below passes. Live: 6 early-dump stop losses at age 0 in 12 days, 2 executed
+        // (CLAUDIA, QI closed at ~0%). Such a reading is treated as missing PnL for this tick.
+        const pnlUnindexed = reportedPnlPct != null && reportedPnlPct <= -99 &&
+          ageMinutes != null && ageMinutes < UNINDEXED_PNL_MAX_AGE_MIN;
+        if (pnlUnindexed) {
+          log("positions_warn", `Unindexed PnL reading for ${positionAddress.slice(0, 8)}: reported ${reportedPnlPct.toFixed(2)}% at age ${ageMinutes}m — PnL ignored this tick`);
+        }
+        const pnlPctSuspicious = pnlUnindexed || (pnlPctDiff != null && pnlPctDiff > (config.management.pnlSanityMaxDiffPct ?? 5));
+        if (pnlPctSuspicious && !pnlUnindexed) {
           log("positions_warn", `Suspicious pnl_pct for ${positionAddress.slice(0, 8)}: reported=${reportedPnlPct.toFixed(2)} derived=${derivedPnlPct.toFixed(2)} diff=${pnlPctDiff.toFixed(2)}`);
         }
 
@@ -1361,7 +1373,8 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
             : binData
             ? Math.round(parseFloat(binData.allTimeFees?.total?.usd || 0) * 10000) / 10000
             : null,
-          pnl_usd:            lpData
+          pnl_usd:            pnlUnindexed ? null
+            : lpData
             ? Math.round((
                 config.management.solMode
                   ? safeNum(lpData.pnl?.valueNative)
@@ -1370,12 +1383,13 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
             : binData
             ? Math.round(parseFloat(config.management.solMode ? (binData.pnlSol || 0) : (binData.pnlUsd || 0)) * 10000) / 10000
             : null,
-          pnl_true_usd:       lpData
+          pnl_true_usd:       pnlUnindexed ? null
+            : lpData
             ? Math.round(safeNum(lpData.pnl?.value) * 10000) / 10000
             : binData
             ? Math.round(parseFloat(binData.pnlUsd || 0) * 10000) / 10000
             : null,
-          pnl_pct:            (lpData || binData)
+          pnl_pct:            (lpData || binData) && !pnlUnindexed
             ? Math.round(reportedPnlPct * 100) / 100
             : null,
           pnl_pct_derived:    derivedPnlPct != null ? Math.round(derivedPnlPct * 100) / 100 : null,
@@ -1389,7 +1403,7 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
           fee_per_tvl_24h:    binData
             ? Math.round(parseFloat(binData.feePerTvl24h || 0) * 100) / 100
             : null,
-          age_minutes:        binData?.createdAt ? Math.floor((Date.now() - binData.createdAt * 1000) / 60000) : ageFromState,
+          age_minutes:        ageMinutes,
           minutes_out_of_range: minutesOutOfRange(positionAddress),
           instruction:        tracked?.instruction ?? null,
         });

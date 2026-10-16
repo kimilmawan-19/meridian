@@ -41,6 +41,8 @@ const gap = formatPositionsMessage([pos("A", 100, 5, 1), { pair: "B", total_valu
 check("known figures are still summed (value 170, PnL 5, fees 1.50)", totalOf(gap).startsWith("Total (3): $170.00 | PnL: +$5.00 | fees: $1.50"), totalOf(gap));
 check("positions with a gap are counted (2)", totalOf(gap).endsWith("| data kurang: 2 posisi"), totalOf(gap));
 check("complete data → no 'data kurang' note", !totalOf(msg).includes("data kurang"));
+check("a position line with null PnL prints 'PnL: ?', not '+$null'", gap.includes("2. B | $50 | PnL: ? | fees: $0.5"), gap);
+check("null fees print '?' too; no 'null' anywhere", gap.includes("3. C | $20 | PnL: ? | fees: ? |") && !gap.includes("null"), gap);
 
 console.log("\n[5] header uses the count the caller passes");
 check("total_positions differs from the list length → header follows the caller, total follows the list", formatPositionsMessage([pos("A", 1, 0, 0)], 3).startsWith("📊 Open Positions (3):") && totalOf(formatPositionsMessage([pos("A", 1, 0, 0)], 3)).startsWith("Total (1)"));

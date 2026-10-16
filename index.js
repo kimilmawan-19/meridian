@@ -2322,11 +2322,13 @@ export function formatPositionsMessage(positions, totalPositions = positions.len
   const decimals = solMode ? 4 : 2;
   const round = (v) => Math.round(v * 10 ** decimals) / 10 ** decimals; // also strips float noise from the sum
   const signed = (v) => (v >= 0 ? `+${cur}${v}` : `-${cur}${Math.abs(v)}`);
+  // null: PnL API missing data, or a reading not yet indexed after deploy (tools/dlmm.js)
+  const amt = (v) => (v != null ? `${cur}${v}` : "?");
   const lines = positions.map((p, i) => {
-    const pnl = signed(p.pnl_usd);
+    const pnl = p.pnl_usd != null ? signed(p.pnl_usd) : "?";
     const age = p.age_minutes != null ? `${p.age_minutes}m` : "?";
     const oor = !p.in_range ? " ⚠️OOR" : "";
-    return `${i + 1}. ${p.pair} | ${cur}${p.total_value_usd} | PnL: ${pnl} | fees: ${cur}${p.unclaimed_fees_usd} | ${age}${oor}`;
+    return `${i + 1}. ${p.pair} | ${amt(p.total_value_usd)} | PnL: ${pnl} | fees: ${amt(p.unclaimed_fees_usd)} | ${age}${oor}`;
   });
   const keys = ["total_value_usd", "pnl_usd", "unclaimed_fees_usd"];
   const have = (v) => v != null && Number.isFinite(Number(v));

@@ -32,6 +32,7 @@
     "test:report-html": "node test/test-report-html.mjs",
     "test:report-send": "node test/test-report-send.mjs",
     "test:positions-total": "node test/test-positions-total.mjs",
+    "test:unindexed-pnl": "node test/test-unindexed-pnl.mjs",
     "test:grace-log": "node test/test-grace-log.mjs",
     "test:pool-cooldown": "node test/test-pool-cooldown-reasons.mjs",
     "test:hivemind-prompt": "node test/test-hivemind-prompt.mjs",
