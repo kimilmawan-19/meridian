@@ -724,7 +724,7 @@ export async function executeTool(name, args) {
             const token = balances.tokens?.find(t => t.mint === result.base_mint);
             if (token && token.usd >= 0.10) {
               log("executor", `Auto-swapping ${token.symbol || result.base_mint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to SOL`);
-              const swapResult = await swapToken({ input_mint: result.base_mint, output_mint: "SOL", amount: token.balance });
+              const swapResult = await swapToken({ input_mint: result.base_mint, output_mint: "SOL", amount: token.balance, expected_usd: token.usd, sol_usd: balances.sol_price });
               // swapToken reports failure as { success:false, error } rather than throwing.
               if (!swapResult || swapResult.success === false || swapResult.error) throw new Error(swapResult?.error || "swap returned no result");
               // Tell the model the swap already happened so it doesn't call swap_token again
@@ -752,7 +752,7 @@ export async function executeTool(name, args) {
             const token = balances.tokens?.find(t => t.mint === result.base_mint);
             if (token && token.usd >= 0.10) {
               log("executor", `Auto-swapping partial scale-out ${token.symbol || result.base_mint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to SOL`);
-              const swapResult = await swapToken({ input_mint: result.base_mint, output_mint: "SOL", amount: token.balance });
+              const swapResult = await swapToken({ input_mint: result.base_mint, output_mint: "SOL", amount: token.balance, expected_usd: token.usd, sol_usd: balances.sol_price });
               if (!swapResult || swapResult.success === false || swapResult.error) throw new Error(swapResult?.error || "swap returned no result");
               result.auto_swapped = true;
               result.auto_swap_note = `Scaled-out base token already auto-swapped back to SOL. Do NOT call swap_token again. The runner (remaining position) is still open with a tightened trailing stop.`;
@@ -770,7 +770,7 @@ export async function executeTool(name, args) {
           const token = balances.tokens?.find(t => t.mint === result.base_mint);
           if (token && token.usd >= 0.10) {
             log("executor", `Auto-swapping claimed ${token.symbol || result.base_mint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to SOL`);
-            await swapToken({ input_mint: result.base_mint, output_mint: "SOL", amount: token.balance });
+            await swapToken({ input_mint: result.base_mint, output_mint: "SOL", amount: token.balance, expected_usd: token.usd, sol_usd: balances.sol_price });
           }
         } catch (e) {
           log("executor_warn", `Auto-swap after claim failed: ${e.message}`);

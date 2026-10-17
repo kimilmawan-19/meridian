@@ -38,6 +38,7 @@
     "test:pool-cooldown": "node test/test-pool-cooldown-reasons.mjs",
     "test:hivemind-prompt": "node test/test-hivemind-prompt.mjs",
     "test:swap-retry": "node test/test-swap-retry.mjs",
+    "test:swap-detail": "node test/test-swap-detail.mjs",
     "test:llm-retry": "node test/test-llm-retry.mjs",
     "test:llm-calls": "node test/test-llm-calls.mjs",
     "test:signal-snapshot": "node test/test-signal-snapshot.mjs",
