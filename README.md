@@ -530,9 +530,8 @@ This analyzes closed position performance (win rate, avg PnL, fee yields) and au
 HiveMind sync uses Agent Meridian at `https://api.agentmeridian.xyz` by default with the built-in public key. Agents can register, pull shared lessons/presets, and push learning events without a separate registration flow.
 
 **What you get:**
-- Shared lessons from other Meridian agents
-- Strategy presets and crowd performance context
-- Role-aware lessons injected into future screener/manager prompts when `hiveMindPullMode` is `auto`
+- Shared lessons from other Meridian agents, pulled into `hivemind-cache.json`. They reach the screener/manager prompts only when `hiveMindLessonsInPrompt` is `true` (off by default, because the pulled text is unvetted)
+- Strategy presets, pulled and cached; nothing in the agent reads them yet
 
 **What you share:**
 - Lessons from `lessons.json`
@@ -553,6 +552,7 @@ Relevant config fields:
 ```json
 {
   "agentId": "",
+  "hiveMindEnabled": true,
   "hiveMindUrl": "",
   "hiveMindApiKey": "",
   "hiveMindPullMode": "auto"
@@ -563,7 +563,9 @@ Blank `hiveMindUrl` and `hiveMindApiKey` values intentionally fall back to the A
 
 ### Disable
 
-There is currently no empty-string disable path for HiveMind; blank values fall back to the built-in Agent Meridian defaults. A true off switch should be implemented as an explicit config flag before documenting HiveMind as disabled by clearing fields.
+Set `"hiveMindEnabled": false` in `user-config.json` and restart. This stops the heartbeat, the lesson and preset pulls, and every push of lessons and closed-position events, and it keeps any cached shared lessons out of the prompt even if `hiveMindLessonsInPrompt` is `true`. Only the JSON value `false` turns it off, so confirm with `/hive`, which then answers `HiveMind: disabled`.
+
+Clearing `hiveMindUrl` or `hiveMindApiKey` does not disable anything: blank values fall back to the built-in Agent Meridian defaults. The `agentId` is still created, because the Agent Meridian relay path sends it. Data already sent stays on the server. The key is not in `update_config`, so the agent cannot change it.
 
 ---
 

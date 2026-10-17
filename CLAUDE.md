@@ -475,6 +475,9 @@ on a shared host could read the wallet private key. Fixed: every write to these 
 (`setup.js` initial write ×2, `telegram.js` `saveChatId`, `tools/executor.js`
 `update_config`, `lessons.js` `evolveThresholds`) is now followed by
 `fs.chmodSync(path, 0o600)` (best-effort, wrapped in try/catch for non-POSIX filesystems).
+One exception (found 2026-10-17, not changed): `hivemind.js` `ensureAgentId` writes `user-config.json`
+without a chmod, only to store a new `agentId`. `writeFileSync` keeps the mode of an existing file,
+so it matters only if the file did not exist yet.
 This only hardens files written by code going forward — if `.env`/`user-config.json` already
 exist with looser permissions from before this patch, run `chmod 600 .env user-config.json`
 once manually after upgrading.
@@ -625,9 +628,21 @@ Agent Meridian HiveMind sync is handled by `hivemind.js`. It uses built-in Agent
 
 **Shared lessons are not injected into the LLM prompt by default.**
 - `getSharedLessonsForPrompt` returns null unless `user-config.json` has `hiveMindLessonsInPrompt: true`.
-- Registration, heartbeat, the lesson/preset pull into `hivemind-cache.json`, and performance push still run.
+- Registration, heartbeat, the lesson/preset pull into `hivemind-cache.json`, and performance push still run unless the off switch below is set.
 - Why: the live cache (2026-09-29) held 12 lessons that were all test data (`TEST-SOL … Reason: test close`, `Tok3-SOL`, `undefined` fields). They appeared in the prompt next to the bot's own lessons with no untrusted label, and the text is unvetted input from an external server (prompt-injection surface).
 - The key is deliberately not in `update_config`'s `CONFIG_MAP`, so the LLM cannot re-enable it. Test: `test:hivemind-prompt`.
+
+**Off switch (since 2026-10-17): `hiveMindEnabled: false` in `user-config.json`.** Test: `test:hivemind-switch`.
+- Default on, so nothing changes until the key is set. Only the JSON value `false` turns it off (the string `"false"` does not). `/hive`, the wallet status and the config snapshot show the state.
+- Off means no heartbeat, no lesson/preset pull, no push of lessons or close events (`isHiveMindEnabled()` is the one gate every request function already checked), and cached shared lessons stay out of the prompt even with `hiveMindLessonsInPrompt: true`. `ensureAgentId` still runs: the Agent Meridian relay sends the `agentId` (relay flag `lpAgentRelayEnabled`, code default false).
+- Like `hiveMindLessonsInPrompt`, it is not in `update_config`'s `CONFIG_MAP`, so the LLM cannot flip it. Set it by editing the file and restarting; back the file up first (the backup holds `llmApiKey`).
+- **The code change does not turn it off.** The user sets the key on the server. Before that, check that the relay is off (`grep -c '"lpAgentRelayEnabled": *true' user-config.json` prints 0), because the code does not show whether the server requires HiveMind registration for relay orders. Data already sent stays on the server.
+
+**What HiveMind gives the bot (code reading, 2026-10-17; no server log was available): nothing measurable.**
+- Pulled lessons are not in the prompt (above); presets are cached and never read (only `hivemind.js` touches `.presets`); the README's "crowd performance context" had no code behind it. Push and heartbeat give the bot nothing back.
+- Cost: about 300 requests a day (96 heartbeat ticks × 3 calls with `pullMode` auto, plus about 23 close pushes; derived from the 15-minute constant and the close rate, not from logs), and data leaving the server. What is sent is a whitelist, not a copy of the record, so new fields such as `be_probe` stay local. Per close: pool, pool name, base mint, strategy, close reason, PnL ($ and %), fees ($ and SOL), minutes held. Per lesson: rule text, tags, role, outcome, pool, `initialValueUsd`, PnL %, fees $, range efficiency, close reason; manual and "[self-tuned]" lessons are pushed too (`addLesson`). No wallet address, key or balance.
+- Not measured: what the live cache holds today (last seen 2026-09-29: test data), any benefit on the server side, and whether results differed with and without it. Even good shared lessons would be advisory prompt text; the 60-day data put the leak in exits, which are deterministic rules that do not read lessons, and entry features other than fee/TVL did not separate winners from losers.
+- **Observed, not changed: `includes("oor")` also matches "floor".** The pattern is in `hivemind.js` `shouldCountInAdjustedWinRate` and in `pool-memory.js` `isOorCloseReason` / `isAdjustedWinRateExcludedReason`. In-range trailing exits end with "in-range give-back floor X% hit" (`state.js`), so they count as OOR closes. To the server that means "not in the adjusted win rate"; locally they leave the pool's `adjusted_win_rate`, and when the last 3 deploys of one pool all match, the 12h "repeated OOR closes" cooldown can be set (`oorCooldownTriggerCount` / `oorCooldownHours`; code defaults 3 and 12, live values not read). The frequency is not measured. A read-only count would be: closes with "floor" and without "out of range" / "OOR", pools whose last 3 closes all match, and the "repeated OOR closes" log lines. Write the decision rule before running it.
 
 ---
 

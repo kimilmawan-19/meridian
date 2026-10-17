@@ -171,6 +171,7 @@
   },
 
   "telegramChatId": "",
+  "hiveMindEnabled": true,
   "hiveMindUrl": "",
   "hiveMindApiKey": "",
   "hiveMindPullMode": "auto"

@@ -3050,7 +3050,8 @@ async function telegramHandler(msg) {
       const enabled = isHiveMindEnabled();
       const agentId = ensureAgentId();
       if (!enabled) {
-        await sendMessage(`HiveMind: disabled\nAgent ID: ${agentId}\nSet hiveMindApiKey to connect.`).catch(() => { });
+        const hint = config.hiveMind.enabled === false ? "hiveMindEnabled is false in user-config.json." : "Set hiveMindApiKey to connect.";
+        await sendMessage(`HiveMind: disabled\nAgent ID: ${agentId}\n${hint}`).catch(() => { });
         return;
       }
       const isManualPull = text === "/hive pull";

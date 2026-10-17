@@ -85,6 +85,7 @@ export function getHiveMindPullMode() {
 }
 
 export function isHiveMindEnabled() {
+  if (config.hiveMind?.enabled === false) return false;
   return !!(getBaseUrl() && getApiKey());
 }
 
@@ -151,7 +152,7 @@ function normalizeSharedLesson(lesson) {
 }
 
 export function getSharedLessonsForPrompt({ agentType = "GENERAL", maxLessons = 6 } = {}) {
-  if (!config.hiveMind?.lessonsInPrompt) return null;
+  if (!config.hiveMind?.lessonsInPrompt || !isHiveMindEnabled()) return null;
   const role = String(agentType || "GENERAL").toUpperCase();
   const shared = (readCache().sharedLessons || [])
     .map(normalizeSharedLesson)
