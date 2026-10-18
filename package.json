@@ -34,6 +34,7 @@
     "test:positions-total": "node test/test-positions-total.mjs",
     "test:unindexed-pnl": "node test/test-unindexed-pnl.mjs",
     "test:be-probe": "node test/test-be-probe.mjs",
+    "test:sl-probe": "node test/test-sl-probe.mjs",
     "test:grace-log": "node test/test-grace-log.mjs",
     "test:pool-cooldown": "node test/test-pool-cooldown-reasons.mjs",
     "test:hivemind-prompt": "node test/test-hivemind-prompt.mjs",

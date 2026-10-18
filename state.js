@@ -18,6 +18,9 @@ const MAX_RECENT_EVENTS = 20;
 const MAX_INSTRUCTION_LENGTH = 280;
 // Shadow break-even levels recorded per position (record-only; live breakEvenTriggerPct is 5).
 const BE_PROBE_LEVELS = [1, 2, 3];
+// Shadow stop levels recorded per position (record-only): the first reading at PnL <= -level.
+const SL_PROBE_LEVELS = [3, 5];
+let slProbeWarned = false;
 
 function sanitizeStoredText(text, maxLen = MAX_INSTRUCTION_LENGTH) {
   if (text == null) return null;
@@ -134,6 +137,8 @@ export function trackPosition({
     break_even_active: false,
     // Record-only: what a break-even armed at 1/2/3% would have done (see updatePnlAndCheckExits).
     be_probe: {},
+    // Record-only: the first reading at -3% / -5% after the stop-loss age gate (see updatePnlAndCheckExits).
+    sl_probe: {},
     top_cluster_trend: top_cluster_trend ?? null,
     // Layer B: per-position risk overrides (raw; clamped at read time)
     sl_pct_override: sl_pct_override ?? null,
@@ -777,6 +782,39 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
         probe.hit_pnl = Math.round(currentPnlPct * 100) / 100;
         probe.hit_in_range = in_range ?? null;
         changed = true;
+      }
+    }
+  }
+
+  // Record-only shadow stop (2026-10-18): the first reading at PnL <= -3% / -5% once the position is
+  // old enough for the real stop loss (same age gate). Peaks of 1–3% have almost no protection
+  // (break-even arms at 5, trailing at 3), and the 2026-10-17 estimate of what a -3% stop would have
+  // saved came from snapshots biased toward stops, so every position is recorded from here on.
+  // Wrapped so a probe bug can never change an exit. No exit reads this.
+  if (pos.sl_probe && !pnl_pct_suspicious && currentPnlPct != null) {
+    try {
+      const slProbeAge = positionData.age_minutes;
+      if (slProbeAge == null || slProbeAge >= (mgmtConfig.minAgeBeforeStopLoss ?? 15)) {
+        const slProbeFee = Number(collected_fees_usd ?? 0) + Number(unclaimed_fees_usd ?? 0);
+        for (const level of SL_PROBE_LEVELS) {
+          const key = String(level);
+          if (pos.sl_probe[key] == null && currentPnlPct <= -level) {
+            pos.sl_probe[key] = {
+              hit_at: new Date().toISOString(),
+              hit_pnl: Math.round(currentPnlPct * 100) / 100,
+              peak: Math.round((pos.peak_pnl_pct ?? 0) * 100) / 100,
+              age_min: slProbeAge ?? null,
+              fee_usd: Number.isFinite(slProbeFee) ? Math.round(slProbeFee * 100) / 100 : null,
+              in_range: in_range ?? null,
+            };
+            changed = true;
+          }
+        }
+      }
+    } catch (err) {
+      if (!slProbeWarned) {
+        slProbeWarned = true;
+        log("state_warn", `sl_probe skipped for ${position_address}: ${err.message}`);
       }
     }
   }

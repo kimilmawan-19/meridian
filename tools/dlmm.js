@@ -1920,6 +1920,8 @@ export async function closePosition({ position_address, reason }) {
             partial_taken_pct:   tracked.partial_taken_pct   ?? 0,
             // Record-only shadow break-even at 1/2/3% (state.js updatePnlAndCheckExits).
             be_probe:            tracked.be_probe            ?? null,
+            // Record-only shadow stop: first reading at -3% / -5% (state.js updatePnlAndCheckExits).
+            sl_probe:            tracked.sl_probe            ?? null,
           });
         } catch (e) {
           log("close_warn", `recordPerformance (relay) failed — close succeeded but not recorded: ${e.message}`);
@@ -2262,6 +2264,8 @@ export async function closePosition({ position_address, reason }) {
           partial_taken_pct:   tracked.partial_taken_pct   ?? 0,
           // Record-only shadow break-even at 1/2/3% (state.js updatePnlAndCheckExits).
           be_probe:            tracked.be_probe            ?? null,
+          // Record-only shadow stop: first reading at -3% / -5% (state.js updatePnlAndCheckExits).
+          sl_probe:            tracked.sl_probe            ?? null,
         });
       } catch (e) {
         log("close_warn", `recordPerformance (SDK) failed — close succeeded but not recorded: ${e.message}`);
