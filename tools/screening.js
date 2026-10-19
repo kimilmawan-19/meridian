@@ -722,26 +722,18 @@ export async function getTopCandidates({ limit = 10 } = {}) {
       if (eligible.length < before) log("screening", `ATH filter removed ${before - eligible.length} pool(s)`);
     }
 
-    // Declining-volume hard filter — a pool whose volume is collapsing is a dying fee
-    // engine. fee/TVL is backward-looking (24h) and can stay attractive while today's
-    // volume evaporates, baiting the LLM into a dead pool. Measured on the volatility
-    // timeframe (>=30m), NOT the noisy 5m screening window. Smart-money presence overrides.
+    // Declining-volume check, record-only since 2026-10-19. Idea: a pool whose volume is
+    // collapsing (measured on the volatility timeframe, >=30m) is a dying fee engine. It never
+    // dropped a pool: condensePool did not keep long_volume_change_pct, so the value read here was
+    // always null. Passing the value through and keeping the drop would have switched on an untested
+    // entry filter, so it only logs which pools it would drop; the value is in signal_snapshot.
     if (config.screening.filterDecliningVolume) {
       const rejectPct = config.screening.volumeCollapseRejectThreshold ?? -50;
-      const before2 = eligible.length;
-      eligible.splice(0, eligible.length, ...eligible.filter((p) => {
+      for (const p of eligible) {
         const vc = p.long_volume_change_pct;
-        if (vc == null) return true;       // no data → fail-open
-        if (vc > rejectPct) return true;   // not collapsing
-        if (p.smart_money_buy || p.kol_in_clusters) {
-          log("screening", `Volume filter: kept ${p.name} despite vol_change ${vc}% (${p.volatility_timeframe}) — smart money present`);
-          return true;
-        }
-        log("screening", `Volume filter: dropped ${p.name} — vol_change ${vc}% over ${p.volatility_timeframe} (limit: ${rejectPct}%)`);
-        pushFilteredReason(filteredOut, p, `volume collapsing ${vc}% over ${p.volatility_timeframe} < ${rejectPct}% limit`);
-        return false;
-      }));
-      if (eligible.length < before2) log("screening", `Volume filter removed ${before2 - eligible.length} pool(s)`);
+        if (vc == null || vc > rejectPct) continue;
+        log("screening", `Volume filter (record-only): would drop ${p.name} — vol_change ${vc}% over ${p.volatility_timeframe} (limit: ${rejectPct}%)`);
+      }
     }
 
     // Drop any pools whose creator is on the dev blocklist (caught via advanced-info)
@@ -899,6 +891,7 @@ function condensePool(p) {
 
     // Activity trends
     volume_change_pct: fix(p.volume_change_pct, 1),
+    long_volume_change_pct: p.long_volume_change_pct ?? null, // volatility timeframe (>=30m), set in applyVolatilityTimeframe
     fee_change_pct: fix(p.fee_change_pct, 1),
     swap_count: p.swap_count,
     unique_traders: p.unique_traders,

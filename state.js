@@ -219,6 +219,18 @@ export function getOorDirection(p) {
 }
 
 /**
+ * How far price has travelled down into the range, in % (0 = top bin, 100 = bottom bin,
+ * above 100 = below the range, negative = above it). Same formula as isInEntryAccumulation,
+ * but null when the bins are unknown. Record-only (be_probe / sl_probe hits).
+ */
+function rangeDepthPct(p) {
+  if (p?.active_bin == null || p.upper_bin == null || p.lower_bin == null) return null;
+  const total = p.upper_bin - p.lower_bin;
+  if (!(total > 0)) return null;
+  return Math.round(((p.upper_bin - p.active_bin) / total) * 1000) / 10;
+}
+
+/**
  * Returns true if position was observed OOR ABOVE within the given window.
  * Used by Rule 8 (rapid dump) and Rule 9 (sell streak) to skip emergency exits
  * while a bid_ask position is still in its entry phase after a recent OOR ABOVE state.
@@ -781,6 +793,7 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
         probe.hit_at = nowIso;
         probe.hit_pnl = Math.round(currentPnlPct * 100) / 100;
         probe.hit_in_range = in_range ?? null;
+        probe.hit_depth_pct = rangeDepthPct(positionData);
         changed = true;
       }
     }
@@ -806,6 +819,7 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
               age_min: slProbeAge ?? null,
               fee_usd: Number.isFinite(slProbeFee) ? Math.round(slProbeFee * 100) / 100 : null,
               in_range: in_range ?? null,
+              depth_pct: rangeDepthPct(positionData),
             };
             changed = true;
           }

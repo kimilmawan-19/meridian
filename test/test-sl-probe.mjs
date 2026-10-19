@@ -60,6 +60,7 @@ try {
   check("exactly at the gate (15): level 3 recorded with every field",
     a3 && a3.hit_pnl === -4 && a3.age_min === 15 && a3.peak === 0 && a3.fee_usd === 1.25 && a3.in_range === true && typeof a3.hit_at === "string",
     JSON.stringify(a3));
+  check("depth_pct 28.6 in range (bin 150 of 100..170)", a3?.depth_pct === 28.6, JSON.stringify(a3));
   check("level 5 not recorded at -4", probe(A)["5"] == null);
 
   console.log("\n[2] the first reading stays; level 5 is separate");
@@ -102,6 +103,13 @@ try {
   upd(E, -3.456, { age: 70, collected: 0.123, unclaimed: 0.456, inRange: false });
   check("fee_usd = collected + unclaimed rounded to 2 decimals (0.58); in_range false", probe(E)["3"]?.fee_usd === 0.58 && probe(E)["3"].in_range === false, JSON.stringify(probe(E)["3"]));
   check("hit_pnl rounded to 2 decimals (-3.456 -> -3.46)", probe(E)["3"]?.hit_pnl === -3.46, JSON.stringify(probe(E)["3"]));
+  check("depth_pct 114.3 below the range (bin 90)", probe(E)["3"]?.depth_pct === 114.3, JSON.stringify(probe(E)["3"]));
+  const E3 = "SlProbeE3111111111111111111111111111111111";
+  open(E3);
+  const e3data = data(-3.2, { age: 70 });
+  delete e3data.active_bin; // bins unknown
+  state.updatePnlAndCheckExits(E3, e3data, mgmt);
+  check("unknown bins: hit still recorded, depth_pct null", probe(E3)["3"]?.hit_pnl === -3.2 && probe(E3)["3"].depth_pct === null, JSON.stringify(probe(E3)["3"]));
   const E2 = "SlProbeE2111111111111111111111111111111111";
   open(E2);
   const e2data = data(-3.2, { age: 70 });

@@ -1449,6 +1449,18 @@ export async function runScreeningCycle({ silent = false } = {}) {
           active_pct: pool.active_pct ?? null,
           unique_traders: pool.unique_traders ?? null,
           regime_at_entry: config.marketRegime?._activeRegime ?? null,
+          // Record-only (2026-10-19), data already fetched for this candidate: DexScreener 1h/6h price
+          // change and liquidity (curve after a falling coin; thin pools and gap dumps), Meteora volume
+          // change over the volatility timeframe (the declining-volume check, which never dropped a pool),
+          // and Jupiter 1h buy/sell volume, organic buyers and 24h net buyers (token.js gives strings).
+          price_change_1h: md?.price_change_1h ?? null,
+          price_change_6h: md?.price_change_6h ?? null,
+          liquidity_usd: md?.liquidity_usd ?? null,
+          long_volume_change_pct: pool.long_volume_change_pct ?? null,
+          buy_vol_1h: numOrNull(ti?.stats_1h?.buy_vol),
+          sell_vol_1h: numOrNull(ti?.stats_1h?.sell_vol),
+          organic_buyers_1h: numOrNull(ti?.stats_1h?.buyers),
+          net_buyers_24h: numOrNull(ti?.stats_24h_net_buyers),
         });
       }
 
@@ -1777,6 +1789,13 @@ function formatCandidates(candidates) {
 }
 
 // ── Flow-regime helpers ──────────────────────────────────────────────────────
+// Number for a record-only snapshot field; null for missing or non-numeric (Number(null) would be 0).
+function numOrNull(value) {
+  if (value == null || value === "") return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
 // Classify a single timeframe as MARKUP / DISTRIBUTION / EXHAUSTION / CAPITULATION / NEUTRAL.
 // priceChangePct: % move (positive = up). volRatio: current-vol / baseline-vol (>1 = expanding).
 // priceThreshold: minimum absolute % to call the move "directional" (filters out noise).

@@ -64,6 +64,7 @@ try {
   check("levels 2 and 3 not armed", probe(A)?.["2"] == null && probe(A)?.["3"] == null);
   run(-0.4);
   check("first PnL <= 0 stored: hit_pnl -0.4, in range", probe(A)["1"].hit_pnl === -0.4 && probe(A)["1"].hit_in_range === true && probe(A)["1"].hit_at != null, JSON.stringify(probe(A)["1"]));
+  check("hit_depth_pct 28.6 (bin 150 of 100..170)", probe(A)["1"].hit_depth_pct === 28.6, JSON.stringify(probe(A)["1"]));
   check("real break-even is not armed at peak 1.5 (live trigger 5)", state.getTrackedPosition(A)?.break_even_active === false);
 
   console.log("\n[2] deeper reading does not overwrite the first hit");
@@ -108,7 +109,16 @@ try {
   state.updatePnlAndCheckExits(D, data(null), mgmt);
   check("null PnL: nothing recorded", Object.keys(probe(D) ?? {}).length === 0);
 
-  console.log("\n[8] carried into the performance record");
+  console.log("\n[8] depth at the hit when the bins are unknown");
+  const E = "ProbeE111111111111111111111111111111111111";
+  open(E);
+  state.queuePeakConfirmation(E, 1.4, { immediate: true });
+  const eData = data(-0.2);
+  delete eData.lower_bin;
+  state.updatePnlAndCheckExits(E, eData, mgmt);
+  check("hit recorded, hit_depth_pct null", probe(E)?.["1"]?.hit_pnl === -0.2 && probe(E)["1"].hit_depth_pct === null, JSON.stringify(probe(E)));
+
+  console.log("\n[9] carried into the performance record");
   const dlmmSrc = fs.readFileSync(new URL("../tools/dlmm.js", import.meta.url), "utf8");
   check("both recordPerformance calls (relay + SDK) carry be_probe",
     (dlmmSrc.match(/be_probe:\s+tracked\.be_probe\s+\?\? null/g) || []).length === 2);
