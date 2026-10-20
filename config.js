@@ -8,6 +8,8 @@ const DEFAULT_HIVEMIND_URL = "https://api.agentmeridian.xyz";
 const DEFAULT_AGENT_MERIDIAN_API_URL = "https://api.agentmeridian.xyz/api";
 const DEFAULT_AGENT_MERIDIAN_PUBLIC_KEY = "bWVyaWRpYW4taXMtdGhlLWJlc3QtYWdlbnRz";
 const DEFAULT_HIVEMIND_API_KEY = DEFAULT_AGENT_MERIDIAN_PUBLIC_KEY;
+// Receiver of the Jupiter swap (referral) fee. Empty until the owner's referral account exists.
+const DEFAULT_REFERRAL_ACCOUNT = "";
 
 const u = fs.existsSync(USER_CONFIG_PATH)
   ? JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"))
@@ -350,9 +352,13 @@ export const config = {
   jupiter: {
     // Internal Jupiter Ultra settings; override by env only, do not expose in user-config.
     apiKey: process.env.JUPITER_API_KEY ?? "",
+    // Swap fee (Jupiter referral) charged on every Jupiter swap: the auto-swap of the base token
+    // back to SOL after a close, partial close or claim. Shown at startup and in /wallet, and
+    // described in the README ("Fees"). Set JUPITER_REFERRAL_FEE_BPS=0 to turn it off.
+    // Empty account = no fee. Put the address of your own Jupiter referral account here.
     referralAccount:
       process.env.JUPITER_REFERRAL_ACCOUNT ??
-      "9MzhDUnq3KxecyPzvhguQMMPbooXQ3VAoCMPDnoijwey",
+      DEFAULT_REFERRAL_ACCOUNT,
     referralFeeBps: Number(
       process.env.JUPITER_REFERRAL_FEE_BPS ?? 50,
     ),

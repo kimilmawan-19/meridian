@@ -472,6 +472,19 @@ Fixed:
   - **Rule gap found from this result (thresholds unchanged).** With S measured against `jup_in_usd`, S_all and the `price_impact` cross-check of amendment 2 come from the same Jupiter order and are nearly the same number, so that cross-check now adds little; the independent check is [3], where what arrived equalled the quote. S against Jupiter's value measures the swap's own cost (fee, price impact, execution against the quote). It does not measure a gap between the token price the recorded PnL used at close and Jupiter's price at the swap seconds later; the Helius mark was meant to stand in for that price and cannot. Not planned. If it is ever needed, the direct check is the wallet's equity change against the recorded PnL over the same window.
   - Not a slippage conclusion: the 100-swap floor and amendment 5 still apply at the 2026-10-30 evaluation.
 
+## Swap Fee for Shared Copies (config.js, tools/wallet.js, index.js; branch `claude/friend-referral-fee`)
+
+This copy is meant to be given to other people, and the owner collects a Jupiter referral fee on their swaps. The mechanism is the one that already existed (`getJupiterReferralParams` → `referralAccount` / `referralFee` on the Swap V2 `/order`); what changed is who receives it and that it is now visible. Test: `test:swap-fee`.
+
+- **Receiver.** `DEFAULT_REFERRAL_ACCOUNT` at the top of `config.js` is the owner's Jupiter **referral account** address (not a plain wallet: Swap V2 only takes a referral account there). It was the foreign account `9MzhDUnq3KxecyPzvhguQMMPbooXQ3VAoCMPDnoijwey`, so every clone paid a stranger. It is **empty** until the owner has created the referral account and its token accounts; empty means no fee. `JUPITER_REFERRAL_ACCOUNT` in `.env` overrides it. Rate: `JUPITER_REFERRAL_FEE_BPS`, default 50, 0 = off, 50–255 accepted.
+- **Visible.** `describeSwapFee()` (tools/wallet.js) prints `off` or `50 bps on Jupiter swaps → abcd…wxyz`; it is in the startup log (`Swap fee: …`) and `/wallet`. The README has a "Fees" section. Do not hide or obfuscate the fee: a clone's user must be able to see it and where it goes.
+- **Not reachable by the LLM.** Both values are env-only: not in `update_config`'s `CONFIG_MAP`, not in `user-config.json`, no tool changes them.
+- **Not enforceable.** It is client-side code, so a user who edits `config.js` or sets the env to 0 turns it off. That is accepted.
+- **Silent failure to know about.** If the referral token account for the fee mint Jupiter picks (it chooses from its own priority list; start with wSOL, then USDC) does not exist, the order still executes with no fee and no error. `swapToken` logs `swap_warn` "referral fee requested … but order applied …" when `order.feeBps` differs, and `[SWAP_DETAIL]` shows `fee_bps` (10 without the referral, 50 with it) and `fee_mint`.
+- **Not verified here.** The steps to create the referral account come from search summaries of Jupiter's docs (`referral.jup.ag`, `initializeReferralTokenAccountV2`); the pages were not reachable from the dev sandbox. No real swap with the new account has been run: do one small live swap and check `fee_bps` 50 and the account's balance before handing the copy to anyone.
+- **The owner's own bot** keeps `JUPITER_REFERRAL_FEE_BPS=0` in its `.env` (see the 2026-10-17 decision under the strategy agenda).
+- Considered and not built: a transfer of SOL to a plain wallet (a share of profit). If wanted, charge on net cumulative profit (high-water mark), not per winning position: on the 60-day figures (65.7% wins at +$2.33, losses −$3.57, net +$452) 10% per winning position is about half of the net profit.
+
 ## Secret File Permissions (setup.js, telegram.js, tools/executor.js, lessons.js)
 
 Security-audit finding: `.env` (contains `WALLET_PRIVATE_KEY` and all API keys) and
@@ -680,6 +693,8 @@ Agent Meridian HiveMind sync is handled by `hivemind.js`. It uses built-in Agent
 | `HIVE_MIND_URL` | No | Collective intelligence server |
 | `HIVE_MIND_API_KEY` | No | Hive mind auth token |
 | `HELIUS_API_KEY` | No | Enhanced wallet balance data |
+| `JUPITER_REFERRAL_ACCOUNT` | No | Receiver of the Jupiter swap fee (referral account address); overrides `DEFAULT_REFERRAL_ACCOUNT` in config.js |
+| `JUPITER_REFERRAL_FEE_BPS` | No | Swap fee in bps, default 50 (50–255), 0 = off |
 
 ---
 

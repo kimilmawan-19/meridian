@@ -33,7 +33,7 @@ function getJupiterApiKey() {
   return config.jupiter.apiKey || process.env.JUPITER_API_KEY || DEFAULT_JUPITER_API_KEY;
 }
 
-function getJupiterReferralParams() {
+export function getJupiterReferralParams() {
   const referralAccount = String(config.jupiter.referralAccount || "").trim();
   const referralFee = Number(config.jupiter.referralFeeBps || 0);
   if (!referralAccount || !Number.isFinite(referralFee) || referralFee <= 0) {
@@ -50,6 +50,14 @@ function getJupiterReferralParams() {
     return null;
   }
   return { referralAccount, referralFee: Math.round(referralFee) };
+}
+
+/** One-line description of the swap fee, for the startup log and /wallet. */
+export function describeSwapFee() {
+  const params = getJupiterReferralParams();
+  if (!params) return "off";
+  const a = params.referralAccount;
+  return `${params.referralFee} bps on Jupiter swaps → ${a.slice(0, 4)}…${a.slice(-4)}`;
 }
 
 /**

@@ -41,6 +41,7 @@
     "test:hivemind-switch": "node test/test-hivemind-switch.mjs",
     "test:swap-retry": "node test/test-swap-retry.mjs",
     "test:swap-detail": "node test/test-swap-detail.mjs",
+    "test:swap-fee": "node test/test-swap-fee.mjs",
     "test:llm-retry": "node test/test-llm-retry.mjs",
     "test:llm-calls": "node test/test-llm-calls.mjs",
     "test:signal-snapshot": "node test/test-signal-snapshot.mjs",

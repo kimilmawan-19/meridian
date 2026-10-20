@@ -6,7 +6,7 @@ import { fileURLToPath } from "url";
 import { agentLoop } from "./agent.js";
 import { log } from "./logger.js";
 import { getMyPositions, getActiveBin } from "./tools/dlmm.js";
-import { getWalletBalances } from "./tools/wallet.js";
+import { describeSwapFee, getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates, fetchPoolVolatility, getPoolDetail, dropBelowFeeFloor } from "./tools/screening.js";
 import { assessMarketRegime, isRegimeConfirmed } from "./market-regime.js";
 import { fetchPoolMarketData, getMarketDataStats } from "./tools/market-data.js";
@@ -51,6 +51,7 @@ if (isMain) {
   log("startup", "DLMM LP Agent starting...");
   log("startup", `Mode: ${process.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE"}`);
   log("startup", `Model: ${process.env.LLM_MODEL || "hermes-3-405b"}`);
+  log("startup", `Swap fee: ${describeSwapFee()}`);
   if (configMeta.lastEvolved) {
     log("startup", `⚠️  Screening thresholds were auto-evolved by lessons system on ${configMeta.lastEvolved} (after ${configMeta.positionsAtEvolution ?? "?"} closed positions). Active: minFeeActiveTvlRatio=${config.screening.minFeeActiveTvlRatio}, minOrganic=${config.screening.minOrganic}. If screening returns 0 candidates, these may be too strict — reset manually in user-config.json.`);
   }
@@ -2371,6 +2372,7 @@ function formatWalletStatus(wallet, positions) {
     `Next deploy amount: ${deployAmount} SOL`,
     `Dry run: ${process.env.DRY_RUN === "true" ? "yes" : "no"}`,
     `HiveMind: ${hive}`,
+    `Swap fee: ${describeSwapFee()}`,
   ].join("\n");
 }
 

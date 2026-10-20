@@ -117,10 +117,14 @@ try {
   check("detail carries the caller's pre-swap USD value and SOL price", d1.expected_usd === 76.1 && d1.sol_usd === 152.2);
 
   console.log("\n[3] fee on shows up in the log");
+  // The default referral account may be empty (fee off), so the test sets its own.
+  const savedReferralAccount = config.jupiter.referralAccount;
+  config.jupiter.referralAccount = "So11111111111111111111111111111111111111112";
   config.jupiter.referralFeeBps = 50;
   stub({ order: { outAmount: "1000000", feeBps: 50 }, exec: { status: "Success", signature: "SIG-2", outputAmountResult: "995000" } });
   const r2 = await quiet(() => swapToken({ input_mint: SOL, output_mint: TOKEN, amount: 1 }));
   config.jupiter.referralFeeBps = 0;
+  config.jupiter.referralAccount = savedReferralAccount;
   check("order carries the referral params", /referralAccount=/.test(requests[0].url) && /referralFee=50/.test(requests[0].url));
   lines = detailLines();
   check("second detail line records fee_bps 50 and null caller metadata", r2.success === true && lines.length === 2 && lines[1].fee_bps === 50 && lines[1].expected_usd === null && lines[1].sol_usd === null, JSON.stringify(lines[1]));
