@@ -8,9 +8,10 @@ const DEFAULT_HIVEMIND_URL = "https://api.agentmeridian.xyz";
 const DEFAULT_AGENT_MERIDIAN_API_URL = "https://api.agentmeridian.xyz/api";
 const DEFAULT_AGENT_MERIDIAN_PUBLIC_KEY = "bWVyaWRpYW4taXMtdGhlLWJlc3QtYWdlbnRz";
 const DEFAULT_HIVEMIND_API_KEY = DEFAULT_AGENT_MERIDIAN_PUBLIC_KEY;
-// Receiver of the Jupiter swap (referral) fee: the owner's Jupiter referral account (not a token
-// account). Empty = no fee.
-const DEFAULT_REFERRAL_ACCOUNT = "AcJasKmaSBiZJK7uWE2Ed2HYVd9HT4wK52P5WxPKV5iM";
+// Receiver of the Jupiter swap (referral) fee: the owner's referral account under the Jupiter
+// Ultra project (not a token account, not a referral account of another project: Jupiter rejects
+// the order with a 400 then). Empty = no fee.
+const DEFAULT_REFERRAL_ACCOUNT = "FFb2WG5cE2bVxnuv9gd8x4Pm1FTw47hxbzmWz3fDkw7y";
 
 const u = fs.existsSync(USER_CONFIG_PATH)
   ? JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"))
