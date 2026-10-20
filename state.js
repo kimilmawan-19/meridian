@@ -655,6 +655,21 @@ export function resolvePendingTrailingDrop(position_address, currentPnlPct, trai
 }
 
 /**
+ * What a positive DexScreener 5m price change does to a queued trailing exit (index.js recheck).
+ *   "none"    — no positive 5m change: the PnL recheck decides.
+ *   "cancel"  — price is recovering and the queued PnL is still >= 0: drop the exit (profit zone, unchanged).
+ *   "ignored" — the 5m change is positive but the queued PnL is already below 0: the PnL recheck decides alone.
+ * Live 2026-10-20 (COMPUTE-SOL): the 5m change read +1.58% three times while the position's own PnL made three
+ * new lows (-0.39%, -4.43%, -6.48%). The cancels, and the pending state they leave set, held the exit back for
+ * 10 minutes (closed at -10.14%). Below 0 the trailing exit limits a loss, and the PnL recheck already
+ * rejects a bounce of more than the tolerance, so the lagging 5m figure must not veto it.
+ */
+export function trailingRecheckPriceVerdict(priceChange5m, pendingCurrentPnl) {
+  if (priceChange5m == null || priceChange5m <= 0) return "none";
+  return (pendingCurrentPnl ?? 0) >= 0 ? "cancel" : "ignored";
+}
+
+/**
  * Get all tracked positions (optionally filter open-only).
  */
 export function getTrackedPositions(openOnly = false) {

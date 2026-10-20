@@ -27,6 +27,7 @@
     "test:security-hardening": "node test/test-security-hardening.mjs",
     "test:fee-revenue": "node test/test-fee-revenue.mjs",
     "test:trailing-floor": "node test/test-trailing-floor.mjs",
+    "test:trailing-recheck": "node test/test-trailing-recheck.mjs",
     "test:direct-close": "node test/test-direct-close.mjs",
     "test:telegram-ux": "node test/test-telegram-ux.mjs",
     "test:report-html": "node test/test-report-html.mjs",

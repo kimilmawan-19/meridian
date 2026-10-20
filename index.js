@@ -32,7 +32,7 @@ import {
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
 import { generateReport } from "./report-html.js";
-import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop, batchUpdateMarketData, batchUpdateLiveVolatility, getOorDirection, wasRecentlyOorAbove, updateR9GraceZone, isInEntryAccumulation, effectiveStopLossPct, recordTpVeto, resetTpVeto, markTaExitTriggered } from "./state.js";
+import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop, trailingRecheckPriceVerdict, batchUpdateMarketData, batchUpdateLiveVolatility, getOorDirection, wasRecentlyOorAbove, updateR9GraceZone, isInEntryAccumulation, effectiveStopLossPct, recordTpVeto, resetTpVeto, markTaExitTriggered } from "./state.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote, addVolumeSnapshot, getVolumeWindow, getSnapshotWindow } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
 import { getTokenNarrative, getTokenInfo } from "./tools/token.js";
@@ -173,12 +173,18 @@ function scheduleTrailingDropConfirmation(positionAddress) {
     try {
       // Check price direction first — if price is recovering, cancel trailing exit.
       // A bounce during the 15s window means the drop may be a wick, not a trend reversal.
-      const poolAddress = getTrackedPosition(positionAddress)?.pool;
-      if (poolAddress) {
-        const md = await fetchPoolMarketData(poolAddress).catch(() => null);
-        if (md?.price_change_5m != null && md.price_change_5m > 0) {
+      // Only while the queued PnL is still >= 0: below 0 the exit limits a loss and the lagging 5m
+      // figure must not veto it (COMPUTE-SOL 2026-10-20), so the PnL recheck below decides alone.
+      const tracked = getTrackedPosition(positionAddress);
+      if (tracked?.pool) {
+        const md = await fetchPoolMarketData(tracked.pool).catch(() => null);
+        const verdict = trailingRecheckPriceVerdict(md?.price_change_5m, tracked.pending_trailing_current_pnl_pct);
+        if (verdict === "cancel") {
           log("state", `[Trailing recheck] Price recovering (${md.price_change_5m.toFixed(2)}%) — cancelling trailing exit for ${positionAddress}`);
           return;
+        }
+        if (verdict === "ignored") {
+          log("state", `[Trailing recheck] Price recovering (${md.price_change_5m.toFixed(2)}%) ignored: queued PnL ${tracked.pending_trailing_current_pnl_pct.toFixed(2)}% is below 0, the PnL recheck decides for ${positionAddress}`);
         }
       }
 
