@@ -575,7 +575,7 @@ This copy of the bot charges one fee, and it is not in your PnL numbers.
 
 - **What:** a Jupiter referral fee on every Jupiter swap the bot makes. In practice that is the auto-swap of the base token back to SOL after a close, a partial close or a claim. Deploying, closing and claiming on Meteora cost nothing extra. The fee is charged on the swap amount, whether the position made or lost money.
 - **How much:** `JUPITER_REFERRAL_FEE_BPS`, default `50` (0.5%). Jupiter allows 50 to 255. Jupiter keeps 20% of the fee; the rest goes to the referral account.
-- **Where it goes:** the Jupiter referral account set in `config.js` (`jupiter.referralAccount`), or `JUPITER_REFERRAL_ACCOUNT` in `.env` if you set it. The owner of that account collects it. While the account is empty, no fee is charged.
+- **Where it goes:** the Jupiter referral account set in `config.js` (`jupiter.referralAccount`), or `JUPITER_REFERRAL_ACCOUNT` in `.env` if you set it. The owner of that account collects it. If the account is empty, no fee is charged.
 - **How to see it:** the startup log (`Swap fee: …`) and `/wallet` show whether it is on, the rate and the account. Each swap's `[SWAP_DETAIL]` line in `logs/agent-*.log` shows the fee Jupiter applied (`fee_bps`; with the fee off, Jupiter's own base fee is 10).
 - **How to change it:** set `JUPITER_REFERRAL_FEE_BPS` (0 turns the fee off) and/or `JUPITER_REFERRAL_ACCOUNT` in `.env` and restart. Both are read from the environment only, so the agent cannot change them through `update_config`.
 
