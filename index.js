@@ -2758,8 +2758,10 @@ async function deployLatestCandidate(index) {
     organic_score: candidate.organic_score,
     initial_value_usd: candidate.tvl ?? candidate.active_tvl ?? null,
   });
-  if (result?.success === false || result?.error) {
-    throw new Error(result.error || "Deploy failed");
+  // A blocked result (safety check, or another deploy already running) is not a deploy; it used to
+  // fall through to the "✅ Deployed" message with "Position: n/a".
+  if (result?.success === false || result?.error || result?.blocked) {
+    throw new Error(result.error || result.reason || "Deploy failed");
   }
   return { result, candidate, deployAmount, binsBelow };
 }

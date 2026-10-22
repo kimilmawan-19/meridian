@@ -627,10 +627,45 @@ const PROTECTED_TOOLS = new Set([
   "self_update",
 ]);
 
+// ─── One deploy at a time ─────────────────
+// Two deploy_position calls in one LLM response run in parallel (agent.js: Promise.all). The
+// "one deploy per session" guard there is filled only after a deploy returns, and both safety
+// checks read the same position list before either deploy has landed, so both passed.
+// Live 2026-10-22: two identical CLAUDIA-SOL positions, 1.5 s apart. A second call while one is
+// running is refused; a blocked result does not use up the session's single deploy (agent.js).
+// A lock older than DEPLOY_LOCK_STALE_MS is ignored, so a hung deploy cannot block deploys for good.
+export const DEPLOY_LOCK_STALE_MS = 5 * 60_000;
+let _deployLockSince = null;
+
+export async function runExclusiveDeploy(run, now = Date.now) {
+  const t = now();
+  if (_deployLockSince !== null && t - _deployLockSince < DEPLOY_LOCK_STALE_MS) {
+    log("safety_block", "deploy_position blocked: another deploy_position call is already running");
+    return {
+      blocked: true,
+      reason: "Another deploy_position call is already running. Only one deploy at a time; do not call deploy_position again in this step.",
+    };
+  }
+  _deployLockSince = t;
+  try {
+    return await run();
+  } finally {
+    if (_deployLockSince === t) _deployLockSince = null;
+  }
+}
+
 /**
  * Execute a tool call with safety checks and logging.
+ * deploy_position goes through runExclusiveDeploy; every other tool stays parallel (a chat
+ * "close all" emits several close_position calls at once).
  */
 export async function executeTool(name, args) {
+  const toolName = name.replace(/<.*$/, "").trim();
+  if (toolName !== "deploy_position") return executeToolUnlocked(name, args);
+  return runExclusiveDeploy(() => executeToolUnlocked(name, args));
+}
+
+async function executeToolUnlocked(name, args) {
   const startTime = Date.now();
 
   // Strip model artifacts like "<|channel|>commentary" appended to tool names
