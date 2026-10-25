@@ -254,7 +254,8 @@ try {
   check("the old post-close cache fallback is skipped for a chain-only close", body.includes("if (finalValueUsd === 0 && !closedViaChain) {"));
   check("no record of zeros for a chain-only close without figures",
     body.includes('if (closedViaChain && finalValueUsd === 0) throw new Error("no usable PnL source (close confirmed by the chain only)");'));
-  check("the success result says how it was confirmed", body.includes('...(closedViaChain ? { confirmed_via: "chain" } : {}),'));
+  check("the success result says how it was confirmed, as its first field after success (the action log cuts at 1,000 characters)",
+    /success: true,\n\s+\.\.\.\(closedViaChain \? \{ confirmed_via: "chain" \} : \{\}\),/.test(body));
   check("the decision log mentions it", body.includes('closedViaChain ? "close confirmed by the chain while the open list lagged" : null,'));
 
   console.log("\n[7] the Gato-SOL incident replayed through the helpers");

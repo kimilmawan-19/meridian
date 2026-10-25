@@ -2392,6 +2392,7 @@ export async function closePosition({ position_address, reason }) {
 
       return {
         success: true,
+        ...(closedViaChain ? { confirmed_via: "chain" } : {}), // first: the action log cuts a long result at 1,000 characters
         position: position_address,
         pool: poolAddress,
         pool_name: tracked.pool_name || poolMeta.name || null,
@@ -2401,7 +2402,6 @@ export async function closePosition({ position_address, reason }) {
         pnl_usd: pnlUsd,
         pnl_pct: pnlPct,
         base_mint: closeBaseMint,
-        ...(closedViaChain ? { confirmed_via: "chain" } : {}),
       };
     }
 
