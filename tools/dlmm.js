@@ -952,6 +952,34 @@ const UNINDEXED_PNL_MAX_AGE_MIN = 10;
 let _positionsCache = null;
 let _positionsCacheAt = 0;
 let _positionsInflight = null; // deduplicates concurrent calls
+
+// Meteora's open-position list can keep a position for many minutes after its close txs landed
+// (Gato-SOL 2026-10-18: at least 17 minutes, 34 more close attempts on a closed account). Once a
+// close is confirmed by the chain the address is hidden from getMyPositions for 30 minutes, so the
+// poll, the report and the slot count stop acting on a position that no longer exists.
+export const RECENTLY_CLOSED_MS = 30 * 60_000;
+const _recentlyClosed = new Map(); // position address → { at: epoch ms, hidden: logged once }
+
+export function markRecentlyClosed(address, now = Date.now()) {
+  for (const [key, entry] of _recentlyClosed) {
+    if (now - entry.at >= RECENTLY_CLOSED_MS) _recentlyClosed.delete(key); // expired marks of addresses nobody asks about
+  }
+  _recentlyClosed.set(address, { at: now, hidden: false });
+}
+
+export function isRecentlyClosed(address, now = Date.now()) {
+  const entry = _recentlyClosed.get(address);
+  if (!entry) return false;
+  if (now - entry.at >= RECENTLY_CLOSED_MS) {
+    _recentlyClosed.delete(address);
+    return false;
+  }
+  if (!entry.hidden) {
+    entry.hidden = true;
+    log("positions", `Hiding ${address.slice(0, 8)}: its close is confirmed on-chain but Meteora's open list still shows it`);
+  }
+  return true;
+}
 const LPAGENT_API = "https://api.lpagent.io/open-api/v1";
 // A rejected key stays rejected: live logs had ~3,000 HTTP 401s a day from a stale key.
 let _lpAgentKeyRejected = false;
@@ -1271,6 +1299,7 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
     const positions = [];
     for (const pool of pools) {
       for (const positionAddress of (pool.listPositions || [])) {
+        if (isRecentlyClosed(positionAddress)) continue; // closed on-chain, the list has not caught up
         const tracked = getTrackedPosition(positionAddress);
         const isOOR = pool.outOfRange || pool.positionsOutOfRange?.includes(positionAddress);
 
@@ -1706,6 +1735,58 @@ export async function partialClosePosition({ position_address, pct, reason }) {
 }
 
 // ─── Close Position ────────────────────────────────────────────
+// The chain, not Meteora's indexer list, decides whether a position still exists.
+// Only "no account at all" counts as gone; any other answer, or an RPC error, means unknown.
+export async function positionAccountGone(connection, positionPubKey) {
+  try {
+    return (await connection.getAccountInfo(positionPubKey)) === null;
+  } catch {
+    return false;
+  }
+}
+
+// Verification after the close txs of the SDK path. The open list is read up to `attempts` times;
+// a position missing from it is closed. If the list still shows it (it did for 17+ minutes on
+// 2026-10-18) the account itself is read: no account on-chain means the close landed.
+// The log texts are unchanged on purpose: diag-gato.mjs parses "still appears open after close txs (attempt k/4)".
+export async function verifyPositionClosed({ position_address, positionPubKey, listPositions, connection, attempts = 4, delayMs = 3000 }) {
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      const refreshed = await listPositions();
+      const stillOpen = refreshed?.positions?.some((p) => p.position === position_address);
+      if (!stillOpen) return { closed: true, via: "list" };
+      log("close_warn", `Position ${position_address} still appears open after close txs (attempt ${attempt + 1}/${attempts})`);
+    } catch (e) {
+      log("close_warn", `Close verification failed (attempt ${attempt + 1}/${attempts}): ${e.message}`);
+    }
+    if (attempt < attempts - 1) await new Promise((r) => setTimeout(r, delayMs));
+  }
+  if (await positionAccountGone(connection, positionPubKey)) {
+    log("close_warn", `Position ${position_address} is still in the open list but its account is gone on-chain: the close is confirmed`);
+    return { closed: true, via: "chain" };
+  }
+  return { closed: false, via: null };
+}
+
+// The figures recordPerformance needs (it recomputes pnl = final + fees - initial), taken from a
+// live reading of the position. The initial value is derived from the reading itself, not from
+// tracked.initial_value_usd, which is the LLM's estimate. Earlier partial withdrawals are not known
+// here, so for a partially closed position the derived initial value is too low. Null when the
+// reading cannot support a record, which includes a position value of 0: closePosition uses
+// finalValueUsd === 0 as "no figures yet".
+export function closeFigureFromReading(reading, solMode) {
+  if (!reading || reading.pnl_pct_suspicious) return null;
+  const finalValueUsd = reading.total_value_true_usd ?? reading.total_value_usd;
+  const pnlTrueUsd = reading.pnl_true_usd ?? (solMode ? null : reading.pnl_usd);
+  const pnlUsd = solMode ? reading.pnl_usd : pnlTrueUsd;
+  const pnlPct = reading.pnl_pct;
+  if (![finalValueUsd, pnlTrueUsd, pnlUsd, pnlPct].every((v) => typeof v === "number" && Number.isFinite(v))) return null;
+  const feesUsd = (reading.collected_fees_true_usd || 0) + (reading.unclaimed_fees_true_usd || 0);
+  const initialUsd = finalValueUsd + feesUsd - pnlTrueUsd;
+  if (!(finalValueUsd > 0) || !(initialUsd > 0)) return null;
+  return { pnlUsd, pnlTrueUsd, pnlPct, feesUsd, finalValueUsd, initialUsd };
+}
+
 export async function closePosition({ position_address, reason }) {
   position_address = normalizeMint(position_address);
   if (process.env.DRY_RUN === "true") {
@@ -1713,6 +1794,9 @@ export async function closePosition({ position_address, reason }) {
   }
 
   const tracked = getTrackedPosition(position_address);
+  // The reading the close decision was made on. The refreshes after the close replace the cache
+  // with post-withdrawal data, so this has to be taken before Step 1.
+  const preCloseReading = _positionsCache?.positions?.find((p) => p.position === position_address) ?? null;
 
   try {
     log("close", `Closing position: ${position_address}`);
@@ -2089,26 +2173,19 @@ export async function closePosition({ position_address, reason }) {
     await new Promise(r => setTimeout(r, 5000));
     _positionsCacheAt = 0;
 
-    let closedConfirmed = false;
-    for (let attempt = 0; attempt < 4; attempt++) {
-      try {
-        const refreshed = await getMyPositions({ force: true, silent: true });
-        const stillOpen = refreshed?.positions?.some((p) => p.position === position_address);
-        if (!stillOpen) {
-          closedConfirmed = true;
-          break;
-        }
-        log("close_warn", `Position ${position_address} still appears open after close txs (attempt ${attempt + 1}/4)`);
-      } catch (e) {
-        log("close_warn", `Close verification failed (attempt ${attempt + 1}/4): ${e.message}`);
-      }
-      if (attempt < 3) await new Promise((r) => setTimeout(r, 3000));
-    }
+    const verified = await verifyPositionClosed({
+      position_address,
+      positionPubKey,
+      listPositions: () => getMyPositions({ force: true, silent: true }),
+      connection: getConnection(),
+    });
+    const closedViaChain = verified.via === "chain";
 
-    if (!closedConfirmed) {
-      // sendAndConfirmTransaction already confirmed on-chain, but position still shows in
-      // getMyPositions after retries — likely a cache lag. Untrack it so the bot doesn't
-      // keep managing a stale entry. Don't call recordPerformance (PnL would be all zeros).
+    if (!verified.closed) {
+      // sendAndConfirmTransaction already confirmed on-chain, but the position still shows in
+      // getMyPositions after retries and the chain still has its account (or could not be read).
+      // Untrack it so the bot doesn't keep managing a stale entry. Don't call recordPerformance
+      // (PnL would be all zeros).
       recordClose(position_address, reason || "agent decision");
       appendDecision({
         type: "close",
@@ -2129,6 +2206,16 @@ export async function closePosition({ position_address, reason }) {
         close_txs: closeTxHashes,
         txs: txHashes,
       };
+    }
+
+    if (closedViaChain) {
+      // The chain says the account is gone while Meteora's open list still shows the position.
+      // Untrack it, hide it from the list for 30 minutes (no more close attempts on it) and go on
+      // as for a normal close, so the performance record, the notification and the auto-swap are
+      // not lost (Gato-SOL 2026-10-18).
+      recordClose(position_address, reason || "agent decision");
+      markRecentlyClosed(position_address);
+      _positionsCacheAt = 0; // the cached list still holds it: the next read must fetch again
     }
 
     // Record performance for learning
@@ -2202,8 +2289,17 @@ export async function closePosition({ position_address, reason }) {
       } catch (e) {
         log("close_warn", `Closed PnL fetch failed: ${e.message}`);
       }
+      // Confirmed by the chain only: the open list still showed the position, so the cache now holds
+      // data read after the withdrawal. Use the reading the close decision was made on instead.
+      if (finalValueUsd === 0 && closedViaChain) {
+        const figure = closeFigureFromReading(preCloseReading, config.management.solMode);
+        if (figure) {
+          ({ pnlUsd, pnlTrueUsd, pnlPct, feesUsd, finalValueUsd, initialUsd } = figure);
+          log("close_warn", `Using the reading from before the close: the closed-PnL API has not settled and the open list is stale`);
+        }
+      }
       // Fallback to pre-close cache snapshot if closed API had no data
-      if (finalValueUsd === 0) {
+      if (finalValueUsd === 0 && !closedViaChain) {
         const cachedPos = _positionsCache?.positions?.find(p => p.position === position_address);
         if (cachedPos) {
           pnlTrueUsd    = cachedPos.pnl_true_usd ?? (config.management.solMode ? 0 : cachedPos.pnl_usd) ?? 0;
@@ -2231,6 +2327,8 @@ export async function closePosition({ position_address, reason }) {
       });
 
       try {
+        // A record of zeros would be worse than none (it counts as a 0% close).
+        if (closedViaChain && finalValueUsd === 0) throw new Error("no usable PnL source (close confirmed by the chain only)");
         const quoteMint2 = pool?.lbPair?.tokenYMint?.toString?.() ?? null;
         await recordPerformance({
           position: position_address,
@@ -2282,6 +2380,7 @@ export async function closePosition({ position_address, reason }) {
         risks: [
           minutesOOR > 0 ? `out of range ${minutesOOR}m` : null,
           tracked.volatility != null ? `volatility ${tracked.volatility}` : null,
+          closedViaChain ? "close confirmed by the chain while the open list lagged" : null,
         ].filter(Boolean),
         metrics: {
           pnl_usd: pnlUsd,
@@ -2302,6 +2401,7 @@ export async function closePosition({ position_address, reason }) {
         pnl_usd: pnlUsd,
         pnl_pct: pnlPct,
         base_mint: closeBaseMint,
+        ...(closedViaChain ? { confirmed_via: "chain" } : {}),
       };
     }
 

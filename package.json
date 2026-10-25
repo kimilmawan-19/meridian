@@ -29,6 +29,7 @@
     "test:trailing-floor": "node test/test-trailing-floor.mjs",
     "test:trailing-recheck": "node test/test-trailing-recheck.mjs",
     "test:deploy-lock": "node test/test-deploy-lock.mjs",
+    "test:ghost-close": "node test/test-ghost-close.mjs",
     "test:direct-close": "node test/test-direct-close.mjs",
     "test:telegram-ux": "node test/test-telegram-ux.mjs",
     "test:report-html": "node test/test-report-html.mjs",
