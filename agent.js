@@ -4,7 +4,7 @@ import { buildSystemPrompt } from "./prompt.js";
 import { executeTool } from "./tools/executor.js";
 import { tools } from "./tools/definitions.js";
 
-const MANAGER_TOOLS  = new Set(["close_position", "claim_fees", "swap_token", "get_position_pnl", "get_my_positions", "get_wallet_balance"]);
+const MANAGER_TOOLS  = new Set(["close_position", "partial_close_position", "claim_fees", "swap_token", "get_position_pnl", "get_my_positions", "get_wallet_balance"]);
 const SCREENER_TOOLS = new Set(["deploy_position", "get_active_bin", "get_top_candidates", "check_smart_wallets_on_pool", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "get_pool_memory", "get_wallet_balance", "get_my_positions"]);
 const GENERAL_INTENT_ONLY_TOOLS = new Set([
   "self_update",
@@ -14,6 +14,7 @@ const GENERAL_INTENT_ONLY_TOOLS = new Set([
   "block_deployer",
   "unblock_deployer",
   "add_pool_note",
+  "forget_pool",
   "set_position_note",
   "add_smart_wallet",
   "remove_smart_wallet",
@@ -83,6 +84,15 @@ function getToolsForRole(agentType, goal = "") {
   if (matched.size === 0) return tools.filter(t => !GENERAL_INTENT_ONLY_TOOLS.has(t.function.name));
   return tools.filter(t => matched.has(t.function.name));
 }
+
+// Optional per-call narrowing of the role's tools (e.g. the screening cycle, whose candidates
+// already carry pool memory, smart wallets, active bin and balance).
+export function selectTools(agentType, goal, allowedTools = null) {
+  const roleTools = getToolsForRole(agentType, goal);
+  if (!allowedTools) return roleTools;
+  const allow = new Set(allowedTools);
+  return roleTools.filter(t => allow.has(t.function.name));
+}
 import { getWalletBalances } from "./tools/wallet.js";
 import { getMyPositions } from "./tools/dlmm.js";
 import { log } from "./logger.js";
@@ -137,6 +147,15 @@ function isSystemRoleError(error) {
   return /invalid message role:\s*system/i.test(message);
 }
 
+// OpenRouter reports some provider failures as a 200 body with no choices. "Provider timed out"
+// (~140-175s) is transient but was not retried: 12 in 3 days failed 4 management + 2 screening cycles.
+export function isTransientProviderError(response, attempt) {
+  const code = response?.error?.code;
+  if (code === 502 || code === 503 || code === 529) return true;
+  const isTimeout = code === 408 || code === 504 || /timed out/i.test(String(response?.error?.message || ""));
+  return isTimeout && attempt === 0; // one retry only: each timeout already cost minutes
+}
+
 function isToolChoiceRequiredError(error) {
   const message = String(error?.message || error?.error?.message || error || "");
   return /tool_choice/i.test(message) && /required/i.test(message);
@@ -150,7 +169,9 @@ function isToolChoiceRequiredError(error) {
  * @returns {string} - The agent's final text response
  */
 export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHistory = [], agentType = "GENERAL", model = null, maxOutputTokens = null, options = {}) {
-  const { interactive = false, onToolStart = null, onToolFinish = null } = options;
+  // requireToolUse: null = infer from the goal; false = a text-only answer (e.g. NO DEPLOY) is valid.
+  const { interactive = false, onToolStart = null, onToolFinish = null, allowedTools = null, requireToolUse = null } = options;
+  const callTools = selectTools(agentType, goal, allowedTools);
   // Build dynamic system prompt with current portfolio state
   const [portfolio, positions] = await Promise.all([getWalletBalances(), getMyPositions()]);
   const stateSummary = getStateSummary();
@@ -176,7 +197,7 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
   // These lock after first attempt regardless of success — retrying them is always wrong
   const NO_RETRY_TOOLS = new Set(["deploy_position"]);
   const firedOnce = new Set();
-  const mustUseRealTool = shouldRequireRealToolUse(goal, agentType, interactive);
+  const mustUseRealTool = requireToolUse ?? shouldRequireRealToolUse(goal, agentType, interactive);
   let sawToolCall = false;
   let noToolRetryCount = 0;
 
@@ -188,19 +209,22 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
       const activeModel = model || DEFAULT_MODEL;
 
       // Retry up to 3 times on transient provider errors (502, 503, 529)
-      const FALLBACK_MODEL = "stepfun/step-3.5-flash:free";
+      // Fallback model for transient failures — derived from config so it never goes stale
+      const FALLBACK_MODEL = agentType === "SCREENER"
+        ? (config.llm.screeningModel || DEFAULT_MODEL)
+        : (config.llm.managementModel || DEFAULT_MODEL);
       let response;
       let usedModel = activeModel;
       // Force a tool call on step 0 for action intents — prevents the model from inventing deploy/close outcomes
       const ACTION_INTENTS = /\b(deploy|open|add liquidity|close|exit|withdraw|claim|swap|block|unblock)\b/i;
-      let toolChoice = (step === 0 && (ACTION_INTENTS.test(goal) || mustUseRealTool)) ? "required" : "auto";
+      let toolChoice = (step === 0 && (requireToolUse ?? (ACTION_INTENTS.test(goal) || mustUseRealTool))) ? "required" : "auto";
 
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
           response = await client.chat.completions.create({
             model: usedModel,
             messages,
-            tools: getToolsForRole(agentType, goal),
+            tools: callTools,
             tool_choice: toolChoice,
             temperature: config.llm.temperature,
             max_tokens: maxOutputTokens ?? config.llm.maxTokens,
@@ -222,8 +246,8 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
           throw error;
         }
         if (response.choices?.length) break;
-        const errCode = response.error?.code;
-        if (errCode === 502 || errCode === 503 || errCode === 529) {
+        const errCode = response.error?.code ?? String(response.error?.message || "?").slice(0, 60);
+        if (isTransientProviderError(response, attempt)) {
           const wait = (attempt + 1) * 5000;
           if (attempt === 1 && usedModel !== FALLBACK_MODEL) {
             usedModel = FALLBACK_MODEL;
@@ -270,7 +294,8 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
         // Hermes sometimes returns null content — pop the empty message and retry once
         if (!msg.content) {
           messages.pop(); // remove the empty assistant message
-          log("agent", "Empty response, retrying...");
+          const reasoningLen = String(msg.reasoning ?? msg.reasoning_content ?? "").length;
+          log("agent", `Empty response (finish_reason=${response.choices[0].finish_reason ?? "?"}, completion_tokens=${response.usage?.completion_tokens ?? "?"}, reasoning_chars=${reasoningLen}), retrying...`);
           continue;
         }
         if (mustUseRealTool && !sawToolCall) {
@@ -282,6 +307,11 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
               content: "I couldn't complete that reliably because no tool call was made. Please retry after checking the logs.",
               userMessage: goal,
             };
+          }
+          // On first no-tool failure, switch to fallback model for the retry
+          if (noToolRetryCount === 1 && (model || DEFAULT_MODEL) !== FALLBACK_MODEL) {
+            model = FALLBACK_MODEL;
+            log("agent", `No tool call from primary model — switching to fallback ${FALLBACK_MODEL} for retry`);
           }
           messages.push({
             role: providerMode === "system" ? "system" : "user",
@@ -365,10 +395,13 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
           step,
         });
 
-        // Lock deploy_position after first attempt regardless of outcome — retrying is never right
-        // For close/swap: only lock on success so genuine failures can be retried
-        if (NO_RETRY_TOOLS.has(functionName)) firedOnce.add(functionName);
-        else if (ONCE_PER_SESSION.has(functionName) && result.success === true) firedOnce.add(functionName);
+        // Lock deploy_position after the first on-chain attempt — retrying risks a double-deploy.
+        // Exception: a pre-execution safety block (result.blocked) never touches on-chain state,
+        // so the LLM may retry with corrected args (e.g. fixing a strategy/volatility mismatch).
+        // For close/swap: only lock on success so genuine failures can be retried.
+        if (NO_RETRY_TOOLS.has(functionName)) {
+          if (!result?.blocked) firedOnce.add(functionName);
+        } else if (ONCE_PER_SESSION.has(functionName) && result.success === true) firedOnce.add(functionName);
 
         return {
           role: "tool",
