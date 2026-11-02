@@ -6,7 +6,7 @@ import { fileURLToPath } from "url";
 import { agentLoop } from "./agent.js";
 import { log } from "./logger.js";
 import { getMyPositions, getActiveBin } from "./tools/dlmm.js";
-import { getWalletBalances } from "./tools/wallet.js";
+import { getWalletBalances, buildEquityDetail } from "./tools/wallet.js";
 import { getTopCandidates, fetchPoolVolatility, getPoolDetail, dropBelowFeeFloor } from "./tools/screening.js";
 import { assessMarketRegime, isRegimeConfirmed } from "./market-regime.js";
 import { fetchPoolMarketData, getMarketDataStats } from "./tools/market-data.js";
@@ -309,6 +309,20 @@ async function maybeRunMissedBriefing() {
 
   log("cron", `Missed briefing detected (last sent: ${lastSent || "never"}) — sending now`);
   await runBriefing();
+}
+
+// Record-only: one `[EQUITY] {json}` line a day (00:00 WIB). Never throws, changes no state and
+// feeds no decision; it exists so the wallet value can be compared with the recorded PnL.
+export async function logDailyEquity() {
+  try {
+    const [wallet, positions] = await Promise.all([
+      getWalletBalances().catch((e) => ({ error: e.message })),
+      getMyPositions({ force: true, silent: true }).catch((e) => ({ error: e.message })),
+    ]);
+    log("equity", JSON.stringify(buildEquityDetail(wallet, positions)));
+  } catch (e) {
+    log("equity_warn", `Equity snapshot not logged: ${e?.message || e}`);
+  }
 }
 
 function stopCronJobs() {
@@ -1637,6 +1651,9 @@ export function startCronJobs() {
     await maybeRunMissedBriefing();
   }, { timezone: 'UTC' });
 
+  // Daily equity snapshot at 17:00 UTC (00:00 WIB), record-only
+  const equityTask = cron.schedule(`0 17 * * *`, () => { logDailyEquity(); }, { timezone: 'UTC' });
+
   // Lightweight 30s PnL poller — updates trailing TP state between management cycles, no LLM
   let _pnlPollBusy = false;
   const pnlPollInterval = setInterval(async () => {
@@ -1709,7 +1726,7 @@ export function startCronJobs() {
     }
   }, 30_000);
 
-  _cronTasks = [mgmtTask, screenTask, briefingTask, briefingWatchdog];
+  _cronTasks = [mgmtTask, screenTask, briefingTask, briefingWatchdog, equityTask];
   // Store interval ref so stopCronJobs can clear it
   _cronTasks._pnlPollInterval = pnlPollInterval;
   log("cron", `Cycles started — management every ${config.schedule.managementIntervalMin}m, screening every ${config.schedule.screeningIntervalMin}m`);

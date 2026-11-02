@@ -52,6 +52,45 @@ function getJupiterReferralParams() {
   return { referralAccount, referralFee: Math.round(referralFee) };
 }
 
+// Record-only daily equity snapshot (see CLAUDE.md, "Is the recorded PnL net?"). Pure: takes the
+// wallet balances and the open-position list and returns the numbers for one `[EQUITY]` log line.
+// equity_usd = wallet total (Helius: SOL + tokens) + open position value (total_value_true_usd, always
+// USD). Unclaimed fees are reported separately because it is not known whether the position value
+// already includes them. complete=false when either source failed, so a gap never reads as zero.
+export function buildEquityDetail(wallet, positionsResult, now = new Date()) {
+  // null/undefined/"" must stay missing (Number(null) is 0, which would read as a real zero)
+  const n = (x) => (x == null || x === "" ? null : Number.isFinite(Number(x)) ? Number(x) : null);
+  const r2 = (x) => (x == null ? null : Math.round(x * 100) / 100);
+  const walletOk = !!wallet && !wallet.error && n(wallet.total_usd) != null;
+  const list = Array.isArray(positionsResult?.positions) ? positionsResult.positions : null;
+  const posOk = list != null && !positionsResult?.error;
+  let posValue = 0, posUnclaimed = 0, posPnl = 0, missing = 0;
+  if (posOk) {
+    for (const p of list) {
+      const v = n(p?.total_value_true_usd ?? p?.total_value_usd);
+      const pnl = n(p?.pnl_true_usd);
+      if (v == null || pnl == null) missing++;
+      posValue += v ?? 0;
+      posUnclaimed += n(p?.unclaimed_fees_true_usd) ?? 0;
+      posPnl += pnl ?? 0;
+    }
+  }
+  const complete = walletOk && posOk && missing === 0;
+  return {
+    at: now.toISOString(),
+    complete,
+    equity_usd: walletOk && posOk ? r2(wallet.total_usd + posValue) : null,
+    wallet_usd: walletOk ? r2(wallet.total_usd) : null,
+    sol: walletOk ? n(wallet.sol) : null,
+    sol_price: walletOk ? n(wallet.sol_price) : null,
+    pos_count: posOk ? list.length : null,
+    pos_value_usd: posOk ? r2(posValue) : null,
+    pos_unclaimed_usd: posOk ? r2(posUnclaimed) : null,
+    pos_pnl_usd: posOk ? r2(posPnl) : null,
+    pos_missing: posOk ? missing : null,
+  };
+}
+
 /**
  * Get current wallet balances: SOL, USDC, and all SPL tokens using Helius Wallet API.
  * Returns USD-denominated values provided by Helius.
