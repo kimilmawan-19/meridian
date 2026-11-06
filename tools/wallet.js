@@ -52,6 +52,45 @@ function getJupiterReferralParams() {
   return { referralAccount, referralFee: Math.round(referralFee) };
 }
 
+// Record-only daily equity snapshot (see CLAUDE.md, "Is the recorded PnL net?"). Pure: takes the
+// wallet balances and the open-position list and returns the numbers for one `[EQUITY]` log line.
+// equity_usd = wallet total (Helius: SOL + tokens) + open position value (total_value_true_usd, always
+// USD). Unclaimed fees are reported separately because it is not known whether the position value
+// already includes them. complete=false when either source failed, so a gap never reads as zero.
+export function buildEquityDetail(wallet, positionsResult, now = new Date()) {
+  // null/undefined/"" must stay missing (Number(null) is 0, which would read as a real zero)
+  const n = (x) => (x == null || x === "" ? null : Number.isFinite(Number(x)) ? Number(x) : null);
+  const r2 = (x) => (x == null ? null : Math.round(x * 100) / 100);
+  const walletOk = !!wallet && !wallet.error && n(wallet.total_usd) != null;
+  const list = Array.isArray(positionsResult?.positions) ? positionsResult.positions : null;
+  const posOk = list != null && !positionsResult?.error;
+  let posValue = 0, posUnclaimed = 0, posPnl = 0, missing = 0;
+  if (posOk) {
+    for (const p of list) {
+      const v = n(p?.total_value_true_usd ?? p?.total_value_usd);
+      const pnl = n(p?.pnl_true_usd);
+      if (v == null || pnl == null) missing++;
+      posValue += v ?? 0;
+      posUnclaimed += n(p?.unclaimed_fees_true_usd) ?? 0;
+      posPnl += pnl ?? 0;
+    }
+  }
+  const complete = walletOk && posOk && missing === 0;
+  return {
+    at: now.toISOString(),
+    complete,
+    equity_usd: walletOk && posOk ? r2(wallet.total_usd + posValue) : null,
+    wallet_usd: walletOk ? r2(wallet.total_usd) : null,
+    sol: walletOk ? n(wallet.sol) : null,
+    sol_price: walletOk ? n(wallet.sol_price) : null,
+    pos_count: posOk ? list.length : null,
+    pos_value_usd: posOk ? r2(posValue) : null,
+    pos_unclaimed_usd: posOk ? r2(posUnclaimed) : null,
+    pos_pnl_usd: posOk ? r2(posPnl) : null,
+    pos_missing: posOk ? missing : null,
+  };
+}
+
 /**
  * Get current wallet balances: SOL, USDC, and all SPL tokens using Helius Wallet API.
  * Returns USD-denominated values provided by Helius.
@@ -142,10 +181,59 @@ export function normalizeMint(mint) {
   return mint;
 }
 
+// Jupiter's shared API key is rate-limited; every 429 seen live was the first order request of an
+// auto-swap right after a close, which then left the base token stranded in the wallet.
+const RATE_LIMIT_RETRY_DELAYS_MS = [2000, 5000, 10000];
+
+export async function fetchWithRateLimitRetry(url, options, label, delays = RATE_LIMIT_RETRY_DELAYS_MS) {
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(url, options);
+    if (res.status !== 429 || attempt >= delays.length) return res;
+    log("swap_warn", `${label} rate-limited (429), retry ${attempt + 1}/${delays.length} in ${delays[attempt] / 1000}s`);
+    await new Promise((r) => setTimeout(r, delays[attempt]));
+  }
+}
+
+// One `swap_detail` log line per successful swap, so the cost that never reaches the recorded PnL
+// (slippage and price impact on the token -> SOL auto-swaps) can be measured. Log-only.
+//   slippage = 1 - out_sol * sol_usd / expected_usd
+// where expected_usd (the wallet's USD value of the token just before the swap) and sol_usd are
+// passed by the auto-swap callers in tools/executor.js; manual swaps leave them null.
+// fee_bps is the fee Jupiter says it applied (the referral fee was measured from volume x bps).
+// Every value is a finite number, a string or null. Pure; the caller wraps it so a logging bug can
+// never turn a successful swap into a reported failure.
+export function buildSwapDetail({ result, order, input_mint, output_mint, amount, expected_usd, sol_usd }) {
+  const num = (v) => {
+    if (v === null || v === undefined || v === "") return null;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+  const str = (v) => (v === null || v === undefined ? null : String(v));
+  const outRaw = str(result?.outputAmountResult);
+  const outRawNum = num(outRaw);
+  return {
+    tx: str(result?.signature),
+    in: input_mint === SOL_MINT ? "SOL" : (input_mint ?? null),
+    out: output_mint === SOL_MINT ? "SOL" : (output_mint ?? null),
+    in_ui: num(amount),
+    out_raw: outRaw,
+    out_sol: output_mint === SOL_MINT && outRawNum !== null ? Math.round(outRawNum) / 1e9 : null,
+    quote_out: str(order?.outAmount),
+    fee_bps: num(order?.feeBps),
+    price_impact: num(order?.priceImpact ?? order?.priceImpactPct),
+    jup_in_usd: num(order?.inUsdValue),
+    jup_out_usd: num(order?.outUsdValue),
+    expected_usd: num(expected_usd),
+    sol_usd: num(sol_usd),
+  };
+}
+
 export async function swapToken({
   input_mint,
   output_mint,
   amount,
+  expected_usd, // log-only: caller's USD value of the input just before the swap
+  sol_usd,      // log-only: SOL price in USD at that moment
 }) {
   input_mint  = normalizeMint(input_mint);
   output_mint = normalizeMint(output_mint);
@@ -177,6 +265,7 @@ export async function swapToken({
       outputMint: output_mint,
       amount: amountStr,
       taker: wallet.publicKey.toString(),
+      slippageBps: String(config.risk.swapSlippageBps ?? 500),
     });
     const referralParams = getJupiterReferralParams();
     if (referralParams) {
@@ -186,9 +275,9 @@ export async function swapToken({
     const orderUrl = `${JUPITER_SWAP_V2_API}/order?${search.toString()}`;
     const jupiterApiKey = getJupiterApiKey();
 
-    const orderRes = await fetch(orderUrl, {
+    const orderRes = await fetchWithRateLimitRetry(orderUrl, {
       headers: jupiterApiKey ? { "x-api-key": jupiterApiKey } : {},
-    });
+    }, "Swap V2 order");
     if (!orderRes.ok) {
       const body = await orderRes.text();
       throw new Error(`Swap V2 order failed: ${orderRes.status} ${body}`);
@@ -225,6 +314,11 @@ export async function swapToken({
     }
 
     log("swap", `SUCCESS tx: ${result.signature}`);
+    try {
+      log("swap_detail", JSON.stringify(buildSwapDetail({ result, order, input_mint, output_mint, amount, expected_usd, sol_usd })));
+    } catch (e) {
+      log("swap_warn", `Swap detail not logged: ${e.message}`);
+    }
     if (referralParams && order.feeBps !== referralParams.referralFee) {
       log(
         "swap_warn",
