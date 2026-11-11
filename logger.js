@@ -12,6 +12,23 @@ if (!fs.existsSync(LOG_DIR)) {
   fs.mkdirSync(LOG_DIR, { recursive: true });
 }
 
+// Daily files older than this are deleted (checked once per day). The diag scripts read up to
+// 60–90 days. Nothing was ever deleted before: logs/ reached 463 MB.
+const LOG_RETENTION_DAYS = Number(process.env.LOG_RETENTION_DAYS) || 90;
+let _lastPruneDate = null;
+
+export function pruneOldLogs(now = Date.now()) {
+  const cutoff = new Date(now - LOG_RETENTION_DAYS * 86_400_000).toISOString().slice(0, 10);
+  let removed = 0;
+  try {
+    for (const f of fs.readdirSync(LOG_DIR)) {
+      const m = f.match(/^(?:agent|actions)-(\d{4}-\d\d-\d\d)\.(?:log|jsonl)$/);
+      if (m && m[1] < cutoff) { fs.unlinkSync(path.join(LOG_DIR, f)); removed++; }
+    }
+  } catch { /* best-effort */ }
+  return removed;
+}
+
 /**
  * General log function.
  */
@@ -30,6 +47,7 @@ export function log(category, message) {
 
   // File output (daily rotation)
   const dateStr = timestamp.split("T")[0];
+  if (dateStr !== _lastPruneDate) { _lastPruneDate = dateStr; pruneOldLogs(); }
   const logFile = path.join(LOG_DIR, `agent-${dateStr}.log`);
   fs.appendFileSync(logFile, line + "\n");
 }
