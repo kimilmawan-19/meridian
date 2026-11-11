@@ -91,6 +91,49 @@ export function buildEquityDetail(wallet, positionsResult, now = new Date()) {
   };
 }
 
+// Record-only close settlement line (see CLAUDE.md, "Close settlement log"): one `[CLOSE_SETTLE]` per
+// close_position, written in every branch of the auto-swap (swapped, skipped, failed, skip_swap), so
+// each close is tied to the SOL that actually reached the wallet. Pure and never throws; the caller
+// wraps it so a logging bug can never turn a successful close into a reported failure.
+//   out_sol      = swap output in SOL as Jupiter reports it (raw lamports / 1e9; before Jupiter's fee)
+//   out_sol_net  = out_sol x (1 - fee_bps / 1e4): what reaches the wallet (on-chain check 2026-10-19)
+//   sol_change   = wallet SOL after the swap minus before it (Helius balance; includes anything else
+//                  that moved in that window, and a parallel close can interleave)
+// Missing numbers stay null, a gap never reads as zero. `pnl_usd` is the close result's figure (SOL in solMode).
+export function buildCloseSettle({ position, pool_name, base_mint, outcome, closeResult, token, balances, balancesAfter, swapResult, error } = {}, now = new Date()) {
+  const n = (x) => (x == null || x === "" ? null : Number.isFinite(Number(x)) ? Number(x) : null);
+  const s = (x, max = 120) => (x == null ? null : String(x).slice(0, max));
+  const r9 = (x) => (x == null ? null : Math.round(x * 1e9) / 1e9);
+  const okBal = (b) => (b && typeof b === "object" && !b.error ? b : null);
+  const before = okBal(balances);
+  const after = okBal(balancesAfter);
+  const solBefore = before ? n(before.sol) : null;
+  const solAfter = after ? n(after.sol) : null;
+  const outRaw = n(swapResult?.amount_out);
+  const fee = n(swapResult?.fee_bps_applied);
+  const outSol = outRaw != null ? outRaw / 1e9 : null;
+  return {
+    at: now.toISOString(),
+    position: s(position, 64),
+    pool_name: s(pool_name, 40),
+    base_mint: s(base_mint, 64),
+    outcome: s(outcome, 24),
+    pnl_usd: n(closeResult?.pnl_usd),
+    pnl_pct: n(closeResult?.pnl_pct),
+    token_balance: n(token?.balance),
+    token_usd: n(token?.usd),
+    sol_usd: before ? n(before.sol_price) : null,
+    sol_before_swap: solBefore,
+    sol_after_swap: solAfter,
+    sol_change: solBefore != null && solAfter != null ? r9(solAfter - solBefore) : null,
+    swap_tx: s(swapResult?.tx, 100),
+    out_sol: r9(outSol),
+    fee_bps: fee,
+    out_sol_net: outSol != null && fee != null ? r9(outSol * (1 - fee / 1e4)) : null,
+    error: s(error),
+  };
+}
+
 /**
  * Get current wallet balances: SOL, USDC, and all SPL tokens using Helius Wallet API.
  * Returns USD-denominated values provided by Helius.

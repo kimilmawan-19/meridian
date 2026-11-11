@@ -10,7 +10,7 @@ import {
   partialClosePosition,
   searchPools,
 } from "./dlmm.js";
-import { getWalletBalances, swapToken } from "./wallet.js";
+import { getWalletBalances, swapToken, buildCloseSettle } from "./wallet.js";
 import { studyTopLPers } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
 import { setPositionInstruction } from "../state.js";
@@ -654,6 +654,32 @@ export async function runExclusiveDeploy(run, now = Date.now) {
   }
 }
 
+// Record-only `[CLOSE_SETTLE]` line after a close_position (see CLAUDE.md, "Close settlement log").
+// After a successful swap it reads the wallet once more (SOL after the swap). It never throws and
+// changes nothing in `result`: a logging bug must not turn a successful close into a failure.
+export async function logCloseSettle({ args, result, settle }) {
+  try {
+    let balancesAfter = null;
+    if (settle.outcome === "swapped") {
+      try { balancesAfter = await getWalletBalances({}); } catch { balancesAfter = null; }
+    }
+    log("close_settle", JSON.stringify(buildCloseSettle({
+      position: args?.position_address ?? result?.position,
+      pool_name: result?.pool_name,
+      base_mint: result?.base_mint,
+      outcome: settle.outcome,
+      closeResult: result,
+      token: settle.token,
+      balances: settle.balances,
+      balancesAfter,
+      swapResult: settle.swapResult,
+      error: settle.error,
+    })));
+  } catch (e) {
+    log("close_settle_warn", `Close settle not logged: ${e?.message}`);
+  }
+}
+
 /**
  * Execute a tool call with safety checks and logging.
  * deploy_position goes through runExclusiveDeploy; every other tool stays parallel (a chat
@@ -753,15 +779,22 @@ async function executeToolUnlocked(name, args) {
           if (poolAddr) addPoolNote({ pool_address: poolAddr, note: `Closed: low yield (fee/TVL below threshold) at ${new Date().toISOString().slice(0,10)}` }).catch?.(() => {});
         }
         // Auto-swap base token back to SOL unless user said to hold
+        // `settle` only feeds the record-only [CLOSE_SETTLE] line below; nothing reads it for a decision.
+        const settle = { outcome: args.skip_swap ? "skip_swap" : (result.base_mint ? "no_token" : "no_base_mint"), balances: null, token: null, swapResult: null, error: null };
         if (!args.skip_swap && result.base_mint) {
           try {
             const balances = await getWalletBalances({});
             const token = balances.tokens?.find(t => t.mint === result.base_mint);
+            settle.balances = balances;
+            settle.token = token || null;
+            if (token) settle.outcome = "skipped_small";
             if (token && token.usd >= 0.10) {
               log("executor", `Auto-swapping ${token.symbol || result.base_mint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to SOL`);
               const swapResult = await swapToken({ input_mint: result.base_mint, output_mint: "SOL", amount: token.balance, expected_usd: token.usd, sol_usd: balances.sol_price });
+              settle.swapResult = swapResult || null;
               // swapToken reports failure as { success:false, error } rather than throwing.
               if (!swapResult || swapResult.success === false || swapResult.error) throw new Error(swapResult?.error || "swap returned no result");
+              settle.outcome = "swapped";
               // Tell the model the swap already happened so it doesn't call swap_token again
               result.auto_swapped = true;
               result.auto_swap_note = `Base token already auto-swapped back to SOL (${token.symbol || result.base_mint.slice(0, 8)} → SOL). Do NOT call swap_token again.`;
@@ -772,12 +805,15 @@ async function executeToolUnlocked(name, args) {
             // so the next deploy would see an understated SOL balance and size down (or fail
             // minSolToOpen). Tell the agent to recover the SOL with a manual swap.
             log("executor_warn", `Auto-swap after close failed: ${e.message}`);
+            settle.outcome = "failed";
+            settle.error = e.message;
             notifyAutoSwapFailed({ pair: result.pool_name || args.position_address?.slice(0, 8), mint: result.base_mint, error: e.message }).catch(() => {});
             result.auto_swapped = false;
             result.auto_swap_failed = true;
             result.auto_swap_note = `Auto-swap of base token (${result.base_mint.slice(0, 8)}) back to SOL FAILED: ${e.message}. The base token is still in the wallet — call swap_token (input_mint=base_mint, output_mint=SOL) to recover SOL before deploying again.`;
           }
         }
+        await logCloseSettle({ args, result, settle });
       } else if (name === "partial_close_position" && result.success) {
         notifyPartialClose({ pair: result.pool_name || args.position_address?.slice(0, 8), pct: result.pct, lockedUsd: result.locked_usd ?? 0, peakPct: result.peak_pnl_pct ?? null }).catch(() => {});
         // Auto-swap the scaled-out base token back to SOL so it is immediately redeployable.

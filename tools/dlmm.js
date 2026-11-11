@@ -1768,6 +1768,44 @@ export async function verifyPositionClosed({ position_address, positionPubKey, l
   return { closed: false, via: null };
 }
 
+// Record-only `[CLOSE_FIGURES]` line (see CLAUDE.md, "Close settlement log"): the raw deposit,
+// withdrawal and fee objects of Meteora's closed-position record, numbers only (strings such as
+// mints are dropped), so it can be read whether the API splits the withdrawal by token. The recorded
+// PnL only uses `.total`. Pure and never throws. A long result keeps only the `total` of each object.
+export function buildCloseFigures({ position, pool_name, source, entry } = {}) {
+  const MAX = 700;
+  const keep = (v, depth = 0) => {
+    if (typeof v === "number") return Number.isFinite(v) ? v : null;
+    if (v && typeof v === "object" && !Array.isArray(v) && depth < 3) {
+      const out = {};
+      for (const [k, x] of Object.entries(v)) {
+        const y = keep(x, depth + 1);
+        if (y !== undefined && y !== null && !(typeof y === "object" && Object.keys(y).length === 0)) out[String(k).slice(0, 24)] = y;
+      }
+      return out;
+    }
+    return undefined;
+  };
+  const pick = (o) => (o && typeof o === "object" ? keep(o) ?? null : null);
+  const out = {
+    position: position == null ? null : String(position).slice(0, 64),
+    pool_name: pool_name == null ? null : String(pool_name).slice(0, 40),
+    source: source == null ? null : String(source).slice(0, 12),
+    entry_keys: entry && typeof entry === "object" ? Object.keys(entry).slice(0, 40).map((k) => String(k).slice(0, 32)) : null,
+    deposits: pick(entry?.allTimeDeposits),
+    withdrawals: pick(entry?.allTimeWithdrawals),
+    fees: pick(entry?.allTimeFees),
+  };
+  if (JSON.stringify(out).length > MAX) {
+    const tot = (o) => (o && o.total !== undefined ? { total: o.total } : null);
+    out.deposits = tot(out.deposits);
+    out.withdrawals = tot(out.withdrawals);
+    out.fees = tot(out.fees);
+    out.truncated = true;
+  }
+  return out;
+}
+
 // The figures recordPerformance needs (it recomputes pnl = final + fees - initial), taken from a
 // live reading of the position. The initial value is derived from the reading itself, not from
 // tracked.initial_value_usd, which is the LLM's estimate. Earlier partial withdrawals are not known
@@ -2244,6 +2282,9 @@ export async function closePosition({ position_address, reason }) {
       let finalValueUsd = 0;
       let initialUsd = 0;
       let feesUsd = tracked.total_fees_claimed_usd || 0;
+      // Record-only: which source gave the figures, and the raw closed record, for [CLOSE_FIGURES] below.
+      let figuresSource = "none";
+      let closedEntry = null;
       try {
         const closedUrl = `https://dlmm.datapi.meteora.ag/positions/${poolAddress}/pnl?user=${wallet.publicKey.toString()}&status=closed&pageSize=50&page=1`;
         for (let attempt = 0; attempt < 6; attempt++) {
@@ -2277,6 +2318,8 @@ export async function closePosition({ position_address, reason }) {
                 finalValueUsd = nextFinalValueUsd;
                 initialUsd    = nextInitialUsd;
                 feesUsd       = nextFeesUsd;
+                figuresSource = "api";
+                closedEntry   = posEntry;
                 log("close", `Closed PnL from API: pnl=${pnlUsd.toFixed(2)} ${config.management.solMode ? "SOL" : "USD"} (${pnlPct.toFixed(2)}%), withdrawn=${finalValueUsd.toFixed(2)} USD, deposited=${initialUsd.toFixed(2)} USD`);
                 break;
               }
@@ -2295,6 +2338,7 @@ export async function closePosition({ position_address, reason }) {
         const figure = closeFigureFromReading(preCloseReading, config.management.solMode);
         if (figure) {
           ({ pnlUsd, pnlTrueUsd, pnlPct, feesUsd, finalValueUsd, initialUsd } = figure);
+          figuresSource = "reading";
           log("close_warn", `Using the reading from before the close: the closed-PnL API has not settled and the open list is stale`);
         }
       }
@@ -2302,6 +2346,7 @@ export async function closePosition({ position_address, reason }) {
       if (finalValueUsd === 0 && !closedViaChain) {
         const cachedPos = _positionsCache?.positions?.find(p => p.position === position_address);
         if (cachedPos) {
+          figuresSource = "cache";
           pnlTrueUsd    = cachedPos.pnl_true_usd ?? (config.management.solMode ? 0 : cachedPos.pnl_usd) ?? 0;
           pnlUsd        = config.management.solMode ? (cachedPos.pnl_usd ?? 0) : pnlTrueUsd;
           pnlPct        = cachedPos.pnl_pct   ?? 0;
@@ -2325,6 +2370,18 @@ export async function closePosition({ position_address, reason }) {
         baseMint: closeBaseMint,
         tracked,
       });
+
+      // Record-only: the raw closed record, so the token / SOL split of the withdrawal can be read.
+      try {
+        log("close_figures", JSON.stringify(buildCloseFigures({
+          position: position_address,
+          pool_name: tracked.pool_name || poolMeta.name || null,
+          source: figuresSource,
+          entry: closedEntry,
+        })));
+      } catch (e) {
+        log("close_warn", `Close figures not logged: ${e.message}`);
+      }
 
       try {
         // A record of zeros would be worse than none (it counts as a 0% close).
