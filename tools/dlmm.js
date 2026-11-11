@@ -1769,13 +1769,20 @@ export async function verifyPositionClosed({ position_address, positionPubKey, l
 }
 
 // Record-only `[CLOSE_FIGURES]` line (see CLAUDE.md, "Close settlement log"): the raw deposit,
-// withdrawal and fee objects of Meteora's closed-position record, numbers only (strings such as
-// mints are dropped), so it can be read whether the API splits the withdrawal by token. The recorded
-// PnL only uses `.total`. Pure and never throws. A long result keeps only the `total` of each object.
+// withdrawal and fee objects of Meteora's closed-position record, numbers only, so it can be read
+// whether the API splits the withdrawal by token. The API sends its amounts as TEXT ("12.34"; the
+// rest of this file reads them with parseFloat), so a text leaf that is a plain number is turned into
+// a number; any other text (mints, words) is dropped and counted in `dropped_leaves`, so a loss like
+// the first live version's (everything was text, the objects came out empty) is visible in the log.
+// The recorded PnL only uses `.total`. Pure and never throws. A long result keeps only the `total`
+// of each object.
+const NUMERIC_TEXT = /^-?\d+(\.\d+)?([eE][+-]?\d+)?$/;
 export function buildCloseFigures({ position, pool_name, source, entry } = {}) {
   const MAX = 700;
+  let dropped = 0;
   const keep = (v, depth = 0) => {
-    if (typeof v === "number") return Number.isFinite(v) ? v : null;
+    if (typeof v === "number") { if (Number.isFinite(v)) return v; dropped++; return null; }
+    if (typeof v === "string" && v.length <= 24 && NUMERIC_TEXT.test(v)) { const n = Number(v); if (Number.isFinite(n)) return n; }
     if (v && typeof v === "object" && !Array.isArray(v) && depth < 3) {
       const out = {};
       for (const [k, x] of Object.entries(v)) {
@@ -1784,6 +1791,7 @@ export function buildCloseFigures({ position, pool_name, source, entry } = {}) {
       }
       return out;
     }
+    dropped++;
     return undefined;
   };
   const pick = (o) => (o && typeof o === "object" ? keep(o) ?? null : null);
@@ -1796,6 +1804,7 @@ export function buildCloseFigures({ position, pool_name, source, entry } = {}) {
     withdrawals: pick(entry?.allTimeWithdrawals),
     fees: pick(entry?.allTimeFees),
   };
+  out.dropped_leaves = dropped;
   if (JSON.stringify(out).length > MAX) {
     const tot = (o) => (o && o.total !== undefined ? { total: o.total } : null);
     out.deposits = tot(out.deposits);

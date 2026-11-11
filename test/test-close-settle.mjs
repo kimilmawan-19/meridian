@@ -102,6 +102,29 @@ check("a long key is cut to 24 characters", Object.keys(buildCloseFigures({ posi
 check("a short result is not marked truncated", buildCloseFigures({ position: "P", entry: { allTimeFees: { total: { usd: 1 } } } }).truncated === undefined);
 check("long ids are cut", buildCloseFigures({ position: "x".repeat(200), pool_name: "y".repeat(200), source: "z".repeat(50) }).position.length === 64);
 
+console.log("[3b] buildCloseFigures: the API sends numbers as text");
+f = buildCloseFigures({ position: "P", source: "api", entry: { allTimeDeposits: { total: { sol: "1.5", usd: "140.25" } }, allTimeWithdrawals: { total: { sol: "1.4", usd: "130.5" }, tokenX: { amount: "12345", usd: "56.1" }, tokenY: { usd: "74.4" }, tag: "abc" }, allTimeFees: { total: { usd: "3" } } } });
+check("numeric text becomes a number", f.withdrawals.total.usd === 130.5 && f.withdrawals.tokenX.usd === 56.1 && f.withdrawals.tokenX.amount === 12345 && f.deposits.total.sol === 1.5 && f.fees.total.usd === 3, JSON.stringify(f));
+check("other text is dropped and counted", f.withdrawals.tag === undefined && f.dropped_leaves === 1, String(f.dropped_leaves));
+check("an all-text real-shaped record no longer comes out empty", Object.keys(f.withdrawals).length === 3);
+{
+  const w = (x) => buildCloseFigures({ position: "P", entry: { allTimeWithdrawals: { v: x } } }).withdrawals;
+  check("'-0.5', '1e5', '0', '007' are numbers", w("-0.5").v === -0.5 && w("1e5").v === 100000 && w("0").v === 0 && w("007").v === 7);
+  check("'.5', '5.', ' 5', '0x10' are not numbers", ["\u002e5", "5.", " 5", "0x10", "5 ", "+5", "1,5"].every((x) => w(x) === null || w(x).v === undefined));
+  check("'NaN', 'Infinity', '' are not numbers", ["NaN", "Infinity", "-Infinity", ""].every((x) => w(x) === null || w(x).v === undefined));
+  check("24 digits are kept, 25 are dropped", w("1".repeat(24)).v === Number("1".repeat(24)) && (w("1".repeat(25)) === null || w("1".repeat(25)).v === undefined));
+  check("a number-looking mint cannot pass (too long)", (w("1".repeat(44)) === null || w("1".repeat(44)).v === undefined));
+  check("'1e999' is not kept (not finite)", w("1e999") === null || w("1e999").v === undefined);
+  check("a boolean or null leaf is dropped", (w(true) === null || w(true).v === undefined) && (w(null) === null || w(null).v === undefined));
+}
+f = buildCloseFigures({ position: "P", entry: { allTimeWithdrawals: { a: 1, b: NaN, c: [1, 2], d: null, e: "x", f: { g: { h: { i: 1 } } } } } });
+check("dropped_leaves counts NaN, array, null, text and a too-deep object", f.dropped_leaves === 5, String(f.dropped_leaves));
+check("all-numeric record: dropped_leaves is 0", buildCloseFigures({ position: "P", entry: { allTimeFees: { total: { usd: 1 } } } }).dropped_leaves === 0);
+check("no entry: dropped_leaves is 0", buildCloseFigures({ position: "P" }).dropped_leaves === 0);
+check("dropped_leaves survives truncation", (() => { const big = {}; for (let i = 0; i < 60; i++) big["k" + i] = { usd: String(i + 0.5) }; const o = buildCloseFigures({ position: "P", entry: { allTimeWithdrawals: { total: { usd: "2" }, ...big, junk: "zz" } } }); return o.truncated === true && o.dropped_leaves === 1; })());
+check("text amounts at depth 3 are read", buildCloseFigures({ position: "P", entry: { allTimeWithdrawals: { a: { b: { c: "7" } } } } }).withdrawals.a.b.c === 7);
+check("text amounts are not read below depth 3", (() => { const o = buildCloseFigures({ position: "P", entry: { allTimeWithdrawals: { a: { b: { c: { d: "7" } } } } } }); return JSON.stringify(o.withdrawals) === "{}" && o.dropped_leaves === 1; })());
+
 console.log("[4] logCloseSettle (real executor module, wallet read stubbed through fetch)");
 const realFetch = globalThis.fetch;
 const realLog = console.log;
