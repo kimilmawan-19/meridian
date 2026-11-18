@@ -409,6 +409,7 @@ const envMap = {
   DRY_RUN: dryRun ? "true" : "false",
 };
 fs.writeFileSync(ENV_PATH, buildEnv(envMap));
+try { fs.chmodSync(ENV_PATH, 0o600); } catch (_) { /* best-effort on non-POSIX FS */ }
 
 // ─── Write user-config.json ────────────────────────────────────────────────────
 const userConfig = {
@@ -447,6 +448,7 @@ const userConfig = {
 delete userConfig.emergencyPriceDropPct;
 
 fs.writeFileSync(CONFIG_PATH, JSON.stringify(userConfig, null, 2));
+try { fs.chmodSync(CONFIG_PATH, 0o600); } catch (_) { /* best-effort on non-POSIX FS */ }
 
 // ─── Summary ──────────────────────────────────────────────────────────────────
 const presetName = preset ? `${preset.label}` : "Custom";
