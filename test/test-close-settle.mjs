@@ -27,7 +27,7 @@ function check(name, cond, detail = "") {
 }
 
 const { buildCloseSettle } = await import(new URL("tools/wallet.js", repo).href);
-const { buildCloseFigures } = await import(new URL("tools/dlmm.js", repo).href);
+const { buildCloseFigures, buildCloseLegs } = await import(new URL("tools/dlmm.js", repo).href);
 const { logCloseSettle } = await import(new URL("tools/executor.js", repo).href);
 const NOW = new Date("2026-11-11T12:00:00.000Z");
 
@@ -124,6 +124,35 @@ check("no entry: dropped_leaves is 0", buildCloseFigures({ position: "P" }).drop
 check("dropped_leaves survives truncation", (() => { const big = {}; for (let i = 0; i < 60; i++) big["k" + i] = { usd: String(i + 0.5) }; const o = buildCloseFigures({ position: "P", entry: { allTimeWithdrawals: { total: { usd: "2" }, ...big, junk: "zz" } } }); return o.truncated === true && o.dropped_leaves === 1; })());
 check("text amounts at depth 3 are read", buildCloseFigures({ position: "P", entry: { allTimeWithdrawals: { a: { b: { c: "7" } } } } }).withdrawals.a.b.c === 7);
 check("text amounts are not read below depth 3", (() => { const o = buildCloseFigures({ position: "P", entry: { allTimeWithdrawals: { a: { b: { c: { d: "7" } } } } } }); return JSON.stringify(o.withdrawals) === "{}" && o.dropped_leaves === 1; })());
+
+console.log("[3c] buildCloseLegs: token and SOL amounts before the withdrawal");
+{
+  const L = buildCloseLegs({ xRaw: "1234567", yRaw: "2500000000", xDecimals: 6, yDecimals: 9, activePrice: "0.00012", quoteIsSol: true, partialTakenCount: 0 });
+  check("raw to UI, 6 and 9 decimals", L.leg_x_ui === 1.234567 && L.leg_y_ui === 2.5, JSON.stringify(L));
+  check("active price from text", L.active_price === 0.00012);
+  check("quote_is_sol and partial count kept", L.quote_is_sol === true && L.partial_taken_count === 0);
+  check("a BN-like object is read through toString", buildCloseLegs({ xRaw: { toString: () => "500" }, xDecimals: 2 }).leg_x_ui === 5);
+  check("a number raw is read", buildCloseLegs({ xRaw: 1000, xDecimals: 3 }).leg_x_ui === 1);
+  check("a fractional raw string is read", buildCloseLegs({ xRaw: "1500.5", xDecimals: 1 }).leg_x_ui === 150.05);
+  check("zero stays zero, not null", buildCloseLegs({ xRaw: "0", xDecimals: 9 }).leg_x_ui === 0);
+  check("null, negative, word, hex and empty raw give null", [null, undefined, "-5", "abc", "0x10", "", "1e5"].every((r) => buildCloseLegs({ xRaw: r, xDecimals: 6 }).leg_x_ui === null));
+  check("a raw string over 40 characters gives null", buildCloseLegs({ xRaw: "1".repeat(41), xDecimals: 6 }).leg_x_ui === null && buildCloseLegs({ xRaw: "1".repeat(40), xDecimals: 0 }).leg_x_ui === 1.1111111111111112e39);
+  check("bad decimals give null (missing, -1, 19, 1.5, text)", [undefined, -1, 19, 1.5, "6"].every((d) => buildCloseLegs({ xRaw: "100", xDecimals: d }).leg_x_ui === null) && buildCloseLegs({ xRaw: "100", xDecimals: 18 }).leg_x_ui === 1e-16 && buildCloseLegs({ xRaw: "100", xDecimals: 0 }).leg_x_ui === 100);
+  check("bad active price gives null (0, negative, NaN, word, null)", [0, -1, NaN, "x", null, undefined].every((p) => buildCloseLegs({ activePrice: p }).active_price === null));
+  check("quote_is_sol must be a boolean", buildCloseLegs({ quoteIsSol: "true" }).quote_is_sol === null && buildCloseLegs({ quoteIsSol: false }).quote_is_sol === false);
+  check("partial count must be an integer >= 0", buildCloseLegs({ partialTakenCount: 2 }).partial_taken_count === 2 && [-1, 1.5, "x", null].every((c) => buildCloseLegs({ partialTakenCount: c }).partial_taken_count === null));
+  check("no input does not throw, all null", JSON.stringify(buildCloseLegs()) === JSON.stringify({ leg_x_ui: null, leg_y_ui: null, active_price: null, quote_is_sol: null, partial_taken_count: null }));
+  const F = buildCloseFigures({ position: "P", source: "api", entry: { allTimeWithdrawals: { total: { sol: "1.4", usd: "130.5" } } }, legs: { xRaw: "2000000", yRaw: "400000000", xDecimals: 6, yDecimals: 9, activePrice: 0.0005, quoteIsSol: true, partialTakenCount: 0 } });
+  check("figures line carries the legs", F.leg_x_ui === 2 && F.leg_y_ui === 0.4 && F.active_price === 0.0005 && F.quote_is_sol === true && F.partial_taken_count === 0);
+  const keys = Object.keys(F);
+  check("legs come before the raw objects", keys.indexOf("leg_x_ui") > keys.indexOf("entry_keys") && keys.indexOf("partial_taken_count") < keys.indexOf("deposits"));
+  check("without legs the fields are null (old line shape still valid)", (() => { const o = buildCloseFigures({ position: "P" }); return o.leg_x_ui === null && o.active_price === null && o.quote_is_sol === null && o.withdrawals === null; })());
+  check("legs null (no liquidity or read failed) does not throw", buildCloseFigures({ position: "P", legs: null }).leg_x_ui === null);
+  check("an infinite active price gives null", buildCloseLegs({ activePrice: Infinity }).active_price === null);
+  check("legs that are not an object are ignored", buildCloseFigures({ position: "P", legs: "x" }).leg_x_ui === null);
+  check("legs survive truncation", (() => { const big = {}; for (let i = 0; i < 60; i++) big["k" + i] = { usd: String(i) }; const o = buildCloseFigures({ position: "P", entry: { allTimeWithdrawals: { total: { usd: "2" }, ...big } }, legs: { xRaw: "5", xDecimals: 0, quoteIsSol: true } }); return o.truncated === true && o.leg_x_ui === 5 && o.quote_is_sol === true && JSON.stringify(o).length <= 760; })());
+  check("legs do not change dropped_leaves", buildCloseFigures({ position: "P", entry: { allTimeFees: { total: { usd: 1 } } }, legs: { xRaw: "abc", xDecimals: 6 } }).dropped_leaves === 0);
+}
 
 console.log("[4] logCloseSettle (real executor module, wallet read stubbed through fetch)");
 const realFetch = globalThis.fetch;
@@ -231,6 +260,15 @@ check("figuresSource starts as none and is set at the three sources", /let figur
 check("the figures line is not disabled and gets the closed record", /\/\/ Record-only: the raw closed record[^\n]*\n\s*try \{\s*log\("close_figures"/.test(sdk) && /source: figuresSource,\s*entry: closedEntry,/.test(sdk));
 check("the raw closed record is kept only on the API branch", /closedEntry\s+= posEntry;/.test(sdk));
 check("[CLOSE_FIGURES] is written before recordPerformance, in its own try/catch", /try \{\s*log\("close_figures", JSON\.stringify\(buildCloseFigures\(\{[\s\S]*?\}\)\)\);\s*\} catch \(e\) \{\s*log\("close_warn", `Close figures not logged/.test(sdk) && sdk.indexOf('log("close_figures"') < sdk.indexOf("await recordPerformance("));
+{
+  const step2 = dl.slice(dl.indexOf("let closeLegs = null;"), dl.indexOf("if (hasLiquidity) {\n      log(\"close\", `Step 2: Removing liquidity"));
+  check("Step 2 reads the legs only with liquidity, inside its own try", /if \(hasLiquidity\) \{\s*try \{[\s\S]*closeLegs = \{[\s\S]*\} catch \(e\) \{\s*log\("close_warn", `Close legs not read/.test(step2), String(step2.length));
+  check("legs come from the position read before removeLiquidity", /xRaw: processed\.totalXAmount,\s*yRaw: processed\.totalYAmount,/.test(step2) && /xDecimals: pool\.tokenX\?\.mint\?\.decimals,\s*yDecimals: pool\.tokenY\?\.mint\?\.decimals,/.test(step2));
+  check("active price read in its own try, failure only logged", /try \{\s*const activeBin = await pool\.getActiveBin\(\);\s*activePrice = pool\.fromPricePerLamport\(Number\(activeBin\.price\)\);\s*\} catch \(e\) \{\s*log\("close_warn", `Active price not read/.test(step2));
+  check("quote_is_sol compares the Y mint with SOL; partial count from tracked", /quoteIsSol: pool\.lbPair\?\.tokenYMint\?\.toString\?\.\(\) === config\.tokens\.SOL,/.test(step2) && /partialTakenCount: tracked\?\.partial_taken_count \?\? 0,/.test(step2));
+  check("the figures line gets the legs", /entry: closedEntry,\s*legs: closeLegs,/.test(sdk));
+  check("closeLegs is not used anywhere else", (dl.match(/closeLegs/g) || []).length === 3, String((dl.match(/closeLegs/g) || []).length));
+}
 check("closePosition's return value is unchanged (no figures field)", !/close_figures|closedEntry/.test(sdk.slice(sdk.indexOf("return {\n        success: true,"))));
 
 console.log(`\n${pass} passed, ${fail} failed`);

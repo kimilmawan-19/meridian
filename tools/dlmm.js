@@ -1777,7 +1777,30 @@ export async function verifyPositionClosed({ position_address, positionPubKey, l
 // The recorded PnL only uses `.total`. Pure and never throws. A long result keeps only the `total`
 // of each object.
 const NUMERIC_TEXT = /^-?\d+(\.\d+)?([eE][+-]?\d+)?$/;
-export function buildCloseFigures({ position, pool_name, source, entry } = {}) {
+// Record-only legs of a close (see CLAUDE.md, "Token price log"): the token (X) and SOL (Y) amounts
+// the position held just before the withdrawal, in UI units, and the pool's active-bin price of the
+// token in the quote token. With them the token part of Meteora's withdrawal value can be computed
+// (withdrawals.total.sol - leg_y_ui). Pure and never throws; anything unreadable is null.
+const RAW_AMOUNT = /^\d+(\.\d+)?$/;
+export function buildCloseLegs({ xRaw, yRaw, xDecimals, yDecimals, activePrice, quoteIsSol, partialTakenCount } = {}) {
+  const ui = (raw, dec) => {
+    const r = typeof raw === "number" ? String(raw) : (raw != null && typeof raw.toString === "function" ? raw.toString() : null);
+    if (r == null || r.length > 40 || !RAW_AMOUNT.test(r)) return null;
+    if (!Number.isInteger(dec) || dec < 0 || dec > 18) return null;
+    return Number(r) / 10 ** dec;
+  };
+  const price = Number(activePrice);
+  const ptc = Number(partialTakenCount);
+  return {
+    leg_x_ui: ui(xRaw, xDecimals),
+    leg_y_ui: ui(yRaw, yDecimals),
+    active_price: Number.isFinite(price) && price > 0 ? price : null,
+    quote_is_sol: typeof quoteIsSol === "boolean" ? quoteIsSol : null,
+    partial_taken_count: partialTakenCount != null && Number.isInteger(ptc) && ptc >= 0 ? ptc : null,
+  };
+}
+
+export function buildCloseFigures({ position, pool_name, source, entry, legs } = {}) {
   const MAX = 700;
   let dropped = 0;
   const keep = (v, depth = 0) => {
@@ -1800,6 +1823,7 @@ export function buildCloseFigures({ position, pool_name, source, entry } = {}) {
     pool_name: pool_name == null ? null : String(pool_name).slice(0, 40),
     source: source == null ? null : String(source).slice(0, 12),
     entry_keys: entry && typeof entry === "object" ? Object.keys(entry).slice(0, 40).map((k) => String(k).slice(0, 32)) : null,
+    ...buildCloseLegs(legs || {}),
     deposits: pick(entry?.allTimeDeposits),
     withdrawals: pick(entry?.allTimeWithdrawals),
     fees: pick(entry?.allTimeFees),
@@ -2173,6 +2197,7 @@ export async function closePosition({ position_address, reason }) {
 
     // ─── Step 2: Remove Liquidity & Close ──────────────────────
     let hasLiquidity = false;
+    let closeLegs = null; // record-only, for [CLOSE_FIGURES]
     let closeFromBinId = -887272;
     let closeToBinId = 887272;
     try {
@@ -2183,6 +2208,28 @@ export async function closePosition({ position_address, reason }) {
         closeToBinId = processed.upperBinId ?? closeToBinId;
         const bins = Array.isArray(processed.positionBinData) ? processed.positionBinData : [];
         hasLiquidity = bins.some((bin) => new BN(bin.positionLiquidity || "0").gt(new BN(0)));
+        if (hasLiquidity) {
+          try {
+            let activePrice = null;
+            try {
+              const activeBin = await pool.getActiveBin();
+              activePrice = pool.fromPricePerLamport(Number(activeBin.price));
+            } catch (e) {
+              log("close_warn", `Active price not read for close legs: ${e.message}`);
+            }
+            closeLegs = {
+              xRaw: processed.totalXAmount,
+              yRaw: processed.totalYAmount,
+              xDecimals: pool.tokenX?.mint?.decimals,
+              yDecimals: pool.tokenY?.mint?.decimals,
+              activePrice,
+              quoteIsSol: pool.lbPair?.tokenYMint?.toString?.() === config.tokens.SOL,
+              partialTakenCount: tracked?.partial_taken_count ?? 0,
+            };
+          } catch (e) {
+            log("close_warn", `Close legs not read: ${e.message}`);
+          }
+        }
       }
     } catch (e) {
       log("close_warn", `Could not check liquidity state: ${e.message}`);
@@ -2387,6 +2434,7 @@ export async function closePosition({ position_address, reason }) {
           pool_name: tracked.pool_name || poolMeta.name || null,
           source: figuresSource,
           entry: closedEntry,
+          legs: closeLegs,
         })));
       } catch (e) {
         log("close_warn", `Close figures not logged: ${e.message}`);
